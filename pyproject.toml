@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cjm-transcript-correction-core"
+dynamic = ["version"]
+description = "A frontend-agnostic core for the transcript correction workflow — the first downstream graph-extension core; composes the graph-storage capability worker into a headless pipeline that applies unified, non-destructive corrections (text, punctuation, segmentation) as a supersede-able overlay on a committed decomposition spine, recomputes the review worklist from deterministic signals, and exposes a CLI as its first driver."
+readme = "README.md"
+requires-python = ">=3.12"
+license = {text = "Apache-2.0"}
+authors = [{name = "Christian J. Mills", email = "9126128+cj-mills@users.noreply.github.com"}]
+keywords = ['nbdev']
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = [
+    "cjm_plugin_system>=0.0.39",
+    "cjm_graph_domains>=0.0.4",
+    "cjm_graph_plugin_system>=0.0.6",
+]
+
+[project.urls]
+Repository = "https://github.com/cj-mills/cjm-transcript-correction-core"
+Documentation = "https://cj-mills.github.io/cjm-transcript-correction-core/"
+
+[project.entry-points.nbdev]
+cjm_transcript_correction_core = "cjm_transcript_correction_core._modidx:d"
+
+[tool.setuptools.dynamic]
+version = {attr = "cjm_transcript_correction_core.__version__"}
+
+[tool.setuptools.packages.find]
+include = ["cjm_transcript_correction_core"]
+
+[tool.nbdev]
