@@ -150,3 +150,13 @@ checklink/cookies.txt
 
 # Quarto
 .quarto
+
+# Claude Code session working docs (untracked; mirrors the prior cores)
+/claude-docs/
+
+# Local runtime + data (project-local worker envs, caches, run manifests)
+/runtime/
+/.cjm/
+/models/
+/runs/
+/plugins.yaml

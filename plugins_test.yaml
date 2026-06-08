@@ -1,0 +1,43 @@
+plugins:
+  # ----------------------------------------------------------------
+  # Context Graph: SQLite Graph
+  # Reads the committed decomp spine (Document + Segment) and extends it
+  # with the correction overlay (Correction / CorrectionSession nodes;
+  # CORRECTS / SUPERSEDES / DERIVED_FROM / REVIEWED edges). The worker's
+  # db_path is OVERRIDDEN per-run (load_plugin config) to point at the
+  # decomp-core graph DB where the spine lives — this core owns no graph
+  # DB of its own (the graph is a shared substrate resource; pass-2 input).
+  # ----------------------------------------------------------------
+  - name: sqlite-graph
+    env_name: test-sqlite-graph
+
+    # Environment File
+    env_file: "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-graph-plugin-sqlite/environment.yml"
+
+    # The Plugin Package (local source)
+    package: "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-graph-plugin-sqlite/"
+
+    # Interface Libraries
+    interface_libs:
+      - "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-plugin-system/"
+      - "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-graph-plugin-system/"
+
+  # ----------------------------------------------------------------
+  # Infrastructure Worker: NVIDIA Monitor (optional)
+  # CR-7 empirical samples for the graph writes that go through the queue
+  # (decomp D7: queue-routed graph storage becomes a first-class measured
+  # capability). No GPU work here; included for telemetry uniformity.
+  # ----------------------------------------------------------------
+  - name: sys-mon-nvidia
+    env_name: test-sys-mon
+
+    # Environment File
+    env_file: "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-system-monitor-nvidia/environment.yml"
+
+    # The Plugin Package (local source)
+    package: "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-system-monitor-nvidia/"
+
+    # Interface Libraries
+    interface_libs:
+      - "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-plugin-system/"
+      - "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-infra-plugin-system/"

@@ -8,3 +8,771 @@
 ``` bash
 pip install cjm_transcript_correction_core
 ```
+
+## Project Structure
+
+    nbs/
+    ├── cli.ipynb      # The CLI driver -- the correction core's first (and currently only) frontend.
+    ├── graph.ipynb    # The correction overlay's graph I/O: targeted (scale-shaped) reads of a committed
+    ├── models.ipynb   # Overlay data shapes for the transcript-correction workflow: the Correction /
+    ├── pipeline.ipynb # The headless correction workflow: load a decomp run manifest, resolve the shared
+    └── signals.ipynb  # Pure deterministic Tier-1 signal functions (no capability calls): empty-segment
+
+Total: 5 notebooks
+
+## Module Dependencies
+
+``` mermaid
+graph LR
+    cli["cli<br/>cli"]
+    graph_mod["graph<br/>graph"]
+    models["models<br/>models"]
+    pipeline["pipeline<br/>pipeline"]
+    signals["signals<br/>signals"]
+
+    cli --> pipeline
+    cli --> models
+    graph_mod --> models
+    pipeline --> graph_mod
+    pipeline --> models
+    pipeline --> signals
+    signals --> models
+```
+
+*7 cross-module dependencies detected*
+
+## CLI Reference
+
+No CLI commands found in this project.
+
+## Module Overview
+
+Detailed documentation for each module in the project:
+
+### cli (`cli.ipynb`)
+
+> The CLI driver – the correction core’s first (and currently only)
+> frontend.
+
+#### Import
+
+``` python
+from cjm_transcript_correction_core.cli import (
+    logger,
+    build_parser,
+    load_capabilities,
+    run_command,
+    main
+)
+```
+
+#### Functions
+
+``` python
+def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
+    "Build the CLI parser (subcommands: run)."
+```
+
+``` python
+def load_capabilities(
+    manager: PluginManager,                      # Freshly constructed manager
+    instance_ids: List[str],                     # Capability names to load, in order
+    configs: Optional[Dict[str, Dict]] = None,   # Per-capability load-time config (e.g. graph db_path)
+) -> None
+    "Discover manifests + load each capability, passing per-capability config (CR-2 caller-wins)."
+```
+
+``` python
+async def run_command(
+    args: argparse.Namespace,  # Parsed args for the `run` subcommand
+) -> int:  # Process exit code
+    "Execute the `run` subcommand: correct a decomp manifest's committed spine."
+```
+
+``` python
+def main(
+    argv: Optional[List[str]] = None,  # Argument list override (None = sys.argv)
+) -> int:  # Process exit code
+    "CLI entry point (console script: `cjm-transcript-correction-core`)."
+```
+
+### graph (`graph.ipynb`)
+
+> The correction overlay’s graph I/O: targeted (scale-shaped) reads of a
+> committed
+
+#### Import
+
+``` python
+from cjm_transcript_correction_core.graph import (
+    field_of,
+    submit_and_wait,
+    load_document_segments,
+    load_empty_segments,
+    count_document_segments,
+    build_correction_node,
+    build_prune_correction,
+    commit_nodes_edges,
+    start_session,
+    get_session,
+    set_session_status,
+    record_review_markers,
+    load_review_markers,
+    find_corrections_for_session,
+    find_prior_corrections_by_hash,
+    project_effective_spine
+)
+```
+
+#### Functions
+
+``` python
+def field_of(
+    result: Any,          # Capability result (dict over the proxy wire, object in-process)
+    key: str,             # Field name
+    default: Any = None,  # Fallback
+) -> Any:  # Field value or default
+    """
+    Read a field from a dict-or-object capability result.
+    
+    The Nth ecosystem copy of this wire-shape tolerance helper (pass-2 E5/D10:
+    capability results need a typed wire layer, not a per-core copy).
+    """
+```
+
+``` python
+async def submit_and_wait(
+    queue: JobQueue,                  # Started job queue
+    instance_id: str,                 # Capability instance to invoke
+    *,
+    timeout: Optional[float] = None,  # Seconds to wait; None = no limit
+    **kwargs,                         # Forwarded to the capability action
+) -> Any:  # Completed job result payload
+    "Submit one capability job, wait for it, return its result (raise on failure)."
+```
+
+``` python
+def _row_to_spine_segment(row: List[Any]) -> SpineSegment:  # One query row -> SpineSegment
+    """Build a SpineSegment from a `query`-action row (first SourceRef carried)."""
+    sources = json.loads(row[5]) if row[5] else []
+    src = sources[0] if sources else {}
+    return SpineSegment(
+        id=row[0], index=int(row[1]) if row[1] is not None else -1,
+        text=row[2] or "", start_time=row[3], end_time=row[4],
+        source_plugin_name=src.get("plugin_name"), source_row_id=src.get("row_id"),
+        content_hash=src.get("content_hash"),
+    )
+
+
+async def load_document_segments(
+    queue: JobQueue,               # Started job queue
+    graph_id: str,                 # Graph-storage capability id
+    document_id: str,              # Document node id
+    limit: Optional[int] = None,   # Optional page size (LIMIT)
+    offset: Optional[int] = None,  # Optional page offset (OFFSET)
+) -> List[SpineSegment]:  # Ordered spine segments (by index)
+    "Build a SpineSegment from a `query`-action row (first SourceRef carried)."
+```
+
+``` python
+async def load_document_segments(
+    queue: JobQueue,               # Started job queue
+    graph_id: str,                 # Graph-storage capability id
+    document_id: str,              # Document node id
+    limit: Optional[int] = None,   # Optional page size (LIMIT)
+    offset: Optional[int] = None,  # Optional page offset (OFFSET)
+) -> List[SpineSegment]:  # Ordered spine segments (by index)
+    "Load a document's Segment spine, ordered by index, via the targeted query action."
+```
+
+``` python
+async def load_empty_segments(
+    queue: JobQueue,   # Started job queue
+    graph_id: str,     # Graph-storage capability id
+    document_id: str,  # Document node id
+) -> List[SpineSegment]:  # Only the empty-text segments (server-side filtered)
+    """
+    Load ONLY a document's empty-text segments (scale-shaped: server-side filter).
+    
+    The D14 prune needs ~10% of the spine; pushing the empty-text predicate into
+    SQL avoids materializing the whole document (contrast load_document_segments,
+    which the neighbour-dependent worklist signals still require). Pass-2: the
+    typed query surface should express a "filtered segment stream", not just paging.
+    """
+```
+
+``` python
+async def count_document_segments(
+    queue: JobQueue,   # Started job queue
+    graph_id: str,     # Graph-storage capability id
+    document_id: str,  # Document node id
+) -> int:  # Number of Segment nodes PART_OF the document
+    "Count a document's segments server-side (no materialization; scale-shaped)."
+```
+
+``` python
+def _edge(
+    source_id: str,                            # Origin node id
+    target_id: str,                            # Destination node id
+    relation_type: str,                        # Edge relation type
+    properties: Optional[Dict[str, Any]] = None,  # Edge properties
+) -> Dict[str, Any]:  # Edge wire dict
+    "Build an edge wire dict."
+```
+
+``` python
+def build_correction_node(
+    correction_type: str,                  # "text_content" | "punctuation" | "grouping"
+    session_id: str,                       # Owning session id
+    payload: Dict[str, Any],               # Type-specific payload
+    actor: str = "human",                  # Actor
+    status: str = "applied",               # Lifecycle status
+    canonical_form: Optional[str] = None,  # Optional entity key
+    rationale: Optional[str] = None,       # Optional note
+) -> Correction:  # The Correction overlay node (not yet committed)
+    "Construct a Correction overlay node (pure; commit happens separately)."
+```
+
+``` python
+def build_prune_correction(
+    document_id: str,            # Document being corrected
+    pruned: List[SpineSegment],  # Empty layer-0 segments to prune
+    session_id: str,             # Owning session id
+    actor: str = "human",        # Actor
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (correction node dict, edge dicts)
+    """
+    Build one batch grouping Correction that prunes empty segments (D14).
+    
+    Non-destructive: layer-0 nodes are NOT deleted; the Correction records the
+    pruned ids and DERIVED_FROM edges point at each pruned Segment. The effective
+    spine drops them at projection time (reversible by superseding this node).
+    """
+```
+
+``` python
+async def commit_nodes_edges(
+    queue: JobQueue,              # Started job queue
+    graph_id: str,                # Graph-storage capability id
+    nodes: List[Dict[str, Any]],  # Node wire dicts
+    edges: List[Dict[str, Any]],  # Edge wire dicts
+) -> Dict[str, int]:  # {"nodes": n, "edges": m} created counts
+    "Commit nodes then edges via the job queue (queue-routed; decomp D7 telemetry)."
+```
+
+``` python
+async def start_session(
+    queue: JobQueue,   # Started job queue
+    graph_id: str,     # Graph-storage capability id
+    scope: List[str],  # Document ids in scope
+) -> CorrectionSession:  # The committed CorrectionSession
+    "Create + commit a new CorrectionSession node."
+```
+
+``` python
+async def get_session(
+    queue: JobQueue,  # Started job queue
+    graph_id: str,    # Graph-storage capability id
+    session_id: str,  # CorrectionSession node id
+) -> Optional[Dict[str, Any]]:  # The session node dict, or None
+    "Fetch a CorrectionSession node by id (resume/reopen)."
+```
+
+``` python
+async def set_session_status(
+    queue: JobQueue,  # Started job queue
+    graph_id: str,    # Graph-storage capability id
+    session_id: str,  # CorrectionSession node id
+    status: str,      # New status ("in_progress" | "completed" | "reopened")
+) -> None
+    """
+    Update a session's status + updated_at.
+    
+    The ONLY update_node use in this core: a CorrectionSession is OVERLAY metadata
+    whose lifecycle is mutable. Layer-0 Segments + Corrections stay append-only.
+    """
+```
+
+``` python
+async def record_review_markers(
+    queue: JobQueue,                   # Started job queue
+    graph_id: str,                     # Graph-storage capability id
+    session_id: str,                   # Owning session id
+    decisions: List[Tuple[str, str]],  # (segment_id, decision) pairs
+) -> int:  # Number of REVIEWED edges committed
+    "Persist per-(session, segment) review markers as REVIEWED edges."
+```
+
+``` python
+async def load_review_markers(
+    queue: JobQueue,  # Started job queue
+    graph_id: str,    # Graph-storage capability id
+    session_id: str,  # Owning session id
+) -> Dict[str, str]:  # segment_id -> decision for the session
+    "Load a session's review markers (targeted query over REVIEWED edges)."
+```
+
+``` python
+async def find_corrections_for_session(
+    queue: JobQueue,  # Started job queue
+    graph_id: str,    # Graph-storage capability id
+    session_id: str,  # Owning session id
+) -> List[Dict[str, Any]]:  # Correction property dicts for the session
+    "List corrections recorded in a session (targeted query by session_id property)."
+```
+
+``` python
+async def find_prior_corrections_by_hash(
+    queue: JobQueue,    # Started job queue
+    graph_id: str,      # Graph-storage capability id
+    content_hash: str,  # SourceRef content hash to look up
+) -> List[Dict[str, Any]]:  # Corrections whose CORRECTS target carried this hash
+    """
+    Cross-transcript correction-cache lookup (targeted; the graph IS the lexicon).
+    
+    A correction made on identical content in ANY prior transcript is discoverable
+    here, keyed by content_hash via a CORRECTS-edge join -- the targeted,
+    scale-shaped read the design wants (vs whole-neighborhood get_context).
+    """
+```
+
+``` python
+def project_effective_spine(
+    segments: List[SpineSegment],       # Ordered layer-0 spine
+    corrections: List[Dict[str, Any]],  # Applied correction property dicts
+) -> List[SpineSegment]:  # The effective spine after applying corrections
+    """
+    Project the effective spine = layer-0 + applied corrections, resolved in-core.
+    
+    Revolution-1 supports the operations built this session:
+      - grouping/prune_empty: drop pruned segment ids (re-thread is positional).
+      - text_content/replace_text: replace a segment's text by id.
+    Superseded corrections are skipped. This hand-rolled projection is direct
+    CR-18 spec material (the graph-aware layer should eventually own
+    "give me the effective view of this spine").
+    """
+```
+
+#### Variables
+
+``` python
+_SEGMENTS_SQL = "SELECT n.id, json_extract(n.properties, '$.index'), json_extract(n.properties, '$.text'), json_extract(n.properties, '$.start_time'), json_extract(n.properties, '$.end_time'), n.sources FROM nodes n JOIN edges e ON e.source_id = n.id WHERE e.target_id = ? AND e.relation_type = ? AND n.label = 'Segment' ORDER BY json_extract(n.properties, '$.index')"
+```
+
+### models (`models.ipynb`)
+
+> Overlay data shapes for the transcript-correction workflow: the
+> Correction /
+
+#### Import
+
+``` python
+from cjm_transcript_correction_core.models import (
+    CorrectionRelations,
+    Correction,
+    CorrectionSession,
+    SpineSegment,
+    WorklistItem,
+    CorrectionConfig,
+    CorrectionManifest,
+    new_run_id
+)
+```
+
+#### Functions
+
+``` python
+def new_run_id() -> str:  # e.g. "correct_20260608_153000_1a2b3c4d"
+    "Generate a unique, sortable correction run id."
+```
+
+#### Classes
+
+``` python
+class CorrectionRelations:
+    "Registry of edge types the correction overlay adds to the spine graph."
+    
+    def all(cls) -> list:  # All relation type strings
+        "Return all defined relation types."
+```
+
+``` python
+class Correction(DomainNode):
+    """
+    A single non-destructive correction over the committed spine (overlay node).
+    
+    Layer-0 spine nodes are immutable; every correction is a supersede-able
+    overlay. Defined in-core as a `DomainNode` subclass (revolution-1) rather
+    than in the shared graph-domain library — its shape is still being validated
+    by real runs; the node/edge construction + effective-view projection are
+    CR-18 spec material, not yet substrate-owned.
+    """
+```
+
+``` python
+class CorrectionSession(DomainNode):
+    "A resumable, reopen-able correction review over one or more documents."
+```
+
+``` python
+@dataclass
+class SpineSegment:
+    "A committed layer-0 Segment loaded from the graph (read view)."
+    
+    id: str  # Graph Segment node id
+    index: int  # 0-based position in the document spine
+    text: str  # Segment text (may be empty for silence VAD chunks)
+    start_time: Optional[float]  # Source-coordinate start (seconds)
+    end_time: Optional[float]  # Source-coordinate end (seconds)
+    source_plugin_name: Optional[str]  # First SourceRef plugin_name (provenance anchor)
+    source_row_id: Optional[str]  # First SourceRef row_id (upstream job_id)
+    content_hash: Optional[str]  # First SourceRef content_hash
+    
+    def is_empty(self) -> bool:  # True when the segment has no non-whitespace text
+        "Empty-text segment (silence VAD chunk with no aligned words; decomp D14)."
+```
+
+``` python
+@dataclass
+class WorklistItem:
+    "One spine segment surfaced for review, with its deterministic Tier-1 flags."
+    
+    segment: SpineSegment  # The segment under review
+    flags: List[str] = field(...)  # Tier-1 signal flags (empty, boundary, divergence, ...)
+    
+    def index(self) -> int:  # Segment spine index
+        "Spine index of the underlying segment."
+```
+
+``` python
+@dataclass
+class CorrectionConfig:
+    "Configuration for one correction run."
+    
+    graph_plugin: str = 'cjm-graph-plugin-sqlite'  # Graph-storage capability id
+    graph_db_path: Optional[str]  # Graph DB the spine lives in (from the decomp manifest)
+    actor: str = 'human'  # Actor recorded on corrections + review markers
+    assume_yes: bool = False  # Auto-accept HITL seams (headless mode)
+    prune_empty: bool = True  # Run the D14 empty-segment prune as the first operation
+    
+    def to_dict(self) -> Dict[str, Any]:  # Plain-dict snapshot for the manifest
+        "Serialize to a plain dict."
+```
+
+``` python
+@dataclass
+class CorrectionManifest:
+    "Durable record of one correction run (proto-bundle; chains decomp -> correction; CR-20)."
+    
+    run_id: str  # Unique run identifier
+    created_at: float  # Unix timestamp at run start
+    config: Dict[str, Any]  # CorrectionConfig snapshot
+    decomp_manifest: str  # Path to the consumed decomp run manifest
+    graph_db_path: str  # Graph DB the corrections were written to (shared with decomp)
+    session_id: str  # CorrectionSession node id
+    source_format: str = ''  # Upstream (decomp) manifest format tag
+    source_version: str = ''  # Upstream (decomp) manifest schema version
+    secondary_manifest: Optional[str]  # Optional second-transcriber decomp manifest (diff)
+    signals_used: List[str] = field(...)  # Signal names contributing to the worklist
+    documents: List[Dict[str, Any]] = field(...)  # Per-document outcome records
+    FORMAT: str = field(...)  # Format tag
+    VERSION: str = field(...)  # Schema version
+    
+    def to_dict(self) -> Dict[str, Any]:  # Plain-dict form for JSON serialization
+            """Serialize to a plain dict."""
+            return {
+                "format": self.FORMAT,
+        "Serialize to a plain dict."
+    
+    def save(
+            self,
+            path: Union[str, Path],  # Destination JSON file (parent dirs created)
+        ) -> Path:  # The written path
+        "Write the manifest as pretty-printed JSON."
+```
+
+### pipeline (`pipeline.ipynb`)
+
+> The headless correction workflow: load a decomp run manifest, resolve
+> the shared
+
+#### Import
+
+``` python
+from cjm_transcript_correction_core.pipeline import (
+    logger,
+    load_decomp_manifest,
+    resolve_graph_db_path,
+    compute_worklist,
+    confirm_seam,
+    prune_empty_segments,
+    collect_plugin_info,
+    run_correction
+)
+```
+
+#### Functions
+
+``` python
+def load_decomp_manifest(
+    path: str,  # Path to a decomp-core run manifest JSON
+) -> Dict[str, Any]:  # Parsed manifest dict
+    "Load + lightly validate a decomp-core run manifest (untyped JSON; CR-20 interchange)."
+```
+
+``` python
+def resolve_graph_db_path(
+    manifest: Dict[str, Any],        # Decomp manifest dict
+    graph_plugin: str,               # Graph-storage capability id
+    override: Optional[str] = None,  # Explicit override (wins)
+) -> Optional[str]:  # Absolute DB path the spine lives in
+    """
+    Resolve the graph DB path: explicit override > the decomp manifest's recorded db_path.
+    
+    The spine lives in the decomp-core graph DB; this core writes its overlay into
+    the SAME DB (a shared substrate resource owned by no single core -- pass-2
+    graph-DB-ownership evidence).
+    """
+```
+
+``` python
+def compute_worklist(
+    segments: List[SpineSegment],                    # Ordered primary spine
+    review_markers: Dict[str, str],                  # segment_id -> decision (persisted)
+    secondary: Optional[List[SpineSegment]] = None,  # Optional second-transcriber spine (diff)
+) -> List[WorklistItem]:  # Items still needing review, flagged
+    """
+    Recompute the worklist from layer-0 + signals + review state (only decisions persist).
+    
+    Segments already decided in this session (reviewed/corrected/skipped) drop out;
+    everything flagged by a deterministic signal and not yet decided surfaces.
+    """
+```
+
+``` python
+def confirm_seam(
+    seam: str,                 # Seam label
+    summary_lines: List[str],  # What the operator is accepting
+    warnings: List[str],       # Tier-1 warnings
+    assume_yes: bool = False,  # Headless: accept without prompting
+) -> bool:  # True = proceed, False = aborted
+    """
+    HITL approval seam in its cheapest viable form (log + optional CLI prompt).
+    
+    Per-seam HITL-assist annotation (5 fields):
+      1. signal: per-document summary + Tier-1 worklist flags
+      2. deterministic pre-filter: compute_signal_flags (no AI)
+      3. modality-bridge candidate: spectrogram / audio review (future Tier 2)
+      4. authoritative verifier: re-transcribe-and-compare (future Tier 3; Gemini)
+      5. flywheel capture: decisions persist as graph nodes/edges (DURABLE, unlike
+         decomp's log-only seam -- the correction overlay IS the captured decision)
+    input() blocks the loop; safe between stages with no jobs in flight (pass-2).
+    """
+```
+
+``` python
+async def prune_empty_segments(
+    queue: JobQueue,        # Started job queue
+    cfg: CorrectionConfig,  # Run configuration
+    graph_id: str,          # Graph-storage capability id
+    document_id: str,       # Document being corrected
+    total_count: int,       # Total segment count (for the summary)
+    session_id: str,        # Owning session id
+) -> Dict[str, Any]:  # {"pruned": n, "correction_id": id|None}
+    """
+    First operation: prune empty (silence) segments as one grouping correction (D14).
+    
+    Deterministic, no-human restructure proof: loads ONLY the empty segments
+    (server-side filter -- scale-shaped), builds a batch grouping Correction +
+    DERIVED_FROM edges, commits via the queue, and records REVIEWED markers
+    (decision=corrected). Layer-0 untouched; reversible by superseding.
+    """
+```
+
+``` python
+def collect_plugin_info(
+    manager: PluginManager,   # Manager holding the loaded capabilities
+    instance_ids: List[str],  # Instance ids to record
+) -> Dict[str, Dict[str, Any]]:  # instance_id -> {name, version, db_path}
+    "Record capability identity + data-DB pointers for the run manifest (provenance)."
+```
+
+``` python
+async def run_correction(
+    manager: PluginManager,                         # Manager with the graph capability loaded
+    queue: JobQueue,                                # Started job queue
+    cfg: CorrectionConfig,                          # Run configuration
+    decomp_manifest_path: str,                      # Decomp run manifest to correct
+    graph_db_path: str,                             # Resolved graph DB path (shared with decomp)
+    run_id: Optional[str] = None,                   # Override run id
+    session_id: Optional[str] = None,               # Resume/reopen an existing session
+    reopen: bool = False,                           # Reopen a completed session
+    secondary_manifest_path: Optional[str] = None,  # Second-transcriber decomp manifest (diff)
+) -> CorrectionManifest:  # Manifest of the correction run
+    """
+    Correct every document in a decomp run manifest (prune + worklist surfacing).
+    
+    Per document: load spine -> [optional secondary spine] -> recompute worklist
+    -> prune empty segments [prune-review seam] -> project effective spine ->
+    record outcome. Resumable: a prior session's review markers drop already-decided
+    segments from the worklist.
+    """
+```
+
+### signals (`signals.ipynb`)
+
+> Pure deterministic Tier-1 signal functions (no capability calls):
+> empty-segment
+
+#### Import
+
+``` python
+from cjm_transcript_correction_core.signals import (
+    detect_empty_segments,
+    boundary_punct_caps_flags,
+    fa_coverage_flags,
+    levenshtein,
+    phonetic_key,
+    cross_transcriber_diff,
+    cluster_variants,
+    compute_signal_flags
+)
+```
+
+#### Functions
+
+``` python
+def detect_empty_segments(
+    segments: List[SpineSegment],  # Ordered spine segments
+) -> List[int]:  # Positions (in `segments`) of empty-text segments
+    "Find empty-text segments (silence VAD chunks with no aligned words; decomp D14)."
+```
+
+``` python
+def _ends_terminal(text: str) -> bool:  # True if text ends with sentence-terminal punctuation
+    """Whether a segment's text ends with terminal punctuation (trailing quotes/brackets ignored)."""
+    t = (text or "").rstrip().rstrip("\"')”’")
+    return t.endswith(_TERMINAL_PUNCT)
+
+
+def _starts_upper(text: str) -> bool:  # True if the first alphabetic char is uppercase
+    "Whether a segment's text ends with terminal punctuation (trailing quotes/brackets ignored)."
+```
+
+``` python
+def _starts_upper(text: str) -> bool:  # True if the first alphabetic char is uppercase
+    """Whether a segment's text starts with an uppercase letter (leading quotes/brackets ignored)."""
+    for ch in (text or "").lstrip("\"'(“‘")
+    "Whether a segment's text starts with an uppercase letter (leading quotes/brackets ignored)."
+```
+
+``` python
+def boundary_punct_caps_flags(
+    segments: List[SpineSegment],  # Ordered spine segments
+) -> Dict[int, List[str]]:  # segment index -> boundary flags
+    """
+    Bidirectional boundary punctuation/capitalization heuristics (in-segment only).
+    
+    At each border (seg[i] -> seg[i+1]) flag the two error directions a downstream
+    grouping workflow cares about, WITHOUT ever merging across audio segments:
+      - "boundary-missing-terminal": seg[i] lacks terminal punctuation and seg[i+1]
+        starts uppercase -> a sentence may end here but is missing a period.
+      - "boundary-terminal-then-lowercase": seg[i] ends terminal but seg[i+1] starts
+        lowercase -> one sentence may have been split across the border.
+    Empty neighbours are skipped (handled by the prune).
+    """
+```
+
+``` python
+def fa_coverage_flags(
+    segments: List[SpineSegment],  # Ordered spine segments
+) -> Dict[int, List[str]]:  # segment index -> coverage flags
+    """
+    Flag segments whose forced-alignment coverage looks suspect (Tier-1).
+    
+    Empty-text segments (no aligned words) and segments missing source-coordinate
+    timing are flagged; both are alignment-failure signals shared by text and
+    segmentation errors.
+    """
+```
+
+``` python
+def levenshtein(
+    a: str,  # First string
+    b: str,  # Second string
+) -> int:  # Edit distance
+    "Levenshtein edit distance (pure, in-core; variant-clustering primitive)."
+```
+
+``` python
+def phonetic_key(
+    word: str,  # A single word token
+) -> str:  # A coarse phonetic key (Soundex-like, in-core)
+    """
+    Compute a coarse phonetic key for a word (groups like-sounding variants).
+    
+    A lightweight Soundex-style reduction (first letter + consonant codes, vowels
+    dropped): enough to bucket transcription variants of one entity for
+    fix-one-fix-all, without a phonetics dependency.
+    """
+```
+
+``` python
+def _normalize_text(text: str) -> str:  # Lowercased alphabetic word tokens, space-joined
+    """Normalize segment text for cross-transcriber comparison."""
+    return " ".join(_WORD_RE.findall((text or "").lower()))
+
+
+def cross_transcriber_diff(
+    primary: List[SpineSegment],    # Primary (e.g. accuracy-model) spine, ordered
+    secondary: List[SpineSegment],  # Secondary (e.g. lightweight-model) spine, ordered
+) -> Dict[int, Tuple[str, str]]:  # primary index -> (primary_text, secondary_text) where they diverge
+    "Normalize segment text for cross-transcriber comparison."
+```
+
+``` python
+def cross_transcriber_diff(
+    primary: List[SpineSegment],    # Primary (e.g. accuracy-model) spine, ordered
+    secondary: List[SpineSegment],  # Secondary (e.g. lightweight-model) spine, ordered
+) -> Dict[int, Tuple[str, str]]:  # primary index -> (primary_text, secondary_text) where they diverge
+    """
+    Positionally diff two transcriber spines of the SAME source.
+    
+    Both decomp spines share an identical VAD-chunk skeleton (same audio -> same
+    VAD timing), so they align 1:1 by index; proper-noun / error sites concentrate
+    where the normalized texts diverge (the force-multiplier signal). A length
+    mismatch is recorded at the sentinel key -1.
+    """
+```
+
+``` python
+def cluster_variants(
+    words: List[str],    # Candidate word tokens (e.g. divergent proper nouns)
+    max_edits: int = 2,  # Max edit distance to join two words into one cluster
+) -> List[List[str]]:  # Clusters (size > 1) of like-sounding / near-spelled variants
+    """
+    Cluster word variants by phonetic key + edit distance (fix-one-fix-all).
+    
+    Buckets transcription variants of one entity so a single decision can map them
+    all to a canonical form. Pure, in-core (no phonetics dependency).
+    """
+```
+
+``` python
+def compute_signal_flags(
+    segments: List[SpineSegment],                    # Ordered primary spine
+    secondary: Optional[List[SpineSegment]] = None,  # Optional second-transcriber spine
+) -> Dict[int, List[str]]:  # segment index -> combined Tier-1 flags
+    """
+    Combine all deterministic Tier-1 signals into per-segment flags.
+    
+    The worklist is RECOMPUTED from this each session (only decisions persist);
+    new signals join here and are picked up automatically.
+    """
+```
+
+#### Variables
+
+``` python
+_TERMINAL_PUNCT  # incl. CJK full-stop / ! / ?
+_WORD_RE  # alphabetic word tokens (unicode-aware)
+```
