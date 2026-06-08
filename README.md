@@ -30,8 +30,8 @@ graph LR
     pipeline["pipeline<br/>pipeline"]
     signals["signals<br/>signals"]
 
-    cli --> pipeline
     cli --> models
+    cli --> pipeline
     graph_mod --> models
     pipeline --> graph_mod
     pipeline --> models
@@ -62,6 +62,7 @@ from cjm_transcript_correction_core.cli import (
     build_parser,
     load_capabilities,
     run_command,
+    review_command,
     main
 )
 ```
@@ -69,8 +70,31 @@ from cjm_transcript_correction_core.cli import (
 #### Functions
 
 ``` python
+def _add_common_run_args(p: argparse.ArgumentParser) -> None:  # Shared run/review arguments
+    """Attach the capability / session / output arguments shared by `run` and `review`."""
+    p.add_argument("manifest", help="Decomp-core run manifest JSON (the committed spine)")
+    p.add_argument("--secondary-manifest", default=None,
+                   help="Second-transcriber decomp manifest of the same source (cross-transcriber diff)")
+    p.add_argument("--manifests-dir", default=".cjm/manifests", help="Capability manifests directory")
+    p.add_argument("--graph-plugin", default="cjm-graph-plugin-sqlite", help="Graph-storage capability name")
+    p.add_argument("--graph-db-path", default=None,
+                   help="Override graph DB path (default: the decomp manifest's recorded db_path)")
+    p.add_argument("--sysmon-plugin", default=None,
+                   help="MonitorPlugin for empirical attribution (CR-7); loaded first; default: none")
+    p.add_argument("--session", default=None, help="Resume an existing CorrectionSession id")
+    p.add_argument("--reopen", action="store_true", help="Reopen a completed session (with --session)")
+    p.add_argument("--actor", default="human", help="Actor recorded on corrections + review markers")
+    p.add_argument("--output", default=None, help="Correction-manifest output path (default: runs/<run_id>.json)")
+    p.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
+
+
 def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
-    "Build the CLI parser (subcommands: run)."
+    "Attach the capability / session / output arguments shared by `run` and `review`."
+```
+
+``` python
+def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
+    "Build the CLI parser (subcommands: run, review)."
 ```
 
 ``` python
@@ -87,6 +111,13 @@ async def run_command(
     args: argparse.Namespace,  # Parsed args for the `run` subcommand
 ) -> int:  # Process exit code
     "Execute the `run` subcommand: correct a decomp manifest's committed spine."
+```
+
+``` python
+async def review_command(
+    args: argparse.Namespace,  # Parsed args for the `review` subcommand
+) -> int:  # Process exit code
+    "Execute the `review` subcommand: interactive text corrections over the flagged worklist."
 ```
 
 ``` python
@@ -120,7 +151,12 @@ from cjm_transcript_correction_core.graph import (
     load_review_markers,
     find_corrections_for_session,
     find_prior_corrections_by_hash,
-    project_effective_spine
+    project_effective_spine,
+    build_text_correction,
+    commit_text_correction,
+    active_corrections,
+    load_document_corrections,
+    find_active_text_correction
 )
 ```
 
@@ -352,6 +388,92 @@ def project_effective_spine(
     """
 ```
 
+``` python
+def build_text_correction(
+    document_id: str,                      # Document the segment belongs to
+    segment_id: str,                       # Layer-0 Segment being corrected
+    new_text: str,                         # Corrected text
+    session_id: str,                       # Owning session id
+    old_text: Optional[str] = None,        # Prior effective text (for the record)
+    supersedes_id: Optional[str] = None,   # Prior Correction this one replaces (re-edit)
+    actor: str = "human",                  # Actor
+    canonical_form: Optional[str] = None,  # Optional entity key (cross-transcript matching)
+    rationale: Optional[str] = None,       # Optional note
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (correction node dict, edge dicts)
+    """
+    Build a text_content Correction + its CORRECTS (+ optional SUPERSEDES) edges.
+    
+    Non-destructive: the layer-0 Segment is unchanged; the correction carries the
+    new text in its payload + a CORRECTS edge to the segment. A re-edit adds a
+    SUPERSEDES edge (new -> prior) so supersession is graph-native + append-only
+    (the prior Correction is never mutated; it is excluded from the effective view
+    because it is a SUPERSEDES target). Direct CR-18 spec material.
+    """
+```
+
+``` python
+async def commit_text_correction(
+    queue: JobQueue,                       # Started job queue
+    graph_id: str,                         # Graph-storage capability id
+    document_id: str,                      # Document the segment belongs to
+    segment_id: str,                       # Layer-0 Segment being corrected
+    new_text: str,                         # Corrected text
+    session_id: str,                       # Owning session id
+    old_text: Optional[str] = None,        # Prior effective text
+    supersedes_id: Optional[str] = None,   # Prior Correction to supersede (re-edit)
+    actor: str = "human",                  # Actor
+    canonical_form: Optional[str] = None,  # Optional entity key
+) -> str:  # The new Correction node id
+    "Commit a text_content correction (node + CORRECTS [+ SUPERSEDES]) + a REVIEWED marker."
+```
+
+``` python
+def active_corrections(
+    corrections: List[Dict[str, Any]],  # Corrections (e.g. from load_document_corrections)
+    superseded_ids: set,                # Ids that are SUPERSEDES targets
+) -> List[Dict[str, Any]]:  # Only the effective (non-superseded) corrections
+    "Filter to the effective correction set (drop SUPERSEDES targets; append-only supersession)."
+```
+
+``` python
+async def _superseded_ids(
+    queue: JobQueue,            # Started job queue
+    graph_id: str,             # Graph-storage capability id
+    correction_ids: List[str],  # Candidate correction ids
+) -> set:  # Subset that are SUPERSEDES targets
+    "Return which of the given corrections have been superseded (are SUPERSEDES targets)."
+```
+
+``` python
+async def load_document_corrections(
+    queue: JobQueue,   # Started job queue
+    graph_id: str,     # Graph-storage capability id
+    document_id: str,  # Document node id
+) -> Tuple[List[Dict[str, Any]], set]:  # (all corrections for the doc, superseded id set)
+    """
+    Load every Correction targeting a document (across sessions) + the superseded-id set.
+    
+    Document-scoped (corrections carry payload.document_id) so the effective view is
+    a property of the document, not one session -- the persistence/resume/reopen
+    requirement. Append-only: supersession is read from SUPERSEDES edges, never a
+    status mutation.
+    """
+```
+
+``` python
+async def find_active_text_correction(
+    queue: JobQueue,  # Started job queue
+    graph_id: str,    # Graph-storage capability id
+    segment_id: str,  # Segment to look up
+) -> Optional[Dict[str, Any]]:  # The current non-superseded text correction, or None
+    """
+    Find the active (non-superseded) text correction on a segment, across sessions (latest wins).
+    
+    Cross-session lookup is what makes a re-edit in a LATER session supersede an
+    earlier correction (the resume/reopen requirement). The graph is the cache.
+    """
+```
+
 #### Variables
 
 ``` python
@@ -506,7 +628,9 @@ from cjm_transcript_correction_core.pipeline import (
     confirm_seam,
     prune_empty_segments,
     collect_plugin_info,
-    run_correction
+    run_correction,
+    review_worklist,
+    run_review
 )
 ```
 
@@ -615,6 +739,62 @@ async def run_correction(
     -> prune empty segments [prune-review seam] -> project effective spine ->
     record outcome. Resumable: a prior session's review markers drop already-decided
     segments from the worklist.
+    """
+```
+
+``` python
+def _format_worklist_item(
+    item: WorklistItem,                     # The item to present
+    effective_text: str,                    # Current effective text (layer-0 or latest correction)
+    secondary_text: Optional[str] = None,   # Secondary-transcriber text (if divergence)
+    prior_correction: Optional[str] = None, # Suggested text from the cross-transcript cache
+) -> str:  # Multi-line presentation block
+    "Render a worklist item for the CLI review seam (text + timing + flags + hints)."
+```
+
+``` python
+async def review_worklist(
+    queue: JobQueue,                                      # Started job queue
+    cfg: CorrectionConfig,                                # Run configuration
+    document_id: str,                                     # Document under review
+    worklist: List[WorklistItem],                         # Flagged, undecided items
+    session_id: str,                                      # Owning session id
+    secondary_by_index: Optional[Dict[int, str]] = None,  # index -> secondary text (divergence)
+    max_items: int = 0,                                   # Cap (0 = all)
+) -> Dict[str, int]:  # {"corrected": n, "skipped": n, "reviewed": n}
+    """
+    Interactive review loop -> text_content corrections (cheapest HITL seam).
+    
+    Per item: present text + timing + flags (+ secondary text + cross-transcript
+    cache hit), then read a decision from stdin:
+      [a]ccept (mark reviewed) / [e]dit (commit a text_content correction;
+      auto-supersedes any prior correction on the segment) / [s]kip / [q]uit.
+    On 'e', the next stdin line is the new text (blank -> adopt the secondary).
+    Drivable headless via a stdin pipe (E9-companion); cfg.assume_yes marks every
+    item reviewed with no edits.
+    """
+```
+
+``` python
+async def run_review(
+    manager: PluginManager,                         # Manager with the graph capability loaded
+    queue: JobQueue,                                # Started job queue
+    cfg: CorrectionConfig,                          # Run configuration
+    decomp_manifest_path: str,                      # Decomp run manifest to review
+    graph_db_path: str,                             # Resolved graph DB path (shared with decomp)
+    run_id: Optional[str] = None,                   # Override run id
+    session_id: Optional[str] = None,               # Resume/reopen an existing session
+    reopen: bool = False,                           # Reopen a completed session
+    secondary_manifest_path: Optional[str] = None,  # Second-transcriber decomp manifest (diff)
+    max_items: int = 0,                             # Max worklist items to review per doc (0 = all)
+) -> CorrectionManifest:  # Manifest of the review run
+    """
+    Interactive review pass over a decomp manifest's flagged worklist (text corrections).
+    
+    Like run_correction but enters the text-correction review loop instead of the
+    prune. Empty segments are excluded from the review worklist (they belong to the
+    prune); the effective spine is projected from the DOCUMENT's corrections (across
+    sessions), so a resumed/reopened session sees prior prune + text corrections.
     """
 ```
 

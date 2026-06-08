@@ -13,7 +13,8 @@ Docs: https://cj-mills.github.io/cjm-transcript-correction-coregraph.html.md"""
 __all__ = ['field_of', 'submit_and_wait', 'load_document_segments', 'load_empty_segments', 'count_document_segments',
            'build_correction_node', 'build_prune_correction', 'commit_nodes_edges', 'start_session', 'get_session',
            'set_session_status', 'record_review_markers', 'load_review_markers', 'find_corrections_for_session',
-           'find_prior_corrections_by_hash', 'project_effective_spine']
+           'find_prior_corrections_by_hash', 'project_effective_spine', 'build_text_correction',
+           'commit_text_correction', 'active_corrections', 'load_document_corrections', 'find_active_text_correction']
 
 # %% ../nbs/graph.ipynb #116eb471b8d6
 import json
@@ -350,3 +351,125 @@ def project_effective_spine(
                              source_row_id=s.source_row_id, content_hash=s.content_hash)
         out.append(s)
     return out
+
+# %% ../nbs/graph.ipynb #b603d8e5bd2f
+def build_text_correction(
+    document_id: str,                      # Document the segment belongs to
+    segment_id: str,                       # Layer-0 Segment being corrected
+    new_text: str,                         # Corrected text
+    session_id: str,                       # Owning session id
+    old_text: Optional[str] = None,        # Prior effective text (for the record)
+    supersedes_id: Optional[str] = None,   # Prior Correction this one replaces (re-edit)
+    actor: str = "human",                  # Actor
+    canonical_form: Optional[str] = None,  # Optional entity key (cross-transcript matching)
+    rationale: Optional[str] = None,       # Optional note
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (correction node dict, edge dicts)
+    """Build a text_content Correction + its CORRECTS (+ optional SUPERSEDES) edges.
+
+    Non-destructive: the layer-0 Segment is unchanged; the correction carries the
+    new text in its payload + a CORRECTS edge to the segment. A re-edit adds a
+    SUPERSEDES edge (new -> prior) so supersession is graph-native + append-only
+    (the prior Correction is never mutated; it is excluded from the effective view
+    because it is a SUPERSEDES target). Direct CR-18 spec material.
+    """
+    payload = {"operation": "replace_text", "document_id": document_id,
+               "segment_id": segment_id, "new_text": new_text, "old_text": old_text}
+    node = build_correction_node("text_content", session_id, payload, actor=actor,
+                                 canonical_form=canonical_form, rationale=rationale).to_graph_node()
+    edges = [_edge(node.id, segment_id, CorrectionRelations.CORRECTS)]
+    if supersedes_id:
+        edges.append(_edge(node.id, supersedes_id, CorrectionRelations.SUPERSEDES))
+    return node.to_dict(), edges
+
+
+async def commit_text_correction(
+    queue: JobQueue,                       # Started job queue
+    graph_id: str,                         # Graph-storage capability id
+    document_id: str,                      # Document the segment belongs to
+    segment_id: str,                       # Layer-0 Segment being corrected
+    new_text: str,                         # Corrected text
+    session_id: str,                       # Owning session id
+    old_text: Optional[str] = None,        # Prior effective text
+    supersedes_id: Optional[str] = None,   # Prior Correction to supersede (re-edit)
+    actor: str = "human",                  # Actor
+    canonical_form: Optional[str] = None,  # Optional entity key
+) -> str:  # The new Correction node id
+    """Commit a text_content correction (node + CORRECTS [+ SUPERSEDES]) + a REVIEWED marker."""
+    node, edges = build_text_correction(
+        document_id, segment_id, new_text, session_id, old_text=old_text,
+        supersedes_id=supersedes_id, actor=actor, canonical_form=canonical_form)
+    await commit_nodes_edges(queue, graph_id, [node], edges)
+    await record_review_markers(queue, graph_id, session_id, [(segment_id, "corrected")])
+    return node["id"]
+
+# %% ../nbs/graph.ipynb #686d40baa290
+def active_corrections(
+    corrections: List[Dict[str, Any]],  # Corrections (e.g. from load_document_corrections)
+    superseded_ids: set,                # Ids that are SUPERSEDES targets
+) -> List[Dict[str, Any]]:  # Only the effective (non-superseded) corrections
+    """Filter to the effective correction set (drop SUPERSEDES targets; append-only supersession)."""
+    return [c for c in corrections if c.get("id") not in superseded_ids]
+
+
+async def _superseded_ids(
+    queue: JobQueue,            # Started job queue
+    graph_id: str,             # Graph-storage capability id
+    correction_ids: List[str],  # Candidate correction ids
+) -> set:  # Subset that are SUPERSEDES targets
+    """Return which of the given corrections have been superseded (are SUPERSEDES targets)."""
+    if not correction_ids:
+        return set()
+    ph = ",".join("?" for _ in correction_ids)
+    sql = f"SELECT DISTINCT target_id FROM edges WHERE relation_type = 'SUPERSEDES' AND target_id IN ({ph})"
+    r = await submit_and_wait(queue, graph_id, action="query", sql=sql, params=correction_ids)
+    return {row[0] for row in (field_of(r, "rows", []) or [])}
+
+
+async def load_document_corrections(
+    queue: JobQueue,   # Started job queue
+    graph_id: str,     # Graph-storage capability id
+    document_id: str,  # Document node id
+) -> Tuple[List[Dict[str, Any]], set]:  # (all corrections for the doc, superseded id set)
+    """Load every Correction targeting a document (across sessions) + the superseded-id set.
+
+    Document-scoped (corrections carry payload.document_id) so the effective view is
+    a property of the document, not one session -- the persistence/resume/reopen
+    requirement. Append-only: supersession is read from SUPERSEDES edges, never a
+    status mutation.
+    """
+    sql = ("SELECT id, properties FROM nodes WHERE label = 'Correction' "
+           "AND json_extract(properties, '$.payload.document_id') = ?")
+    r = await submit_and_wait(queue, graph_id, action="query", sql=sql, params=[document_id])
+    corrections = []
+    for row in (field_of(r, "rows", []) or []):
+        props = json.loads(row[1]) if row[1] else {}
+        props["id"] = row[0]
+        corrections.append(props)
+    superseded = await _superseded_ids(queue, graph_id, [c["id"] for c in corrections])
+    return corrections, superseded
+
+
+async def find_active_text_correction(
+    queue: JobQueue,  # Started job queue
+    graph_id: str,    # Graph-storage capability id
+    segment_id: str,  # Segment to look up
+) -> Optional[Dict[str, Any]]:  # The current non-superseded text correction, or None
+    """Find the active (non-superseded) text correction on a segment, across sessions (latest wins).
+
+    Cross-session lookup is what makes a re-edit in a LATER session supersede an
+    earlier correction (the resume/reopen requirement). The graph is the cache.
+    """
+    sql = ("SELECT id, properties FROM nodes WHERE label = 'Correction' "
+           "AND json_extract(properties, '$.correction_type') = 'text_content' "
+           "AND json_extract(properties, '$.payload.segment_id') = ?")
+    r = await submit_and_wait(queue, graph_id, action="query", sql=sql, params=[segment_id])
+    cands = []
+    for row in (field_of(r, "rows", []) or []):
+        props = json.loads(row[1]) if row[1] else {}
+        props["id"] = row[0]
+        cands.append(props)
+    if not cands:
+        return None
+    superseded = await _superseded_ids(queue, graph_id, [c["id"] for c in cands])
+    active = [c for c in cands if c["id"] not in superseded]
+    return max(active, key=lambda c: c.get("created_at", 0.0)) if active else None
