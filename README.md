@@ -30,8 +30,8 @@ graph LR
     pipeline["pipeline<br/>pipeline"]
     signals["signals<br/>signals"]
 
-    cli --> models
     cli --> pipeline
+    cli --> models
     graph_mod --> models
     pipeline --> graph_mod
     pipeline --> models
@@ -43,7 +43,23 @@ graph LR
 
 ## CLI Reference
 
-No CLI commands found in this project.
+### `cjm-transcript-correction-core` Command
+
+    usage: cjm-transcript-correction-core [-h] {run,review} ...
+
+    Headless transcript correction: non-destructive overlay on a committed decomp
+    spine.
+
+    positional arguments:
+      {run,review}
+        run         Prune empty segments + surface the worklist (deterministic)
+        review      Interactive text-correction review of the flagged worklist
+
+    options:
+      -h, --help    show this help message and exit
+
+For detailed help on any command, use
+`cjm-transcript-correction-core <command> --help`.
 
 ## Module Overview
 
