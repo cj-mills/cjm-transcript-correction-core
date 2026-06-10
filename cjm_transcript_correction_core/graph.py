@@ -29,7 +29,7 @@ from cjm_transcript_correction_core.models import (
     Correction, CorrectionSession, CorrectionRelations, SpineSegment,
 )
 
-# %% ../nbs/graph.ipynb #47d3363d
+# %% ../nbs/graph.ipynb #2ccf60f6
 async def submit_and_wait(
     queue: JobQueue,                  # Started job queue
     instance_id: str,                 # Capability instance to invoke
