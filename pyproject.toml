@@ -17,9 +17,9 @@ classifiers = [
 ]
 dependencies = [
     "cjm_plugin_system>=0.0.39",
-    "cjm_graph_domains>=0.0.4",
-    "cjm_graph_plugin_system>=0.0.6",
-    "cjm_context_graph_primitives>=0.0.1",
+    "cjm_graph_domains>=0.0.14",
+    "cjm_graph_plugin_system>=0.0.16",
+    "cjm_context_graph_primitives>=0.0.2",
 ]
 
 [project.urls]
