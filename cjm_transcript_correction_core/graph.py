@@ -23,6 +23,7 @@ from uuid import uuid4
 from typing import Any, Dict, List, Optional, Tuple
 
 from cjm_plugin_system.core.queue import JobQueue, JobStatus
+from cjm_context_graph_primitives.locators import locator_from_dict
 
 from cjm_transcript_correction_core.models import (
     Correction, CorrectionSession, CorrectionRelations, SpineSegment,
@@ -85,7 +86,7 @@ def _row_to_spine_segment(row: List[Any]) -> SpineSegment:  # One query row -> S
     return SpineSegment(
         id=row[0], index=int(row[1]) if row[1] is not None else -1,
         text=row[2] or "", start_time=row[3], end_time=row[4],
-        source_plugin_name=src.get("plugin_name"), source_row_id=src.get("row_id"),
+        source_locator=(str(locator_from_dict(src["locator"])) if src.get("locator") else None),
         content_hash=src.get("content_hash"),
     )
 
@@ -347,8 +348,7 @@ def project_effective_spine(
         if s.id in text_overrides:
             s = SpineSegment(id=s.id, index=s.index, text=text_overrides[s.id],
                              start_time=s.start_time, end_time=s.end_time,
-                             source_plugin_name=s.source_plugin_name,
-                             source_row_id=s.source_row_id, content_hash=s.content_hash)
+                             source_locator=s.source_locator, content_hash=s.content_hash)
         out.append(s)
     return out
 

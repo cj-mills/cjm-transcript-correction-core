@@ -72,8 +72,7 @@ class SpineSegment:
     text: str                                 # Segment text (may be empty for silence VAD chunks)
     start_time: Optional[float] = None        # Source-coordinate start (seconds)
     end_time: Optional[float] = None          # Source-coordinate end (seconds)
-    source_plugin_name: Optional[str] = None  # First SourceRef plugin_name (provenance anchor)
-    source_row_id: Optional[str] = None       # First SourceRef row_id (upstream job_id)
+    source_locator: Optional[str] = None      # First SourceRef locator URI (provenance anchor; CR-19)
     content_hash: Optional[str] = None        # First SourceRef content_hash
 
     @property
