@@ -15,12 +15,13 @@ __all__ = ['CorrectionRelations', 'Correction', 'CorrectionSession', 'SpineSegme
 import json
 import time
 import uuid
+from uuid import uuid4
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from pydantic import Field
-from cjm_graph_domains.core import DomainNode
+from cjm_context_graph_primitives.graph import GraphNode
+
 
 # %% ../nbs/models.ipynb #c5203b457623
 class CorrectionRelations:
@@ -37,48 +38,72 @@ class CorrectionRelations:
                 if not k.startswith('_') and isinstance(v, str)]
 
 # %% ../nbs/models.ipynb #df9e66d5a85e
-class Correction(DomainNode):
+@dataclass
+class Correction:
     """A single non-destructive correction over the committed spine (overlay node).
 
     Layer-0 spine nodes are immutable; every correction is a supersede-able
-    overlay. Defined in-core as a `DomainNode` subclass (revolution-1) rather
-    than in the shared graph-domain library — its shape is still being validated
-    by real runs; the node/edge construction + effective-view projection are
-    CR-18 spec material, not yet substrate-owned.
+    overlay. Defined IN-CORE (the C6 pattern, kept at stage 5 after
+    cjm-graph-domains dissolved): a plain dataclass mapping itself onto the
+    generic GraphNode. Corrections are DECISIONS (asserted events) — they keep
+    GENERATED ids, the FLIP-TRIGGER-protected class.
     """
     correction_type: str                                   # "text_content" | "punctuation" | "grouping"
     status: str = "applied"                                # "proposed" | "applied" | "superseded"
     session_id: str = ""                                   # Owning CorrectionSession id
-    payload: Dict[str, Any] = Field(default_factory=dict)  # Type-specific data (new text, prune set, ...)
+    payload: Dict[str, Any] = field(default_factory=dict)  # Type-specific data (new text, prune set, ...)
     actor: str = "human"                                   # "human" | "agent:<id>" | "capability:<name>"
     canonical_form: Optional[str] = None                   # Optional entity key (cross-transcript matching)
     rationale: Optional[str] = None                        # Optional human/agent note
-    created_at: float = Field(default_factory=time.time)   # Unix timestamp
+    created_at: float = field(default_factory=time.time)   # Unix timestamp
+    id: str = field(default_factory=lambda: str(uuid4()))  # Generated node id (decision = event)
+
+    def to_graph_node(self) -> GraphNode:  # Generic graph node (label = class name)
+        """Map onto a generic GraphNode (None-valued fields excluded from properties)."""
+        props = {k: v for k, v in asdict(self).items() if k != "id" and v is not None}
+        return GraphNode(id=self.id, label="Correction", properties=props, sources=[])
+
 
 # %% ../nbs/models.ipynb #c44850af65f1
-class CorrectionSession(DomainNode):
-    """A resumable, reopen-able correction review over one or more documents."""
-    status: str = "in_progress"                             # "in_progress" | "completed" | "reopened"
-    scope: List[str] = Field(default_factory=list)         # Document node ids in scope
-    started_at: float = Field(default_factory=time.time)   # Unix timestamp at session start
-    updated_at: float = Field(default_factory=time.time)   # Unix timestamp of last activity
+@dataclass
+class CorrectionSession:
+    """A resumable, reopen-able correction review over one or more sources."""
+    status: str = "in_progress"                            # "in_progress" | "completed" | "reopened"
+    scope: List[str] = field(default_factory=list)         # Source node ids in scope
+    started_at: float = field(default_factory=time.time)   # Unix timestamp at session start
+    updated_at: float = field(default_factory=time.time)   # Unix timestamp of last activity
+    id: str = field(default_factory=lambda: str(uuid4()))  # Generated node id (session = event)
+
+    def to_graph_node(self) -> GraphNode:  # Generic graph node
+        """Map onto a generic GraphNode (None-valued fields excluded from properties)."""
+        props = {k: v for k, v in asdict(self).items() if k != "id" and v is not None}
+        return GraphNode(id=self.id, label="CorrectionSession", properties=props, sources=[])
+
 
 # %% ../nbs/models.ipynb #d91c571d5162
 @dataclass
 class SpineSegment:
-    """A committed layer-0 Segment loaded from the graph (read view)."""
+    """A committed layer-0 Segment loaded from the graph (read view).
+
+    Stage 5 (Source-rooted schema): segments carry an audio `TimeSlice` ref
+    (the stable anchor) + per-transcriber `CharSlice` refs into Transcript
+    nodes; `content_hash` is the AUTHORITATIVE text's hash (the `text_from`
+    slice) — the cross-transcript cache key."""
     id: str                                   # Graph Segment node id
-    index: int                                # 0-based position in the document spine
-    text: str                                 # Segment text (may be empty for silence VAD chunks)
+    index: int                                # 0-based position in the source spine
+    text: str                                 # Layer-0 text (may be empty for silence VAD chunks)
     start_time: Optional[float] = None        # Source-coordinate start (seconds)
     end_time: Optional[float] = None          # Source-coordinate end (seconds)
-    source_locator: Optional[str] = None      # First SourceRef locator URI (provenance anchor; CR-19)
-    content_hash: Optional[str] = None        # First SourceRef content_hash
+    source_locator: Optional[str] = None      # Audio SourceRef locator URI (the stable provenance anchor)
+    content_hash: Optional[str] = None        # Authoritative text slice's content_hash (None when empty)
+    text_from: Optional[str] = None           # Authoritative Transcript node id (provenance designation)
+    text_slices: List[Dict[str, Any]] = field(default_factory=list)  # [{transcript, start, end, content_hash}]
 
     @property
     def is_empty(self) -> bool:  # True when the segment has no non-whitespace text
         """Empty-text segment (silence VAD chunk with no aligned words; decomp D14)."""
         return not (self.text or "").strip()
+
 
 # %% ../nbs/models.ipynb #a45c5d0bf91d
 @dataclass
@@ -109,21 +134,24 @@ class CorrectionConfig:
 # %% ../nbs/models.ipynb #ad1d6ffac40f
 @dataclass
 class CorrectionManifest:
-    """Durable record of one correction run (proto-bundle; chains decomp -> correction; CR-20)."""
-    run_id: str                  # Unique run identifier
-    created_at: float            # Unix timestamp at run start
-    config: Dict[str, Any]       # CorrectionConfig snapshot
-    decomp_manifest: str         # Path to the consumed decomp run manifest
-    graph_db_path: str           # Graph DB the corrections were written to (shared with decomp)
-    session_id: str              # CorrectionSession node id
-    source_format: str = ""      # Upstream (decomp) manifest format tag
-    source_version: str = ""     # Upstream (decomp) manifest schema version
-    secondary_manifest: Optional[str] = None  # Optional second-transcriber decomp manifest (diff)
-    signals_used: List[str] = field(default_factory=list)          # Signal names contributing to the worklist
-    documents: List[Dict[str, Any]] = field(default_factory=list)  # Per-document outcome records
+    """Durable record of one correction run (proto-bundle; chainable, CR-20).
+
+    Schema 0.2.0 (stage 5): `documents` became `sources` (Document dissolved
+    into Source); the cross-transcriber diff is intra-graph now, so the
+    secondary-manifest pointer is gone."""
+    run_id: str             # Unique run identifier
+    created_at: float       # Unix timestamp at run start
+    config: Dict[str, Any]  # CorrectionConfig snapshot
+    decomp_manifest: str    # Path to the consumed decomp run manifest
+    graph_db_path: str      # The shared graph DB the spine + overlay live in
+    session_id: str         # CorrectionSession node id this run used
+    source_format: str = ""   # Upstream manifest format tag (interchange contract)
+    source_version: str = ""  # Upstream manifest schema version
+    signals_used: List[str] = field(default_factory=list)  # Deterministic signals active this run
+    sources: List[Dict[str, Any]] = field(default_factory=list)  # Per-source outcome records
 
     FORMAT: str = field(default="cjm-transcript-correction-core/run-manifest", repr=False)  # Format tag
-    VERSION: str = field(default="0.1.0", repr=False)                                        # Schema version
+    VERSION: str = field(default="0.2.0", repr=False)                                       # Schema version
 
     def to_dict(self) -> Dict[str, Any]:  # Plain-dict form for JSON serialization
         """Serialize to a plain dict."""
@@ -134,13 +162,12 @@ class CorrectionManifest:
             "created_at": self.created_at,
             "config": self.config,
             "decomp_manifest": self.decomp_manifest,
-            "secondary_manifest": self.secondary_manifest,
             "graph_db_path": self.graph_db_path,
             "session_id": self.session_id,
             "source_format": self.source_format,
             "source_version": self.source_version,
-            "signals_used": self.signals_used,
-            "documents": self.documents,
+            "signals_used": list(self.signals_used),
+            "sources": list(self.sources),
         }
 
     def save(
@@ -152,6 +179,7 @@ class CorrectionManifest:
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(self.to_dict(), indent=2))
         return out
+
 
 # %% ../nbs/models.ipynb #bea957f169eb
 def new_run_id() -> str:  # e.g. "correct_20260608_153000_1a2b3c4d"

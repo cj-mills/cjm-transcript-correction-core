@@ -32,8 +32,6 @@ logger = logging.getLogger(__name__)
 def _add_common_run_args(p: argparse.ArgumentParser) -> None:  # Shared run/review arguments
     """Attach the capability / session / output arguments shared by `run` and `review`."""
     p.add_argument("manifest", help="Decomp-core run manifest JSON (the committed spine)")
-    p.add_argument("--secondary-manifest", default=None,
-                   help="Second-transcriber decomp manifest of the same source (cross-transcriber diff)")
     p.add_argument("--manifests-dir", default=".cjm/manifests", help="Capability manifests directory")
     p.add_argument("--graph-plugin", default="cjm-graph-plugin-sqlite", help="Graph-storage capability name")
     p.add_argument("--graph-db-path", default=None,
@@ -48,10 +46,14 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:  # Shared run/revi
 
 
 def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
-    """Build the CLI parser (subcommands: run, review)."""
+    """Build the CLI parser (subcommands: run, review).
+
+    Stage 5: --secondary-manifest is RETIRED — the cross-transcriber diff is
+    intra-graph now (variant slices on the shared-skeleton segments).
+    """
     parser = argparse.ArgumentParser(
         prog="cjm-transcript-correction-core",
-        description="Headless transcript correction: non-destructive overlay on a committed decomp spine.",
+        description="Headless transcript correction: non-destructive overlay on a committed source spine.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -65,6 +67,7 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
     review.add_argument("--review-max", type=int, default=0, help="Max worklist items to review (0 = all)")
     review.add_argument("-y", "--yes", action="store_true", help="Auto-mark every reviewed item (no edits)")
     return parser
+
 
 # %% ../nbs/cli.ipynb #3963a1b2e18d
 def load_capabilities(
@@ -120,9 +123,6 @@ async def run_command(
         manifest = await run_correction(
             manager, queue, cfg, manifest_path, graph_db_path,
             session_id=args.session, reopen=args.reopen,
-            secondary_manifest_path=(
-                str(Path(args.secondary_manifest).resolve()) if args.secondary_manifest else None
-            ),
         )
     finally:
         await queue.stop()
@@ -134,13 +134,14 @@ async def run_command(
 
     out = Path(args.output) if args.output else Path("runs") / f"{manifest.run_id}.json"
     manifest.save(out)
-    n_docs = len(manifest.documents)
-    n_pruned = sum(d.get("pruned", 0) for d in manifest.documents)
-    n_flagged = sum(d.get("worklist_flagged", 0) for d in manifest.documents)
+    n_sources = len(manifest.sources)
+    n_pruned = sum(s.get("pruned", 0) for s in manifest.sources)
+    n_flagged = sum(s.get("worklist_flagged", 0) for s in manifest.sources)
     print(f"correction manifest: {out}")
-    print(f"documents: {n_docs}  worklist flagged: {n_flagged}  pruned: {n_pruned}")
+    print(f"sources: {n_sources}  worklist flagged: {n_flagged}  pruned: {n_pruned}")
     print(f"session: {manifest.session_id}")
     return 0
+
 
 # %% ../nbs/cli.ipynb #6c70c02add5a
 async def review_command(
@@ -167,8 +168,6 @@ async def review_command(
         manifest = await run_review(
             manager, queue, cfg, manifest_path, graph_db_path,
             session_id=args.session, reopen=args.reopen, max_items=args.review_max,
-            secondary_manifest_path=(
-                str(Path(args.secondary_manifest).resolve()) if args.secondary_manifest else None),
         )
     finally:
         await queue.stop()
@@ -180,12 +179,13 @@ async def review_command(
 
     out = Path(args.output) if args.output else Path("runs") / f"{manifest.run_id}.json"
     manifest.save(out)
-    n_corr = sum(d.get("corrected", 0) for d in manifest.documents)
-    n_active = sum(d.get("active_corrections", 0) for d in manifest.documents)
+    n_corr = sum(s.get("corrected", 0) for s in manifest.sources)
+    n_active = sum(s.get("active_corrections", 0) for s in manifest.sources)
     print(f"correction manifest: {out}")
-    print(f"documents: {len(manifest.documents)}  corrected: {n_corr}  active corrections: {n_active}")
+    print(f"sources: {len(manifest.sources)}  corrected: {n_corr}  active corrections: {n_active}")
     print(f"session: {manifest.session_id}")
     return 0
+
 
 # %% ../nbs/cli.ipynb #3de78845a606
 def main(

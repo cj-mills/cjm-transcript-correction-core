@@ -10,7 +10,7 @@ Docs: https://cj-mills.github.io/cjm-transcript-correction-coresignals.html.md""
 
 # %% auto #0
 __all__ = ['detect_empty_segments', 'boundary_punct_caps_flags', 'fa_coverage_flags', 'levenshtein', 'phonetic_key',
-           'cross_transcriber_diff', 'cluster_variants', 'compute_signal_flags']
+           'variant_divergence', 'cluster_variants', 'compute_signal_flags']
 
 # %% ../nbs/signals.ipynb #be3ae6915e18
 import re
@@ -144,26 +144,27 @@ def _normalize_text(text: str) -> str:  # Lowercased alphabetic word tokens, spa
     return " ".join(_WORD_RE.findall((text or "").lower()))
 
 
-def cross_transcriber_diff(
-    primary: List[SpineSegment],    # Primary (e.g. accuracy-model) spine, ordered
-    secondary: List[SpineSegment],  # Secondary (e.g. lightweight-model) spine, ordered
-) -> Dict[int, Tuple[str, str]]:  # primary index -> (primary_text, secondary_text) where they diverge
-    """Positionally diff two transcriber spines of the SAME source.
+def variant_divergence(
+    segments: List[SpineSegment],            # Layer-0 spine (authoritative text)
+    variants: Dict[str, Dict[str, str]],     # segment_id -> {transcriber: chunk text} (from the graph)
+) -> Dict[int, Tuple[str, str]]:  # spine index -> (authoritative_text, first divergent variant)
+    """Within-segment cross-transcriber divergence (stage 5: intra-graph).
 
-    Both decomp spines share an identical VAD-chunk skeleton (same audio -> same
-    VAD timing), so they align 1:1 by index; proper-noun / error sites concentrate
-    where the normalized texts diverge (the force-multiplier signal). A length
-    mismatch is recorded at the sentinel key -1.
+    The shared-skeleton model stores every transcriber's chunk text as a slice
+    on ONE segment, so divergence is a WITHIN-NODE comparison now (C14 realized)
+    — no second spine, no positional join. Proper-noun / error sites concentrate
+    where the normalized texts diverge (the force-multiplier signal); the
+    authoritative transcriber's own variant compares equal by construction.
     """
     diffs: Dict[int, Tuple[str, str]] = {}
-    n = min(len(primary), len(secondary))
-    if len(primary) != len(secondary):
-        diffs[-1] = (f"len={len(primary)}", f"len={len(secondary)}")
-    for i in range(n):
-        pt, st = primary[i].text or "", secondary[i].text or ""
-        if _normalize_text(pt) != _normalize_text(st):
-            diffs[i] = (pt, st)
+    for i, s in enumerate(segments):
+        auth_norm = _normalize_text(s.text)
+        for t, vtext in (variants.get(s.id) or {}).items():
+            if _normalize_text(vtext) != auth_norm:
+                diffs[i] = (s.text or "", vtext)
+                break
     return diffs
+
 
 # %% ../nbs/signals.ipynb #a2fab1ac553b
 def cluster_variants(
@@ -193,13 +194,15 @@ def cluster_variants(
 
 # %% ../nbs/signals.ipynb #eea240b7879d
 def compute_signal_flags(
-    segments: List[SpineSegment],                    # Ordered primary spine
-    secondary: Optional[List[SpineSegment]] = None,  # Optional second-transcriber spine
+    segments: List[SpineSegment],                       # Ordered layer-0 spine
+    variants: Optional[Dict[str, Dict[str, str]]] = None,  # segment_id -> {transcriber: text} (intra-graph)
 ) -> Dict[int, List[str]]:  # segment index -> combined Tier-1 flags
     """Combine all deterministic Tier-1 signals into per-segment flags.
 
     The worklist is RECOMPUTED from this each session (only decisions persist);
-    new signals join here and are picked up automatically.
+    new signals join here and are picked up automatically. Stage 5: the
+    transcriber-divergence signal reads the segments' own variant slices
+    (intra-graph), not a second decomp spine.
     """
     flags: Dict[int, List[str]] = {}
 
@@ -213,8 +216,8 @@ def compute_signal_flags(
         add(idx, fl)
     for idx, fl in boundary_punct_caps_flags(segments).items():
         add(idx, fl)
-    if secondary is not None:
-        for idx in cross_transcriber_diff(segments, secondary):
-            if idx >= 0:
-                add(idx, ["transcriber-divergence"])
+    if variants:
+        for idx in variant_divergence(segments, variants):
+            add(idx, ["transcriber-divergence"])
     return flags
+

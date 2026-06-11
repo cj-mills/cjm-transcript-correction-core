@@ -26,19 +26,21 @@ from cjm_transcript_correction_core.models import (
     CorrectionConfig, CorrectionManifest, SpineSegment, WorklistItem, new_run_id,
 )
 from cjm_transcript_correction_core.signals import (
-    compute_signal_flags, detect_empty_segments, cross_transcriber_diff,
+    compute_signal_flags, detect_empty_segments, variant_divergence,
 )
 from cjm_transcript_correction_core.graph import (
-    load_document_segments, load_empty_segments, count_document_segments,
+    load_source_segments, load_empty_segments, count_source_segments,
+    load_variant_texts,
     build_prune_correction, commit_nodes_edges, start_session, get_session,
     set_session_status, record_review_markers, load_review_markers,
     find_corrections_for_session, project_effective_spine,
     commit_text_correction, find_active_text_correction,
     find_active_text_corrections_batch,
-    load_document_corrections, active_corrections, find_prior_corrections_by_hash,
+    load_source_corrections, active_corrections, find_prior_corrections_by_hash,
 )
 
 logger = logging.getLogger(__name__)
+
 
 # %% ../nbs/pipeline.ipynb #fea6d30b3261
 def load_decomp_manifest(
@@ -70,16 +72,16 @@ def resolve_graph_db_path(
 
 # %% ../nbs/pipeline.ipynb #e3685d9fa665
 def compute_worklist(
-    segments: List[SpineSegment],                    # Ordered primary spine
-    review_markers: Dict[str, str],                  # segment_id -> decision (persisted)
-    secondary: Optional[List[SpineSegment]] = None,  # Optional second-transcriber spine (diff)
+    segments: List[SpineSegment],                       # Ordered layer-0 spine
+    review_markers: Dict[str, str],                     # segment_id -> decision (persisted)
+    variants: Optional[Dict[str, Dict[str, str]]] = None,  # segment_id -> {transcriber: text} (intra-graph)
 ) -> List[WorklistItem]:  # Items still needing review, flagged
     """Recompute the worklist from layer-0 + signals + review state (only decisions persist).
 
     Segments already decided in this session (reviewed/corrected/skipped) drop out;
     everything flagged by a deterministic signal and not yet decided surfaces.
     """
-    flags = compute_signal_flags(segments, secondary=secondary)
+    flags = compute_signal_flags(segments, variants=variants)
     items: List[WorklistItem] = []
     for i, s in enumerate(segments):
         if review_markers.get(s.id):  # already decided this session
@@ -88,6 +90,7 @@ def compute_worklist(
         if fl:
             items.append(WorklistItem(segment=s, flags=fl))
     return items
+
 
 # %% ../nbs/pipeline.ipynb #752e725a52c8
 def confirm_seam(
@@ -124,7 +127,7 @@ async def prune_empty_segments(
     queue: JobQueue,        # Started job queue
     cfg: CorrectionConfig,  # Run configuration
     graph_id: str,          # Graph-storage capability id
-    document_id: str,       # Document being corrected
+    source_id: str,         # Source being corrected
     total_count: int,       # Total segment count (for the summary)
     session_id: str,        # Owning session id
 ) -> Dict[str, Any]:  # {"pruned": n, "correction_id": id|None}
@@ -135,21 +138,22 @@ async def prune_empty_segments(
     DERIVED_FROM edges, commits via the queue, and records REVIEWED markers
     (decision=corrected). Layer-0 untouched; reversible by superseding.
     """
-    empties = await load_empty_segments(queue, graph_id, document_id)
+    empties = await load_empty_segments(queue, graph_id, source_id)
     if not empties:
-        logger.info(f"[prune] {document_id}: no empty segments")
+        logger.info(f"[prune] {source_id}: no empty segments")
         return {"pruned": 0, "correction_id": None}
     if not confirm_seam("prune-review",
-                        [f"{document_id}: prune {len(empties)}/{total_count} empty segment(s)"],
+                        [f"{source_id}: prune {len(empties)}/{total_count} empty segment(s)"],
                         [], assume_yes=cfg.assume_yes):
-        logger.warning(f"[prune] {document_id}: declined by operator")
+        logger.warning(f"[prune] {source_id}: declined by operator")
         return {"pruned": 0, "correction_id": None}
-    node, edges = build_prune_correction(document_id, empties, session_id, actor=cfg.actor)
+    node, edges = build_prune_correction(source_id, empties, session_id, actor=cfg.actor)
     await commit_nodes_edges(queue, graph_id, [node], edges)
     await record_review_markers(queue, graph_id, session_id,
                                 [(s.id, "corrected") for s in empties])
-    logger.info(f"[prune] {document_id}: grouping correction {node['id']} pruned {len(empties)} segment(s)")
+    logger.info(f"[prune] {source_id}: grouping correction {node['id']} pruned {len(empties)} segment(s)")
     return {"pruned": len(empties), "correction_id": node["id"]}
+
 
 # %% ../nbs/pipeline.ipynb #702078f928ea
 def collect_plugin_info(
@@ -169,35 +173,29 @@ def collect_plugin_info(
 
 # %% ../nbs/pipeline.ipynb #69288c2e3325
 async def run_correction(
-    manager: PluginManager,                         # Manager with the graph capability loaded
-    queue: JobQueue,                                # Started job queue
-    cfg: CorrectionConfig,                          # Run configuration
-    decomp_manifest_path: str,                      # Decomp run manifest to correct
-    graph_db_path: str,                             # Resolved graph DB path (shared with decomp)
-    run_id: Optional[str] = None,                   # Override run id
-    session_id: Optional[str] = None,               # Resume/reopen an existing session
-    reopen: bool = False,                           # Reopen a completed session
-    secondary_manifest_path: Optional[str] = None,  # Second-transcriber decomp manifest (diff)
+    manager: PluginManager,            # Manager with the graph capability loaded
+    queue: JobQueue,                   # Started job queue
+    cfg: CorrectionConfig,             # Run configuration
+    decomp_manifest_path: str,         # Decomp run manifest to correct
+    graph_db_path: str,                # Resolved graph DB path (shared with decomp)
+    run_id: Optional[str] = None,      # Override run id
+    session_id: Optional[str] = None,  # Resume/reopen an existing session
+    reopen: bool = False,              # Reopen a completed session
 ) -> CorrectionManifest:  # Manifest of the correction run
-    """Correct every document in a decomp run manifest (prune + worklist surfacing).
+    """Correct every source in a decomp run manifest (prune + worklist surfacing).
 
-    Per document: load spine -> [optional secondary spine] -> recompute worklist
-    -> prune empty segments [prune-review seam] -> project effective spine ->
-    record outcome. Resumable: a prior session's review markers drop already-decided
-    segments from the worklist.
+    Per source: load spine (with variant slices) -> recompute worklist -> prune
+    empty segments [prune-review seam] -> project effective spine -> record
+    outcome. The cross-transcriber diff is INTRA-GRAPH (stage 5): variant texts
+    come from the segments' own Transcript slice refs — no second manifest.
+    Resumable: a prior session's review markers drop decided segments.
     """
     run_id = run_id or new_run_id()
     decomp = load_decomp_manifest(decomp_manifest_path)
-    doc_ids = [d.get("document_id") for d in (decomp.get("documents", []) or []) if d.get("document_id")]
-
-    # Optional secondary (second-transcriber) decomp manifest -> positional doc pairing.
-    secondary_docs: Dict[str, str] = {}
-    if secondary_manifest_path:
-        sec = load_decomp_manifest(secondary_manifest_path)
-        sec_ids = [d.get("document_id") for d in (sec.get("documents", []) or [])]
-        for i, did in enumerate(doc_ids):
-            if i < len(sec_ids):
-                secondary_docs[did] = sec_ids[i]
+    source_ids = [s.get("source_node_id") for s in (decomp.get("sources", []) or [])
+                  if s.get("source_node_id")]
+    if not source_ids:
+        raise SystemExit("decomp manifest lists no sources (pre-0.2.0 manifest? re-run decomp)")
 
     # Session: start fresh, or resume/reopen an existing one.
     if session_id:
@@ -208,48 +206,42 @@ async def run_correction(
         sess_id = session_id
         logger.info(f"resumed session {sess_id}")
     else:
-        sess = await start_session(queue, cfg.graph_plugin, doc_ids)
+        sess = await start_session(queue, cfg.graph_plugin, source_ids)
         sess_id = sess.id
-        logger.info(f"started session {sess_id} over {len(doc_ids)} document(s)")
+        logger.info(f"started session {sess_id} over {len(source_ids)} source(s)")
 
     manifest = CorrectionManifest(
         run_id=run_id, created_at=time.time(), config=cfg.to_dict(),
         decomp_manifest=str(decomp_manifest_path),
-        secondary_manifest=str(secondary_manifest_path) if secondary_manifest_path else None,
         graph_db_path=graph_db_path, session_id=sess_id,
         source_format=decomp.get("format", ""), source_version=decomp.get("version", ""),
         signals_used=["empty-text", "missing-timing", "boundary-missing-terminal",
-                      "boundary-terminal-then-lowercase"]
-        + (["transcriber-divergence"] if secondary_manifest_path else []),
+                      "boundary-terminal-then-lowercase", "transcriber-divergence"],
     )
 
-    for did in doc_ids:
-        n = await count_document_segments(queue, cfg.graph_plugin, did)
-        segments = await load_document_segments(queue, cfg.graph_plugin, did)
-        secondary = None
-        if did in secondary_docs:
-            secondary = await load_document_segments(queue, cfg.graph_plugin, secondary_docs[did])
+    for sid in source_ids:
+        n = await count_source_segments(queue, cfg.graph_plugin, sid)
+        segments = await load_source_segments(queue, cfg.graph_plugin, sid)
+        variants = await load_variant_texts(queue, cfg.graph_plugin, segments)
         markers = await load_review_markers(queue, cfg.graph_plugin, sess_id)
-        worklist = compute_worklist(segments, markers, secondary=secondary)
+        worklist = compute_worklist(segments, markers, variants=variants)
         divergences = sum(1 for it in worklist if "transcriber-divergence" in it.flags)
-        logger.info(f"[doc {did}] {n} segment(s); worklist {len(worklist)} flagged; "
-                    f"{len(detect_empty_segments(segments))} empty"
-                    + (f"; {divergences} transcriber-divergence vs {secondary_docs[did]}"
-                       if secondary else ""))
+        logger.info(f"[src {sid[:8]}] {n} segment(s); worklist {len(worklist)} flagged; "
+                    f"{len(detect_empty_segments(segments))} empty; "
+                    f"{divergences} transcriber-divergence (intra-graph)")
 
         prune = {"pruned": 0, "correction_id": None}
         if cfg.prune_empty:
-            prune = await prune_empty_segments(queue, cfg, cfg.graph_plugin, did, n, sess_id)
+            prune = await prune_empty_segments(queue, cfg, cfg.graph_plugin, sid, n, sess_id)
 
         corrections = await find_corrections_for_session(queue, cfg.graph_plugin, sess_id)
         effective = project_effective_spine(segments, corrections)
-        manifest.documents.append({
-            "document_id": did,
+        manifest.sources.append({
+            "source_node_id": sid,
             "segment_count": n,
             "worklist_flagged": len(worklist),
             "empty_segments": len(detect_empty_segments(segments)),
-            "secondary_document_id": secondary_docs.get(did),
-            "transcriber_divergences": divergences if secondary else 0,
+            "transcriber_divergences": divergences,
             "pruned": prune["pruned"],
             "prune_correction_id": prune["correction_id"],
             "effective_segment_count": len(effective),
@@ -258,45 +250,48 @@ async def run_correction(
     await set_session_status(queue, cfg.graph_plugin, sess_id, "completed")
     return manifest
 
+
 # %% ../nbs/pipeline.ipynb #46ba22b8c6fb
 def _format_worklist_item(
     item: WorklistItem,                     # The item to present
     effective_text: str,                    # Current effective text (layer-0 or latest correction)
-    secondary_text: Optional[str] = None,   # Secondary-transcriber text (if divergence)
+    variant_text: Optional[str] = None,     # Divergent variant text (another transcriber's reading)
     prior_correction: Optional[str] = None, # Suggested text from the cross-transcript cache
 ) -> str:  # Multi-line presentation block
     """Render a worklist item for the CLI review seam (text + timing + flags + hints)."""
     s = item.segment
     t = f"[{s.start_time:.1f}-{s.end_time:.1f}s]" if s.start_time is not None else "[--]"
     lines = [f"  #{s.index} {t} flags={','.join(item.flags)}",
-             f"    text:      {effective_text!r}"]
-    if secondary_text is not None:
-        lines.append(f"    secondary: {secondary_text!r}")
+             f"    text:    {effective_text!r}"]
+    if variant_text is not None:
+        lines.append(f"    variant: {variant_text!r}")
     if prior_correction is not None:
         lines.append(f"    cache-hit: {prior_correction!r}")
     return "\n".join(lines)
 
 
 async def review_worklist(
-    queue: JobQueue,                                      # Started job queue
-    cfg: CorrectionConfig,                                # Run configuration
-    document_id: str,                                     # Document under review
-    worklist: List[WorklistItem],                         # Flagged, undecided items
-    session_id: str,                                      # Owning session id
-    secondary_by_index: Optional[Dict[int, str]] = None,  # index -> secondary text (divergence)
-    max_items: int = 0,                                   # Cap (0 = all)
+    queue: JobQueue,                                    # Started job queue
+    cfg: CorrectionConfig,                              # Run configuration
+    source_id: str,                                     # Source under review
+    worklist: List[WorklistItem],                       # Flagged, undecided items
+    session_id: str,                                    # Owning session id
+    variant_by_segment: Optional[Dict[str, str]] = None,  # segment_id -> divergent variant text
+    max_items: int = 0,                                 # Cap (0 = all)
 ) -> Dict[str, int]:  # {"corrected": n, "skipped": n, "reviewed": n}
     """Interactive review loop -> text_content corrections (cheapest HITL seam).
 
-    Per item: present text + timing + flags (+ secondary text + cross-transcript
-    cache hit), then read a decision from stdin:
+    Per item: present text + timing + flags (+ the divergent variant text +
+    cross-transcript cache hit), then read a decision from stdin:
       [a]ccept (mark reviewed) / [e]dit (commit a text_content correction;
       auto-supersedes any prior correction on the segment) / [s]kip / [q]uit.
-    On 'e', the next stdin line is the new text (blank -> adopt the secondary).
+    On 'e', the next stdin line is the new text (blank -> adopt the variant) —
+    adopting a variant IS the "extract the superior lightweight reading" move,
+    and its provenance is the variant slice already on the segment.
     Drivable headless via a stdin pipe (E9-companion); cfg.assume_yes marks every
     item reviewed with no edits.
     """
-    secondary_by_index = secondary_by_index or {}
+    variant_by_segment = variant_by_segment or {}
     counts = {"corrected": 0, "skipped": 0, "reviewed": 0}
     items = worklist[:max_items] if max_items > 0 else worklist
     # C17 (stage 4): ONE batched far-end read replaces the per-item lookup —
@@ -309,14 +304,14 @@ async def review_worklist(
         seg = item.segment
         active = active_by_segment.get(seg.id)
         effective_text = (active.get("payload", {}) or {}).get("new_text", seg.text) if active else seg.text
-        sec = secondary_by_index.get(seg.index)
+        var = variant_by_segment.get(seg.id)
         prior = None
         if seg.content_hash:
             hits = await find_prior_corrections_by_hash(queue, cfg.graph_plugin, seg.content_hash)
             hits = [h for h in hits if (h.get("payload") or {}).get("segment_id") != seg.id]
             if hits:
                 prior = (hits[0].get("payload") or {}).get("new_text")
-        logger.info("review item:\n" + _format_worklist_item(item, effective_text, sec, prior))
+        logger.info("review item:\n" + _format_worklist_item(item, effective_text, var, prior))
         if cfg.assume_yes:
             await record_review_markers(queue, cfg.graph_plugin, session_id, [(seg.id, "reviewed")])
             counts["reviewed"] += 1
@@ -329,17 +324,17 @@ async def review_worklist(
             break
         if decision in ("e", "edit"):
             try:
-                new_text = input("    new text (blank = adopt secondary): ").rstrip("\n")
+                new_text = input("    new text (blank = adopt variant): ").rstrip("\n")
             except EOFError:
                 new_text = ""
-            if not new_text and sec:
-                new_text = sec
+            if not new_text and var:
+                new_text = var
             if not new_text:
                 await record_review_markers(queue, cfg.graph_plugin, session_id, [(seg.id, "skipped")])
                 counts["skipped"] += 1
                 continue
             cid = await commit_text_correction(
-                queue, cfg.graph_plugin, document_id, seg.id, new_text, session_id,
+                queue, cfg.graph_plugin, source_id, seg.id, new_text, session_id,
                 old_text=effective_text, supersedes_id=(active.get("id") if active else None),
                 actor=cfg.actor)
             logger.info(f"  #{seg.index}: text correction {cid}"
@@ -353,36 +348,33 @@ async def review_worklist(
             counts["reviewed"] += 1
     return counts
 
+
 # %% ../nbs/pipeline.ipynb #a1b335c48810
 async def run_review(
-    manager: PluginManager,                         # Manager with the graph capability loaded
-    queue: JobQueue,                                # Started job queue
-    cfg: CorrectionConfig,                          # Run configuration
-    decomp_manifest_path: str,                      # Decomp run manifest to review
-    graph_db_path: str,                             # Resolved graph DB path (shared with decomp)
-    run_id: Optional[str] = None,                   # Override run id
-    session_id: Optional[str] = None,               # Resume/reopen an existing session
-    reopen: bool = False,                           # Reopen a completed session
-    secondary_manifest_path: Optional[str] = None,  # Second-transcriber decomp manifest (diff)
-    max_items: int = 0,                             # Max worklist items to review per doc (0 = all)
+    manager: PluginManager,            # Manager with the graph capability loaded
+    queue: JobQueue,                   # Started job queue
+    cfg: CorrectionConfig,             # Run configuration
+    decomp_manifest_path: str,         # Decomp run manifest to review
+    graph_db_path: str,                # Resolved graph DB path (shared with decomp)
+    run_id: Optional[str] = None,      # Override run id
+    session_id: Optional[str] = None,  # Resume/reopen an existing session
+    reopen: bool = False,              # Reopen a completed session
+    max_items: int = 0,                # Max worklist items to review per source (0 = all)
 ) -> CorrectionManifest:  # Manifest of the review run
     """Interactive review pass over a decomp manifest's flagged worklist (text corrections).
 
     Like run_correction but enters the text-correction review loop instead of the
     prune. Empty segments are excluded from the review worklist (they belong to the
-    prune); the effective spine is projected from the DOCUMENT's corrections (across
+    prune); the effective spine is projected from the SOURCE's corrections (across
     sessions), so a resumed/reopened session sees prior prune + text corrections.
+    The variant hints come from the segments' own slice refs (intra-graph).
     """
     run_id = run_id or new_run_id()
     decomp = load_decomp_manifest(decomp_manifest_path)
-    doc_ids = [d.get("document_id") for d in (decomp.get("documents", []) or []) if d.get("document_id")]
-    secondary_docs: Dict[str, str] = {}
-    if secondary_manifest_path:
-        sec = load_decomp_manifest(secondary_manifest_path)
-        sec_ids = [d.get("document_id") for d in (sec.get("documents", []) or [])]
-        for i, did in enumerate(doc_ids):
-            if i < len(sec_ids):
-                secondary_docs[did] = sec_ids[i]
+    source_ids = [s.get("source_node_id") for s in (decomp.get("sources", []) or [])
+                  if s.get("source_node_id")]
+    if not source_ids:
+        raise SystemExit("decomp manifest lists no sources (pre-0.2.0 manifest? re-run decomp)")
 
     if session_id:
         if await get_session(queue, cfg.graph_plugin, session_id) is None:
@@ -392,50 +384,47 @@ async def run_review(
         sess_id = session_id
         logger.info(f"resumed session {sess_id}")
     else:
-        sess = await start_session(queue, cfg.graph_plugin, doc_ids)
+        sess = await start_session(queue, cfg.graph_plugin, source_ids)
         sess_id = sess.id
-        logger.info(f"started review session {sess_id} over {len(doc_ids)} document(s)")
+        logger.info(f"started review session {sess_id} over {len(source_ids)} source(s)")
 
     manifest = CorrectionManifest(
         run_id=run_id, created_at=time.time(), config=cfg.to_dict(),
         decomp_manifest=str(decomp_manifest_path),
-        secondary_manifest=str(secondary_manifest_path) if secondary_manifest_path else None,
         graph_db_path=graph_db_path, session_id=sess_id,
         source_format=decomp.get("format", ""), source_version=decomp.get("version", ""),
-        signals_used=["boundary-missing-terminal", "boundary-terminal-then-lowercase"]
-        + (["transcriber-divergence"] if secondary_manifest_path else []),
+        signals_used=["boundary-missing-terminal", "boundary-terminal-then-lowercase",
+                      "transcriber-divergence"],
     )
 
-    for did in doc_ids:
-        n = await count_document_segments(queue, cfg.graph_plugin, did)
-        segments = await load_document_segments(queue, cfg.graph_plugin, did)
-        secondary = None
-        secondary_by_index: Dict[int, str] = {}
-        if did in secondary_docs:
-            secondary = await load_document_segments(queue, cfg.graph_plugin, secondary_docs[did])
-            for i in cross_transcriber_diff(segments, secondary):
-                if 0 <= i < len(secondary):
-                    secondary_by_index[secondary[i].index] = secondary[i].text
+    for sid in source_ids:
+        n = await count_source_segments(queue, cfg.graph_plugin, sid)
+        segments = await load_source_segments(queue, cfg.graph_plugin, sid)
+        variants = await load_variant_texts(queue, cfg.graph_plugin, segments)
+        variant_by_segment: Dict[str, str] = {}
+        for i, (auth, var) in variant_divergence(segments, variants).items():
+            variant_by_segment[segments[i].id] = var
         markers = await load_review_markers(queue, cfg.graph_plugin, sess_id)
-        worklist = [it for it in compute_worklist(segments, markers, secondary=secondary)
+        worklist = [it for it in compute_worklist(segments, markers, variants=variants)
                     if not it.segment.is_empty]
-        logger.info(f"[doc {did}] {n} segment(s); review worklist {len(worklist)} "
+        logger.info(f"[src {sid[:8]}] {n} segment(s); review worklist {len(worklist)} "
                     f"(reviewing up to {max_items or len(worklist)})")
-        counts = await review_worklist(queue, cfg, did, worklist, sess_id,
-                                       secondary_by_index=secondary_by_index, max_items=max_items)
+        counts = await review_worklist(queue, cfg, sid, worklist, sess_id,
+                                       variant_by_segment=variant_by_segment, max_items=max_items)
 
-        corrections, superseded = await load_document_corrections(queue, cfg.graph_plugin, did)
+        corrections, superseded = await load_source_corrections(queue, cfg.graph_plugin, sid)
         active = active_corrections(corrections, superseded)
         effective = project_effective_spine(segments, active)
-        manifest.documents.append({
-            "document_id": did, "segment_count": n, "review_worklist": len(worklist),
+        manifest.sources.append({
+            "source_node_id": sid, "segment_count": n, "review_worklist": len(worklist),
             "corrected": counts["corrected"], "skipped": counts["skipped"],
             "reviewed": counts["reviewed"], "active_corrections": len(active),
             "superseded_corrections": len(superseded), "effective_segment_count": len(effective),
         })
-        logger.info(f"[doc {did}] corrected={counts['corrected']} skipped={counts['skipped']} "
+        logger.info(f"[src {sid[:8]}] corrected={counts['corrected']} skipped={counts['skipped']} "
                     f"reviewed={counts['reviewed']}; active corrections={len(active)}; "
                     f"effective spine={len(effective)}")
 
     await set_session_status(queue, cfg.graph_plugin, sess_id, "completed")
     return manifest
+
