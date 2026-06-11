@@ -34,6 +34,7 @@ from cjm_transcript_correction_core.graph import (
     set_session_status, record_review_markers, load_review_markers,
     find_corrections_for_session, project_effective_spine,
     commit_text_correction, find_active_text_correction,
+    find_active_text_corrections_batch,
     load_document_corrections, active_corrections, find_prior_corrections_by_hash,
 )
 
@@ -298,9 +299,15 @@ async def review_worklist(
     secondary_by_index = secondary_by_index or {}
     counts = {"corrected": 0, "skipped": 0, "reviewed": 0}
     items = worklist[:max_items] if max_items > 0 else worklist
+    # C17 (stage 4): ONE batched far-end read replaces the per-item lookup —
+    # 2 graph round-trips for the whole worklist instead of 1 per item. (The
+    # per-item hash-cache lookup below stays lazy/per-item: batching it needs
+    # a hash-LIST far-end constraint — recorded promotion candidate.)
+    active_by_segment = await find_active_text_corrections_batch(
+        queue, cfg.graph_plugin, [it.segment.id for it in items])
     for item in items:
         seg = item.segment
-        active = await find_active_text_correction(queue, cfg.graph_plugin, seg.id)
+        active = active_by_segment.get(seg.id)
         effective_text = (active.get("payload", {}) or {}).get("new_text", seg.text) if active else seg.text
         sec = secondary_by_index.get(seg.index)
         prior = None
