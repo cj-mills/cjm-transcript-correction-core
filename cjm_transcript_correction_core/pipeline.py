@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 
 from cjm_plugin_system.core.manager import PluginManager
 from cjm_plugin_system.core.queue import JobQueue
+from cjm_plugin_system.core.journal_store import JournalEvent, SubstrateEventType
 
 from cjm_transcript_correction_core.models import (
     CorrectionConfig, CorrectionManifest, SpineSegment, WorklistItem, new_run_id,
@@ -171,6 +172,26 @@ def collect_plugin_info(
                      "db_path": manifest.get("db_path")}
     return info
 
+# %% ../nbs/pipeline.ipynb #40c4d54f
+def _journal_run_event(
+    manager: PluginManager,  # Manager owning the journal store
+    event_type: str,         # SubstrateEventType value (run_started / run_finished)
+    run_id: str,             # This run's manifest id
+    actor: Optional[str],    # Who/what initiated the run (cfg.actor)
+    payload: Dict[str, Any], # Run-level structured detail
+) -> None:
+    """Append a host-tier run event to the journal (CR-14 follow-up).
+
+    The cores are the trusted host writer class: RUN_STARTED/RUN_FINISHED
+    bracket the run so the run manifest (same run_id) links to every job row
+    the run produced. No-op when the manager has no journal store; append
+    failures stay LOUD (journal contract)."""
+    journal = getattr(manager, "journal_store", None)
+    if journal is None:
+        return
+    journal.append(JournalEvent(
+        event_type=event_type, run_id=run_id, actor=actor, payload=payload))
+
 # %% ../nbs/pipeline.ipynb #69288c2e3325
 async def run_correction(
     manager: PluginManager,            # Manager with the graph capability loaded
@@ -191,63 +212,88 @@ async def run_correction(
     Resumable: a prior session's review markers drop decided segments.
     """
     run_id = run_id or new_run_id()
-    decomp = load_decomp_manifest(decomp_manifest_path)
-    source_ids = [s.get("source_node_id") for s in (decomp.get("sources", []) or [])
-                  if s.get("source_node_id")]
-    if not source_ids:
-        raise SystemExit("decomp manifest lists no sources (pre-0.2.0 manifest? re-run decomp)")
+    # CR-14 follow-up: queue-scoped run context — every job submitted in this
+    # run carries run_id/actor into its journal rows + worker diagnostics
+    # (run-manifest <-> journal linkage); the run itself is bracketed by
+    # RUN_STARTED/RUN_FINISHED host-tier rows. Actor = cfg.actor (the same
+    # attribution recorded on Corrections in the graph).
+    queue.set_run_context(run_id=run_id, actor=cfg.actor)
+    _journal_run_event(manager, SubstrateEventType.RUN_STARTED.value, run_id, cfg.actor, {
+        "core": "cjm-transcript-correction-core", "mode": "correction",
+        "decomp_manifest": str(decomp_manifest_path),
+        "graph_plugin": cfg.graph_plugin,
+    })
+    try:
+        decomp = load_decomp_manifest(decomp_manifest_path)
+        source_ids = [s.get("source_node_id") for s in (decomp.get("sources", []) or [])
+                      if s.get("source_node_id")]
+        if not source_ids:
+            raise SystemExit("decomp manifest lists no sources (pre-0.2.0 manifest? re-run decomp)")
 
-    # Session: start fresh, or resume/reopen an existing one.
-    if session_id:
-        if await get_session(queue, cfg.graph_plugin, session_id) is None:
-            raise SystemExit(f"session {session_id} not found in graph")
-        if reopen:
-            await set_session_status(queue, cfg.graph_plugin, session_id, "reopened")
-        sess_id = session_id
-        logger.info(f"resumed session {sess_id}")
-    else:
-        sess = await start_session(queue, cfg.graph_plugin, source_ids)
-        sess_id = sess.id
-        logger.info(f"started session {sess_id} over {len(source_ids)} source(s)")
+        # Session: start fresh, or resume/reopen an existing one.
+        if session_id:
+            if await get_session(queue, cfg.graph_plugin, session_id) is None:
+                raise SystemExit(f"session {session_id} not found in graph")
+            if reopen:
+                await set_session_status(queue, cfg.graph_plugin, session_id, "reopened")
+            sess_id = session_id
+            logger.info(f"resumed session {sess_id}")
+        else:
+            sess = await start_session(queue, cfg.graph_plugin, source_ids)
+            sess_id = sess.id
+            logger.info(f"started session {sess_id} over {len(source_ids)} source(s)")
 
-    manifest = CorrectionManifest(
-        run_id=run_id, created_at=time.time(), config=cfg.to_dict(),
-        decomp_manifest=str(decomp_manifest_path),
-        graph_db_path=graph_db_path, session_id=sess_id,
-        source_format=decomp.get("format", ""), source_version=decomp.get("version", ""),
-        signals_used=["empty-text", "missing-timing", "boundary-missing-terminal",
-                      "boundary-terminal-then-lowercase", "transcriber-divergence"],
-    )
+        manifest = CorrectionManifest(
+            run_id=run_id, created_at=time.time(), config=cfg.to_dict(),
+            decomp_manifest=str(decomp_manifest_path),
+            graph_db_path=graph_db_path, session_id=sess_id,
+            source_format=decomp.get("format", ""), source_version=decomp.get("version", ""),
+            signals_used=["empty-text", "missing-timing", "boundary-missing-terminal",
+                          "boundary-terminal-then-lowercase", "transcriber-divergence"],
+        )
 
-    for sid in source_ids:
-        n = await count_source_segments(queue, cfg.graph_plugin, sid)
-        segments = await load_source_segments(queue, cfg.graph_plugin, sid)
-        variants = await load_variant_texts(queue, cfg.graph_plugin, segments)
-        markers = await load_review_markers(queue, cfg.graph_plugin, sess_id)
-        worklist = compute_worklist(segments, markers, variants=variants)
-        divergences = sum(1 for it in worklist if "transcriber-divergence" in it.flags)
-        logger.info(f"[src {sid[:8]}] {n} segment(s); worklist {len(worklist)} flagged; "
-                    f"{len(detect_empty_segments(segments))} empty; "
-                    f"{divergences} transcriber-divergence (intra-graph)")
+        for sid in source_ids:
+            n = await count_source_segments(queue, cfg.graph_plugin, sid)
+            segments = await load_source_segments(queue, cfg.graph_plugin, sid)
+            variants = await load_variant_texts(queue, cfg.graph_plugin, segments)
+            markers = await load_review_markers(queue, cfg.graph_plugin, sess_id)
+            worklist = compute_worklist(segments, markers, variants=variants)
+            divergences = sum(1 for it in worklist if "transcriber-divergence" in it.flags)
+            logger.info(f"[src {sid[:8]}] {n} segment(s); worklist {len(worklist)} flagged; "
+                        f"{len(detect_empty_segments(segments))} empty; "
+                        f"{divergences} transcriber-divergence (intra-graph)")
 
-        prune = {"pruned": 0, "correction_id": None}
-        if cfg.prune_empty:
-            prune = await prune_empty_segments(queue, cfg, cfg.graph_plugin, sid, n, sess_id)
+            prune = {"pruned": 0, "correction_id": None}
+            if cfg.prune_empty:
+                prune = await prune_empty_segments(queue, cfg, cfg.graph_plugin, sid, n, sess_id)
 
-        corrections = await find_corrections_for_session(queue, cfg.graph_plugin, sess_id)
-        effective = project_effective_spine(segments, corrections)
-        manifest.sources.append({
-            "source_node_id": sid,
-            "segment_count": n,
-            "worklist_flagged": len(worklist),
-            "empty_segments": len(detect_empty_segments(segments)),
-            "transcriber_divergences": divergences,
-            "pruned": prune["pruned"],
-            "prune_correction_id": prune["correction_id"],
-            "effective_segment_count": len(effective),
+            corrections = await find_corrections_for_session(queue, cfg.graph_plugin, sess_id)
+            effective = project_effective_spine(segments, corrections)
+            manifest.sources.append({
+                "source_node_id": sid,
+                "segment_count": n,
+                "worklist_flagged": len(worklist),
+                "empty_segments": len(detect_empty_segments(segments)),
+                "transcriber_divergences": divergences,
+                "pruned": prune["pruned"],
+                "prune_correction_id": prune["correction_id"],
+                "effective_segment_count": len(effective),
+            })
+
+        await set_session_status(queue, cfg.graph_plugin, sess_id, "completed")
+    except BaseException as e:
+        # The journal exists for exactly this row: a run that DIED records
+        # that it was attempted (failures stop being the unattributed case).
+        _journal_run_event(manager, SubstrateEventType.RUN_FINISHED.value, run_id, cfg.actor, {
+            "core": "cjm-transcript-correction-core", "mode": "correction",
+            "status": "failed", "error": repr(e),
         })
-
-    await set_session_status(queue, cfg.graph_plugin, sess_id, "completed")
+        raise
+    _journal_run_event(manager, SubstrateEventType.RUN_FINISHED.value, run_id, cfg.actor, {
+        "core": "cjm-transcript-correction-core", "mode": "correction",
+        "status": "completed", "session_id": sess_id,
+        "sources": len(manifest.sources),
+    })
     return manifest
 
 
@@ -370,61 +416,86 @@ async def run_review(
     The variant hints come from the segments' own slice refs (intra-graph).
     """
     run_id = run_id or new_run_id()
-    decomp = load_decomp_manifest(decomp_manifest_path)
-    source_ids = [s.get("source_node_id") for s in (decomp.get("sources", []) or [])
-                  if s.get("source_node_id")]
-    if not source_ids:
-        raise SystemExit("decomp manifest lists no sources (pre-0.2.0 manifest? re-run decomp)")
+    # CR-14 follow-up: queue-scoped run context — every job submitted in this
+    # run carries run_id/actor into its journal rows + worker diagnostics
+    # (run-manifest <-> journal linkage); the run itself is bracketed by
+    # RUN_STARTED/RUN_FINISHED host-tier rows. Actor = cfg.actor (the same
+    # attribution recorded on Corrections in the graph).
+    queue.set_run_context(run_id=run_id, actor=cfg.actor)
+    _journal_run_event(manager, SubstrateEventType.RUN_STARTED.value, run_id, cfg.actor, {
+        "core": "cjm-transcript-correction-core", "mode": "review",
+        "decomp_manifest": str(decomp_manifest_path),
+        "graph_plugin": cfg.graph_plugin,
+    })
+    try:
+        decomp = load_decomp_manifest(decomp_manifest_path)
+        source_ids = [s.get("source_node_id") for s in (decomp.get("sources", []) or [])
+                      if s.get("source_node_id")]
+        if not source_ids:
+            raise SystemExit("decomp manifest lists no sources (pre-0.2.0 manifest? re-run decomp)")
 
-    if session_id:
-        if await get_session(queue, cfg.graph_plugin, session_id) is None:
-            raise SystemExit(f"session {session_id} not found in graph")
-        if reopen:
-            await set_session_status(queue, cfg.graph_plugin, session_id, "reopened")
-        sess_id = session_id
-        logger.info(f"resumed session {sess_id}")
-    else:
-        sess = await start_session(queue, cfg.graph_plugin, source_ids)
-        sess_id = sess.id
-        logger.info(f"started review session {sess_id} over {len(source_ids)} source(s)")
+        if session_id:
+            if await get_session(queue, cfg.graph_plugin, session_id) is None:
+                raise SystemExit(f"session {session_id} not found in graph")
+            if reopen:
+                await set_session_status(queue, cfg.graph_plugin, session_id, "reopened")
+            sess_id = session_id
+            logger.info(f"resumed session {sess_id}")
+        else:
+            sess = await start_session(queue, cfg.graph_plugin, source_ids)
+            sess_id = sess.id
+            logger.info(f"started review session {sess_id} over {len(source_ids)} source(s)")
 
-    manifest = CorrectionManifest(
-        run_id=run_id, created_at=time.time(), config=cfg.to_dict(),
-        decomp_manifest=str(decomp_manifest_path),
-        graph_db_path=graph_db_path, session_id=sess_id,
-        source_format=decomp.get("format", ""), source_version=decomp.get("version", ""),
-        signals_used=["boundary-missing-terminal", "boundary-terminal-then-lowercase",
-                      "transcriber-divergence"],
-    )
+        manifest = CorrectionManifest(
+            run_id=run_id, created_at=time.time(), config=cfg.to_dict(),
+            decomp_manifest=str(decomp_manifest_path),
+            graph_db_path=graph_db_path, session_id=sess_id,
+            source_format=decomp.get("format", ""), source_version=decomp.get("version", ""),
+            signals_used=["boundary-missing-terminal", "boundary-terminal-then-lowercase",
+                          "transcriber-divergence"],
+        )
 
-    for sid in source_ids:
-        n = await count_source_segments(queue, cfg.graph_plugin, sid)
-        segments = await load_source_segments(queue, cfg.graph_plugin, sid)
-        variants = await load_variant_texts(queue, cfg.graph_plugin, segments)
-        variant_by_segment: Dict[str, str] = {}
-        for i, (auth, var) in variant_divergence(segments, variants).items():
-            variant_by_segment[segments[i].id] = var
-        markers = await load_review_markers(queue, cfg.graph_plugin, sess_id)
-        worklist = [it for it in compute_worklist(segments, markers, variants=variants)
-                    if not it.segment.is_empty]
-        logger.info(f"[src {sid[:8]}] {n} segment(s); review worklist {len(worklist)} "
-                    f"(reviewing up to {max_items or len(worklist)})")
-        counts = await review_worklist(queue, cfg, sid, worklist, sess_id,
-                                       variant_by_segment=variant_by_segment, max_items=max_items)
+        for sid in source_ids:
+            n = await count_source_segments(queue, cfg.graph_plugin, sid)
+            segments = await load_source_segments(queue, cfg.graph_plugin, sid)
+            variants = await load_variant_texts(queue, cfg.graph_plugin, segments)
+            variant_by_segment: Dict[str, str] = {}
+            for i, (auth, var) in variant_divergence(segments, variants).items():
+                variant_by_segment[segments[i].id] = var
+            markers = await load_review_markers(queue, cfg.graph_plugin, sess_id)
+            worklist = [it for it in compute_worklist(segments, markers, variants=variants)
+                        if not it.segment.is_empty]
+            logger.info(f"[src {sid[:8]}] {n} segment(s); review worklist {len(worklist)} "
+                        f"(reviewing up to {max_items or len(worklist)})")
+            counts = await review_worklist(queue, cfg, sid, worklist, sess_id,
+                                           variant_by_segment=variant_by_segment, max_items=max_items)
 
-        corrections, superseded = await load_source_corrections(queue, cfg.graph_plugin, sid)
-        active = active_corrections(corrections, superseded)
-        effective = project_effective_spine(segments, active)
-        manifest.sources.append({
-            "source_node_id": sid, "segment_count": n, "review_worklist": len(worklist),
-            "corrected": counts["corrected"], "skipped": counts["skipped"],
-            "reviewed": counts["reviewed"], "active_corrections": len(active),
-            "superseded_corrections": len(superseded), "effective_segment_count": len(effective),
+            corrections, superseded = await load_source_corrections(queue, cfg.graph_plugin, sid)
+            active = active_corrections(corrections, superseded)
+            effective = project_effective_spine(segments, active)
+            manifest.sources.append({
+                "source_node_id": sid, "segment_count": n, "review_worklist": len(worklist),
+                "corrected": counts["corrected"], "skipped": counts["skipped"],
+                "reviewed": counts["reviewed"], "active_corrections": len(active),
+                "superseded_corrections": len(superseded), "effective_segment_count": len(effective),
+            })
+            logger.info(f"[src {sid[:8]}] corrected={counts['corrected']} skipped={counts['skipped']} "
+                        f"reviewed={counts['reviewed']}; active corrections={len(active)}; "
+                        f"effective spine={len(effective)}")
+
+        await set_session_status(queue, cfg.graph_plugin, sess_id, "completed")
+    except BaseException as e:
+        # The journal exists for exactly this row: a run that DIED records
+        # that it was attempted (failures stop being the unattributed case).
+        _journal_run_event(manager, SubstrateEventType.RUN_FINISHED.value, run_id, cfg.actor, {
+            "core": "cjm-transcript-correction-core", "mode": "review",
+            "status": "failed", "error": repr(e),
         })
-        logger.info(f"[src {sid[:8]}] corrected={counts['corrected']} skipped={counts['skipped']} "
-                    f"reviewed={counts['reviewed']}; active corrections={len(active)}; "
-                    f"effective spine={len(effective)}")
-
-    await set_session_status(queue, cfg.graph_plugin, sess_id, "completed")
+        raise
+    _journal_run_event(manager, SubstrateEventType.RUN_FINISHED.value, run_id, cfg.actor, {
+        "core": "cjm-transcript-correction-core", "mode": "review",
+        "status": "completed", "session_id": sess_id,
+        "sources": len(manifest.sources),
+    })
     return manifest
 
