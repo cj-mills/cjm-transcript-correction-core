@@ -135,11 +135,13 @@ async def prune_empty_segments(
     """First operation: prune empty (silence) segments as one grouping correction (D14).
 
     Deterministic, no-human restructure proof: loads ONLY the empty segments
-    (server-side filter -- scale-shaped), builds a batch grouping Correction +
-    DERIVED_FROM edges, commits via the queue, and records REVIEWED markers
-    (decision=corrected). Layer-0 untouched; reversible by superseding.
+    (server-side filter -- scale-shaped) under the chosen rendition spine, builds
+    a batch grouping Correction + DERIVED_FROM edges, commits via the queue, and
+    records REVIEWED markers (decision=corrected). Layer-0 untouched; reversible
+    by superseding.
     """
-    empties = await load_empty_segments(queue, graph_id, source_id)
+    empties = await load_empty_segments(queue, graph_id, source_id,
+                                        rendition_selector=cfg.rendition_selector)
     if not empties:
         logger.info(f"[prune] {source_id}: no empty segments")
         return {"pruned": 0, "correction_id": None}
@@ -208,8 +210,10 @@ async def run_correction(
     Per source: load spine (with variant slices) -> recompute worklist -> prune
     empty segments [prune-review seam] -> project effective spine -> record
     outcome. The cross-transcriber diff is INTRA-GRAPH (stage 5): variant texts
-    come from the segments' own Transcript slice refs — no second manifest.
-    Resumable: a prior session's review markers drop decided segments.
+    come from the segments' own Transcript slice refs — no second manifest. The
+    fine spine is scoped to the chosen AudioRendition (cfg.rendition_selector;
+    auto-selected when a source has one decomposed rendition). Resumable: a prior
+    session's review markers drop decided segments.
     """
     run_id = run_id or new_run_id()
     # CR-14 follow-up: queue-scoped run context — every job submitted in this
@@ -253,8 +257,10 @@ async def run_correction(
         )
 
         for sid in source_ids:
-            n = await count_source_segments(queue, cfg.graph_plugin, sid)
-            segments = await load_source_segments(queue, cfg.graph_plugin, sid)
+            n = await count_source_segments(queue, cfg.graph_plugin, sid,
+                                            rendition_selector=cfg.rendition_selector)
+            segments = await load_source_segments(queue, cfg.graph_plugin, sid,
+                                                  rendition_selector=cfg.rendition_selector)
             variants = await load_variant_texts(queue, cfg.graph_plugin, segments)
             markers = await load_review_markers(queue, cfg.graph_plugin, sess_id)
             worklist = compute_worklist(segments, markers, variants=variants)
@@ -413,7 +419,8 @@ async def run_review(
     prune. Empty segments are excluded from the review worklist (they belong to the
     prune); the effective spine is projected from the SOURCE's corrections (across
     sessions), so a resumed/reopened session sees prior prune + text corrections.
-    The variant hints come from the segments' own slice refs (intra-graph).
+    The variant hints come from the segments' own slice refs (intra-graph). The
+    fine spine is scoped to the chosen AudioRendition (cfg.rendition_selector).
     """
     run_id = run_id or new_run_id()
     # CR-14 follow-up: queue-scoped run context — every job submitted in this
@@ -456,8 +463,10 @@ async def run_review(
         )
 
         for sid in source_ids:
-            n = await count_source_segments(queue, cfg.graph_plugin, sid)
-            segments = await load_source_segments(queue, cfg.graph_plugin, sid)
+            n = await count_source_segments(queue, cfg.graph_plugin, sid,
+                                            rendition_selector=cfg.rendition_selector)
+            segments = await load_source_segments(queue, cfg.graph_plugin, sid,
+                                                  rendition_selector=cfg.rendition_selector)
             variants = await load_variant_texts(queue, cfg.graph_plugin, segments)
             variant_by_segment: Dict[str, str] = {}
             for i, (auth, var) in variant_divergence(segments, variants).items():

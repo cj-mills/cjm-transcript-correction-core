@@ -126,6 +126,7 @@ class CorrectionConfig:
     actor: str = "human"                           # Actor recorded on corrections + review markers
     assume_yes: bool = False                       # Auto-accept HITL seams (headless mode)
     prune_empty: bool = True                       # Run the D14 empty-segment prune as the first operation
+    rendition_selector: Optional[str] = None       # Which AudioRendition spine to correct ("raw" | preprocessing substring); None = auto-select the populated one (error if ambiguous)
 
     def to_dict(self) -> Dict[str, Any]:  # Plain-dict snapshot for the manifest
         """Serialize to a plain dict."""

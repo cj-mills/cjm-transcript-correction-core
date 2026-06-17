@@ -36,6 +36,10 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:  # Shared run/revi
     p.add_argument("--graph-plugin", default="cjm-graph-plugin-sqlite", help="Graph-storage capability name")
     p.add_argument("--graph-db-path", default=None,
                    help="Override graph DB path (default: the decomp manifest's recorded db_path)")
+    p.add_argument("--rendition", default=None,
+                   help="Which AudioRendition spine to correct when a source has more than one "
+                        "(\"raw\" or a preprocessing substring e.g. \"demucs\"); default: auto-select the "
+                        "decomposed one (errors if ambiguous)")
     p.add_argument("--sysmon-plugin", default=None,
                    help="MonitorPlugin for empirical attribution (CR-7); loaded first; default: none")
     p.add_argument("--session", default=None, help="Resume an existing CorrectionSession id")
@@ -107,6 +111,7 @@ async def run_command(
     cfg = CorrectionConfig(
         graph_plugin=args.graph_plugin, graph_db_path=graph_db_path,
         actor=args.actor, assume_yes=args.yes, prune_empty=not args.no_prune,
+        rendition_selector=args.rendition,
     )
 
     manager = PluginManager(
@@ -157,7 +162,8 @@ async def review_command(
         raise SystemExit("could not resolve graph DB path from manifest; pass --graph-db-path explicitly")
 
     cfg = CorrectionConfig(graph_plugin=args.graph_plugin, graph_db_path=graph_db_path,
-                           actor=args.actor, assume_yes=args.yes, prune_empty=False)
+                           actor=args.actor, assume_yes=args.yes, prune_empty=False,
+                           rendition_selector=args.rendition)
     manager = PluginManager(search_paths=[Path(args.manifests_dir)], sysmon_plugin_name=args.sysmon_plugin)
     load_order = ([args.sysmon_plugin] if args.sysmon_plugin else []) + [cfg.graph_plugin]
     load_capabilities(manager, load_order, configs={cfg.graph_plugin: {"db_path": graph_db_path}})
