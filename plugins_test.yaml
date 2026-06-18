@@ -45,5 +45,8 @@ plugins:
 
     # Interface Libraries
     interface_libs:
-      - "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-plugin-system/"
-      - "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-infra-plugin-system/"
+      # schema v2: substrate AUTO-INJECTED; the monitor depends only on the telemetry
+      # data nouns (cjm-capability-primitives), not the dissolved cjm-infra-plugin-system.
+      # NO adapters block -- consumed via the native-dispatch channel
+      # (get_system_status / list_processes), not a task.
+      - "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-capability-primitives/"
