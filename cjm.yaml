@@ -23,7 +23,7 @@ runtime:
 data_dir: ./.cjm
 
 # Plugins configuration file
-plugins_config: ./plugins.yaml
+plugins_config: ./plugins_test.yaml
 
 # Shared model storage (platform-independent)
 models_dir: ./models

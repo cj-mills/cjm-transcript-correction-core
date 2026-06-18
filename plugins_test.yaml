@@ -17,10 +17,10 @@ plugins:
     # The Plugin Package (local source)
     package: "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-graph-plugin-sqlite/"
 
-    # Interface Libraries
+    # Interface Libraries (schema v2: substrate AUTO-INJECTED; the tool depends
+    # only on the graph data nouns, not the dissolved graph domain interface lib)
     interface_libs:
-      - "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-plugin-system/"
-      - "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-graph-plugin-system/"
+      - "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-context-graph-primitives/"
     # Adapter impls this worker env carries (stage-6 J10: install-all
     # pip-installs `lib` into the env + generates the adapter manifest --
     # the I6/J8 manual steps now ride the pipeline)
