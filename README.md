@@ -92,7 +92,7 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:  # Shared run/revi
     p.add_argument("--secondary-manifest", default=None,
                    help="Second-transcriber decomp manifest of the same source (cross-transcriber diff)")
     p.add_argument("--manifests-dir", default=".cjm/manifests", help="Capability manifests directory")
-    p.add_argument("--graph-plugin", default="cjm-graph-plugin-sqlite", help="Graph-storage capability name")
+    p.add_argument("--graph-plugin", default="cjm-capability-graph-sqlite", help="Graph-storage capability name")
     p.add_argument("--graph-db-path", default=None,
                    help="Override graph DB path (default: the decomp manifest's recorded db_path)")
     p.add_argument("--sysmon-plugin", default=None,
@@ -115,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
 
 ``` python
 def load_capabilities(
-    manager: PluginManager,                      # Freshly constructed manager
+    manager: CapabilityManager,                      # Freshly constructed manager
     instance_ids: List[str],                     # Capability names to load, in order
     configs: Optional[Dict[str, Dict]] = None,   # Per-capability load-time config (e.g. graph db_path)
 ) -> None
@@ -586,7 +586,7 @@ class WorklistItem:
 class CorrectionConfig:
     "Configuration for one correction run."
     
-    graph_plugin: str = 'cjm-graph-plugin-sqlite'  # Graph-storage capability id
+    graph_plugin: str = 'cjm-capability-graph-sqlite'  # Graph-storage capability id
     graph_db_path: Optional[str]  # Graph DB the spine lives in (from the decomp manifest)
     actor: str = 'human'  # Actor recorded on corrections + review markers
     assume_yes: bool = False  # Auto-accept HITL seams (headless mode)
@@ -730,7 +730,7 @@ async def prune_empty_segments(
 
 ``` python
 def collect_plugin_info(
-    manager: PluginManager,   # Manager holding the loaded capabilities
+    manager: CapabilityManager,   # Manager holding the loaded capabilities
     instance_ids: List[str],  # Instance ids to record
 ) -> Dict[str, Dict[str, Any]]:  # instance_id -> {name, version, db_path}
     "Record capability identity + data-DB pointers for the run manifest (provenance)."
@@ -738,7 +738,7 @@ def collect_plugin_info(
 
 ``` python
 async def run_correction(
-    manager: PluginManager,                         # Manager with the graph capability loaded
+    manager: CapabilityManager,                         # Manager with the graph capability loaded
     queue: JobQueue,                                # Started job queue
     cfg: CorrectionConfig,                          # Run configuration
     decomp_manifest_path: str,                      # Decomp run manifest to correct
@@ -793,7 +793,7 @@ async def review_worklist(
 
 ``` python
 async def run_review(
-    manager: PluginManager,                         # Manager with the graph capability loaded
+    manager: CapabilityManager,                         # Manager with the graph capability loaded
     queue: JobQueue,                                # Started job queue
     cfg: CorrectionConfig,                          # Run configuration
     decomp_manifest_path: str,                      # Decomp run manifest to review

@@ -1,4 +1,4 @@
-plugins:
+capabilities:
   # ----------------------------------------------------------------
   # Context Graph: SQLite Graph
   # Reads the committed decomp spine (Document + Segment) and extends it
@@ -12,10 +12,10 @@ plugins:
     env_name: test-sqlite-graph
 
     # Environment File
-    env_file: "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-graph-plugin-sqlite/environment.yml"
+    env_file: "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-capability-graph-sqlite/environment.yml"
 
     # The Plugin Package (local source)
-    package: "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-graph-plugin-sqlite/"
+    package: "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-capability-graph-sqlite/"
 
     # Interface Libraries (schema v2: substrate AUTO-INJECTED; the tool depends
     # only on the graph data nouns, not the dissolved graph domain interface lib)
@@ -38,10 +38,10 @@ plugins:
     env_name: test-sys-mon
 
     # Environment File
-    env_file: "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-system-monitor-nvidia/environment.yml"
+    env_file: "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-capability-monitor-nvidia/environment.yml"
 
     # The Plugin Package (local source)
-    package: "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-system-monitor-nvidia/"
+    package: "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-capability-monitor-nvidia/"
 
     # Interface Libraries
     interface_libs:

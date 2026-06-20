@@ -24,7 +24,7 @@ import time
 from uuid import uuid4
 from typing import Any, Dict, List, Optional, Tuple
 
-from cjm_plugin_system.core.queue import JobQueue, JobStatus
+from cjm_substrate.core.queue import JobQueue, JobStatus
 from cjm_context_graph_primitives.locators import locator_from_dict
 # Stage 4: the typed query surface (expressions + results; importing the
 # result classes IS the host-side wire registration, F8)

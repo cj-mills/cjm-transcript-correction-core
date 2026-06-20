@@ -19,9 +19,9 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from cjm_plugin_system.core.manager import PluginManager
-from cjm_plugin_system.core.queue import JobQueue
-from cjm_plugin_system.core.journal_store import JournalEvent, SubstrateEventType
+from cjm_substrate.core.manager import CapabilityManager
+from cjm_substrate.core.queue import JobQueue
+from cjm_substrate.core.journal_store import JournalEvent, SubstrateEventType
 
 from cjm_transcript_correction_core.models import (
     CorrectionConfig, CorrectionManifest, SpineSegment, WorklistItem, new_run_id,
@@ -160,7 +160,7 @@ async def prune_empty_segments(
 
 # %% ../nbs/pipeline.ipynb #702078f928ea
 def collect_plugin_info(
-    manager: PluginManager,   # Manager holding the loaded capabilities
+    manager: CapabilityManager,   # Manager holding the loaded capabilities
     instance_ids: List[str],  # Instance ids to record
 ) -> Dict[str, Dict[str, Any]]:  # instance_id -> {name, version, db_path}
     """Record capability identity + data-DB pointers for the run manifest (provenance)."""
@@ -176,7 +176,7 @@ def collect_plugin_info(
 
 # %% ../nbs/pipeline.ipynb #40c4d54f
 def _journal_run_event(
-    manager: PluginManager,  # Manager owning the journal store
+    manager: CapabilityManager,  # Manager owning the journal store
     event_type: str,         # SubstrateEventType value (run_started / run_finished)
     run_id: str,             # This run's manifest id
     actor: Optional[str],    # Who/what initiated the run (cfg.actor)
@@ -196,7 +196,7 @@ def _journal_run_event(
 
 # %% ../nbs/pipeline.ipynb #69288c2e3325
 async def run_correction(
-    manager: PluginManager,            # Manager with the graph capability loaded
+    manager: CapabilityManager,            # Manager with the graph capability loaded
     queue: JobQueue,                   # Started job queue
     cfg: CorrectionConfig,             # Run configuration
     decomp_manifest_path: str,         # Decomp run manifest to correct
@@ -403,7 +403,7 @@ async def review_worklist(
 
 # %% ../nbs/pipeline.ipynb #a1b335c48810
 async def run_review(
-    manager: PluginManager,            # Manager with the graph capability loaded
+    manager: CapabilityManager,            # Manager with the graph capability loaded
     queue: JobQueue,                   # Started job queue
     cfg: CorrectionConfig,             # Run configuration
     decomp_manifest_path: str,         # Decomp run manifest to review

@@ -18,8 +18,8 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from cjm_plugin_system.core.manager import PluginManager
-from cjm_plugin_system.core.queue import JobQueue
+from cjm_substrate.core.manager import CapabilityManager
+from cjm_substrate.core.queue import JobQueue
 
 from .models import CorrectionConfig
 from cjm_transcript_correction_core.pipeline import (
@@ -33,7 +33,7 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:  # Shared run/revi
     """Attach the capability / session / output arguments shared by `run` and `review`."""
     p.add_argument("manifest", help="Decomp-core run manifest JSON (the committed spine)")
     p.add_argument("--manifests-dir", default=".cjm/manifests", help="Capability manifests directory")
-    p.add_argument("--graph-plugin", default="cjm-graph-plugin-sqlite", help="Graph-storage capability name")
+    p.add_argument("--graph-plugin", default="cjm-capability-graph-sqlite", help="Graph-storage capability name")
     p.add_argument("--graph-db-path", default=None,
                    help="Override graph DB path (default: the decomp manifest's recorded db_path)")
     p.add_argument("--rendition", default=None,
@@ -75,7 +75,7 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
 
 # %% ../nbs/cli.ipynb #3963a1b2e18d
 def load_capabilities(
-    manager: PluginManager,                      # Freshly constructed manager
+    manager: CapabilityManager,                      # Freshly constructed manager
     instance_ids: List[str],                     # Capability names to load, in order
     configs: Optional[Dict[str, Dict]] = None,   # Per-capability load-time config (e.g. graph db_path)
 ) -> None:
@@ -90,7 +90,7 @@ def load_capabilities(
                 f"capability {iid!r} not found in manifests "
                 f"(discovered: {sorted(discovered)}) -- run cjm-ctl install-all first"
             )
-        if not manager.load_plugin(meta, config=configs.get(iid)):
+        if not manager.load_capability(meta, config=configs.get(iid)):
             raise SystemExit(f"failed to load capability {iid!r}")
         logger.info(f"loaded {iid}" + (f" (db_path override)" if iid in configs else ""))
 
@@ -114,15 +114,15 @@ async def run_command(
         rendition_selector=args.rendition,
     )
 
-    manager = PluginManager(
+    manager = CapabilityManager(
         search_paths=[Path(args.manifests_dir)],
-        sysmon_plugin_name=args.sysmon_plugin,
+        sysmon_capability_name=args.sysmon_plugin,
     )
     load_order = ([args.sysmon_plugin] if args.sysmon_plugin else []) + [cfg.graph_plugin]
     # Point the graph worker at the decomp graph DB (the shared spine) via load-time config.
     load_capabilities(manager, load_order, configs={cfg.graph_plugin: {"db_path": graph_db_path}})
 
-    queue = JobQueue(deps=manager, sysmon_plugin_name=args.sysmon_plugin)
+    queue = JobQueue(deps=manager, sysmon_capability_name=args.sysmon_plugin)
     await queue.start()
     try:
         manifest = await run_correction(
@@ -133,7 +133,7 @@ async def run_command(
         await queue.stop()
         for iid in reversed(load_order):
             try:
-                manager.unload_plugin(iid)
+                manager.unload_capability(iid)
             except Exception as e:  # Best-effort teardown; never mask the run's outcome
                 logger.warning(f"unload {iid} failed: {e}")
 
@@ -164,11 +164,11 @@ async def review_command(
     cfg = CorrectionConfig(graph_plugin=args.graph_plugin, graph_db_path=graph_db_path,
                            actor=args.actor, assume_yes=args.yes, prune_empty=False,
                            rendition_selector=args.rendition)
-    manager = PluginManager(search_paths=[Path(args.manifests_dir)], sysmon_plugin_name=args.sysmon_plugin)
+    manager = CapabilityManager(search_paths=[Path(args.manifests_dir)], sysmon_capability_name=args.sysmon_plugin)
     load_order = ([args.sysmon_plugin] if args.sysmon_plugin else []) + [cfg.graph_plugin]
     load_capabilities(manager, load_order, configs={cfg.graph_plugin: {"db_path": graph_db_path}})
 
-    queue = JobQueue(deps=manager, sysmon_plugin_name=args.sysmon_plugin)
+    queue = JobQueue(deps=manager, sysmon_capability_name=args.sysmon_plugin)
     await queue.start()
     try:
         manifest = await run_review(
@@ -179,7 +179,7 @@ async def review_command(
         await queue.stop()
         for iid in reversed(load_order):
             try:
-                manager.unload_plugin(iid)
+                manager.unload_capability(iid)
             except Exception as e:  # Best-effort teardown; never mask the run's outcome
                 logger.warning(f"unload {iid} failed: {e}")
 

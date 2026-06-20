@@ -22,8 +22,8 @@ runtime:
 # Project-local data directory
 data_dir: ./.cjm
 
-# Plugins configuration file
-plugins_config: ./plugins_test.yaml
+# Capabilities configuration file
+capabilities_config: ./capabilities_test.yaml
 
 # Shared model storage (platform-independent)
 models_dir: ./models
