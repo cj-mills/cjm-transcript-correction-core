@@ -4,7 +4,7 @@ capabilities:
   # Reads the committed decomp spine (Document + Segment) and extends it
   # with the correction overlay (Correction / CorrectionSession nodes;
   # CORRECTS / SUPERSEDES / DERIVED_FROM / REVIEWED edges). The worker's
-  # db_path is OVERRIDDEN per-run (load_plugin config) to point at the
+  # db_path is OVERRIDDEN per-run (load_capability config) to point at the
   # decomp-core graph DB where the spine lives — this core owns no graph
   # DB of its own (the graph is a shared substrate resource; pass-2 input).
   # ----------------------------------------------------------------
@@ -14,7 +14,7 @@ capabilities:
     # Environment File
     env_file: "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-capability-graph-sqlite/environment.yml"
 
-    # The Plugin Package (local source)
+    # The Capability Package (local source)
     package: "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-capability-graph-sqlite/"
 
     # Interface Libraries (schema v2: substrate AUTO-INJECTED; the tool depends
@@ -40,7 +40,7 @@ capabilities:
     # Environment File
     env_file: "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-capability-monitor-nvidia/environment.yml"
 
-    # The Plugin Package (local source)
+    # The Capability Package (local source)
     package: "/mnt/SN850X_8TB_EXT4/Projects/GitHub/cj-mills/cjm-capability-monitor-nvidia/"
 
     # Interface Libraries

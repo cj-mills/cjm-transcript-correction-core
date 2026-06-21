@@ -33,8 +33,8 @@ graph LR
     cli --> pipeline
     cli --> models
     graph_mod --> models
-    pipeline --> graph_mod
     pipeline --> models
+    pipeline --> graph_mod
     pipeline --> signals
     signals --> models
 ```
@@ -47,7 +47,7 @@ graph LR
 
     usage: cjm-transcript-correction-core [-h] {run,review} ...
 
-    Headless transcript correction: non-destructive overlay on a committed decomp
+    Headless transcript correction: non-destructive overlay on a committed source
     spine.
 
     positional arguments:
@@ -87,30 +87,17 @@ from cjm_transcript_correction_core.cli import (
 
 ``` python
 def _add_common_run_args(p: argparse.ArgumentParser) -> None:  # Shared run/review arguments
-    """Attach the capability / session / output arguments shared by `run` and `review`."""
-    p.add_argument("manifest", help="Decomp-core run manifest JSON (the committed spine)")
-    p.add_argument("--secondary-manifest", default=None,
-                   help="Second-transcriber decomp manifest of the same source (cross-transcriber diff)")
-    p.add_argument("--manifests-dir", default=".cjm/manifests", help="Capability manifests directory")
-    p.add_argument("--graph-plugin", default="cjm-capability-graph-sqlite", help="Graph-storage capability name")
-    p.add_argument("--graph-db-path", default=None,
-                   help="Override graph DB path (default: the decomp manifest's recorded db_path)")
-    p.add_argument("--sysmon-plugin", default=None,
-                   help="MonitorPlugin for empirical attribution (CR-7); loaded first; default: none")
-    p.add_argument("--session", default=None, help="Resume an existing CorrectionSession id")
-    p.add_argument("--reopen", action="store_true", help="Reopen a completed session (with --session)")
-    p.add_argument("--actor", default="human", help="Actor recorded on corrections + review markers")
-    p.add_argument("--output", default=None, help="Correction-manifest output path (default: runs/<run_id>.json)")
-    p.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
-
-
-def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
     "Attach the capability / session / output arguments shared by `run` and `review`."
 ```
 
 ``` python
 def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
-    "Build the CLI parser (subcommands: run, review)."
+    """
+    Build the CLI parser (subcommands: run, review).
+    
+    Stage 5: --secondary-manifest is RETIRED — the cross-transcriber diff is
+    intra-graph now (variant slices on the shared-skeleton segments).
+    """
 ```
 
 ``` python
@@ -152,11 +139,12 @@ def main(
 
 ``` python
 from cjm_transcript_correction_core.graph import (
-    field_of,
     submit_and_wait,
-    load_document_segments,
+    source_audio_segment_ids,
+    resolve_source_renditions,
+    load_source_segments,
     load_empty_segments,
-    count_document_segments,
+    count_source_segments,
     build_correction_node,
     build_prune_correction,
     commit_nodes_edges,
@@ -167,30 +155,19 @@ from cjm_transcript_correction_core.graph import (
     load_review_markers,
     find_corrections_for_session,
     find_prior_corrections_by_hash,
+    corrections_to_edits,
     project_effective_spine,
     build_text_correction,
     commit_text_correction,
     active_corrections,
-    load_document_corrections,
-    find_active_text_correction
+    load_source_corrections,
+    find_active_text_corrections_batch,
+    find_active_text_correction,
+    load_variant_texts
 )
 ```
 
 #### Functions
-
-``` python
-def field_of(
-    result: Any,          # Capability result (dict over the proxy wire, object in-process)
-    key: str,             # Field name
-    default: Any = None,  # Fallback
-) -> Any:  # Field value or default
-    """
-    Read a field from a dict-or-object capability result.
-    
-    The Nth ecosystem copy of this wire-shape tolerance helper (pass-2 E5/D10:
-    capability results need a typed wire layer, not a per-core copy).
-    """
-```
 
 ``` python
 async def submit_and_wait(
@@ -200,66 +177,113 @@ async def submit_and_wait(
     timeout: Optional[float] = None,  # Seconds to wait; None = no limit
     **kwargs,                         # Forwarded to the capability action
 ) -> Any:  # Completed job result payload
-    "Submit one capability job, wait for it, return its result (raise on failure)."
+    """
+    Submit one capability job, wait for it, return its result (raise on failure).
+    
+    (Restored as its own cell after the stage-2 field_of retirement removed
+    the shared cell that bundled both functions — the loop-back harness
+    caught the casualty; one-fn-per-cell prevents the recurrence.)
+    """
 ```
 
 ``` python
-def _row_to_spine_segment(row: List[Any]) -> SpineSegment:  # One query row -> SpineSegment
-    """Build a SpineSegment from a `query`-action row (first SourceRef carried)."""
-    sources = json.loads(row[5]) if row[5] else []
-    src = sources[0] if sources else {}
-    return SpineSegment(
-        id=row[0], index=int(row[1]) if row[1] is not None else -1,
-        text=row[2] or "", start_time=row[3], end_time=row[4],
-        source_plugin_name=src.get("plugin_name"), source_row_id=src.get("row_id"),
-        content_hash=src.get("content_hash"),
-    )
-
-
-async def load_document_segments(
-    queue: JobQueue,               # Started job queue
-    graph_id: str,                 # Graph-storage capability id
-    document_id: str,              # Document node id
-    limit: Optional[int] = None,   # Optional page size (LIMIT)
-    offset: Optional[int] = None,  # Optional page offset (OFFSET)
-) -> List[SpineSegment]:  # Ordered spine segments (by index)
-    "Build a SpineSegment from a `query`-action row (first SourceRef carried)."
+def _row_to_spine_segment(row: Dict[str, Any]) -> SpineSegment:  # One projected row -> SpineSegment
+    """Build a SpineSegment from a projected row (audio anchor + per-transcriber slices)."""
+    sources = row.get("sources") or []
+    text_from = row.get("text_from")
+    audio = next((s for s in sources if (s.get("slice") or {}).get("kind") == "time"), None)
+    slices: List[Dict[str, Any]] = []
+    "Build a SpineSegment from a projected row (audio anchor + per-transcriber slices)."
 ```
 
 ``` python
-async def load_document_segments(
-    queue: JobQueue,               # Started job queue
-    graph_id: str,                 # Graph-storage capability id
-    document_id: str,              # Document node id
-    limit: Optional[int] = None,   # Optional page size (LIMIT)
-    offset: Optional[int] = None,  # Optional page offset (OFFSET)
+async def source_audio_segment_ids(
+    queue: JobQueue,  # Started job queue
+    graph_id: str,    # Graph-storage capability id
+    source_id: str,   # Source node id
+) -> List[str]:  # Ordered AudioSegment node ids under the Source
+    "The Source's coarse spine (one small typed read; ordered by index)."
+```
+
+``` python
+def _rendition_label(r: Dict[str, Any]) -> str:  # Human-readable rendition label
+    """A rendition's selector/display label ("raw" or its preprocessing chain)."""
+    if r.get("is_raw")
+    "A rendition's selector/display label ("raw" or its preprocessing chain)."
+```
+
+``` python
+async def resolve_source_renditions(
+    queue: JobQueue,                   # Started job queue
+    graph_id: str,                     # Graph-storage capability id
+    source_id: str,                    # Source node id
+    selector: Optional[str] = None,    # Which rendition: "raw" | a preprocessing-descriptor substring | None = auto
+) -> List[str]:  # The AudioRendition ids whose fine spine to operate on (one chain group)
+    """
+    Pick the AudioRendition set whose fine Segment spine correction operates on.
+    
+    The fine spine hangs under renditions (raw | vocals | ...) that COEXIST under
+    one AudioSegment. With ONE decomposed rendition (the common case) it is
+    selected automatically; multiple decomposed renditions REQUIRE an explicit
+    `selector` ("raw", or a substring of the preprocessing descriptor) — the
+    spines are never silently mixed. Returns the rendition ids of the chosen
+    chain group (one per AudioSegment), or [] when nothing is decomposed yet.
+    """
+```
+
+``` python
+async def _populated_rendition_ids(
+    queue: JobQueue,          # Started job queue
+    graph_id: str,            # Graph-storage capability id
+    rendition_ids: List[str], # Candidate rendition ids
+) -> set:  # Subset that own >=1 fine Segment
+    "Which renditions actually carry a fine Segment spine (one batched read)."
+```
+
+``` python
+def _spine_query(
+    rendition_ids: List[str],  # The AudioRendition ids the spine hangs under
+    **overrides,               # NodeQuery field overrides (where / count / limit / ...)
+) -> NodeQuery:  # The source-spine read
+    "Segments PART_OF the chosen AudioRenditions (batched far-end), ordered by index."
+```
+
+``` python
+async def load_source_segments(
+    queue: JobQueue,                        # Started job queue
+    graph_id: str,                          # Graph-storage capability id
+    source_id: str,                         # Source node id
+    limit: Optional[int] = None,            # Optional page size
+    offset: Optional[int] = None,           # Optional page offset
+    rendition_selector: Optional[str] = None,  # Which rendition spine (None = auto-select)
 ) -> List[SpineSegment]:  # Ordered spine segments (by index)
-    "Load a document's Segment spine, ordered by index, via the targeted query action."
+    "Load a Source's fine Segment spine under its chosen rendition (typed query surface)."
 ```
 
 ``` python
 async def load_empty_segments(
-    queue: JobQueue,   # Started job queue
-    graph_id: str,     # Graph-storage capability id
-    document_id: str,  # Document node id
+    queue: JobQueue,  # Started job queue
+    graph_id: str,    # Graph-storage capability id
+    source_id: str,   # Source node id
+    rendition_selector: Optional[str] = None,  # Which rendition spine (None = auto-select)
 ) -> List[SpineSegment]:  # Only the empty-text segments (server-side filtered)
     """
-    Load ONLY a document's empty-text segments (scale-shaped: server-side filter).
+    Load ONLY a Source's empty-text segments under its chosen rendition (D14 prune).
     
-    The D14 prune needs ~10% of the spine; pushing the empty-text predicate into
-    SQL avoids materializing the whole document (contrast load_document_segments,
-    which the neighbour-dependent worklist signals still require). Pass-2: the
-    typed query surface should express a "filtered segment stream", not just paging.
+    The evidenced OR case (text = '' OR text IS NULL) = TWO server-side-filtered
+    queries unioned client-side — compound boolean predicates stay deferred (P8);
+    both halves materialize ~10% of the spine, never the whole source.
     """
 ```
 
 ``` python
-async def count_document_segments(
-    queue: JobQueue,   # Started job queue
-    graph_id: str,     # Graph-storage capability id
-    document_id: str,  # Document node id
-) -> int:  # Number of Segment nodes PART_OF the document
-    "Count a document's segments server-side (no materialization; scale-shaped)."
+async def count_source_segments(
+    queue: JobQueue,  # Started job queue
+    graph_id: str,    # Graph-storage capability id
+    source_id: str,   # Source node id
+    rendition_selector: Optional[str] = None,  # Which rendition spine (None = auto-select)
+) -> int:  # Number of fine Segment nodes under the Source's chosen rendition
+    "Count a Source's segments server-side under its chosen rendition (typed count mode)."
 ```
 
 ``` python
@@ -269,7 +293,14 @@ def _edge(
     relation_type: str,                        # Edge relation type
     properties: Optional[Dict[str, Any]] = None,  # Edge properties
 ) -> Dict[str, Any]:  # Edge wire dict
-    "Build an edge wire dict."
+    """
+    Build an edge wire dict with a GENERATED id.
+    
+    Used for REVIEWED markers only: review decisions are EVENTS (a re-decision
+    appends), so their edges keep generated ids. Structural overlay edges
+    (CORRECTS / SUPERSEDES / DERIVED_FROM) use the layer's deterministic
+    `make_edge` — unique per (source, target, relation) by construction.
+    """
 ```
 
 ``` python
@@ -287,7 +318,7 @@ def build_correction_node(
 
 ``` python
 def build_prune_correction(
-    document_id: str,            # Document being corrected
+    source_id: str,              # Source being corrected
     pruned: List[SpineSegment],  # Empty layer-0 segments to prune
     session_id: str,             # Owning session id
     actor: str = "human",        # Actor
@@ -298,6 +329,7 @@ def build_prune_correction(
     Non-destructive: layer-0 nodes are NOT deleted; the Correction records the
     pruned ids and DERIVED_FROM edges point at each pruned Segment. The effective
     spine drops them at projection time (reversible by superseding this node).
+    The payload carries the layer's `prune` spine-edit op vocabulary.
     """
 ```
 
@@ -308,14 +340,21 @@ async def commit_nodes_edges(
     nodes: List[Dict[str, Any]],  # Node wire dicts
     edges: List[Dict[str, Any]],  # Edge wire dicts
 ) -> Dict[str, int]:  # {"nodes": n, "edges": m} created counts
-    "Commit nodes then edges via the job queue (queue-routed; decomp D7 telemetry)."
+    """
+    Commit overlay nodes/edges through the layer's idempotent extend_graph.
+    
+    Stage 5 (C5 plumbing migrated): the layer owns emit-if-absent +
+    verify-if-present; overlay nodes have generated ids so they always add,
+    but a replayed commit collides into a verified no-op instead of
+    duplicating structural edges.
+    """
 ```
 
 ``` python
 async def start_session(
     queue: JobQueue,   # Started job queue
     graph_id: str,     # Graph-storage capability id
-    scope: List[str],  # Document ids in scope
+    scope: List[str],  # Source node ids in scope
 ) -> CorrectionSession:  # The committed CorrectionSession
     "Create + commit a new CorrectionSession node."
 ```
@@ -326,7 +365,7 @@ async def get_session(
     graph_id: str,    # Graph-storage capability id
     session_id: str,  # CorrectionSession node id
 ) -> Optional[Dict[str, Any]]:  # The session node dict, or None
-    "Fetch a CorrectionSession node by id (resume/reopen)."
+    "Fetch a CorrectionSession node by id (resume/reopen) — typed get, dict shape preserved."
 ```
 
 ``` python
@@ -360,7 +399,14 @@ async def load_review_markers(
     graph_id: str,    # Graph-storage capability id
     session_id: str,  # Owning session id
 ) -> Dict[str, str]:  # segment_id -> decision for the session
-    "Load a session's review markers (targeted query over REVIEWED edges)."
+    "Load a session's review markers (typed edge projection over REVIEWED edges)."
+```
+
+``` python
+def _node_to_correction_dict(
+    node: Any,  # GraphNode (typed task result) or its wire dict
+) -> Dict[str, Any]:  # Correction properties + "id" (the pre-stage-4 row shape)
+    "Flatten a Correction node to its properties dict + id."
 ```
 
 ``` python
@@ -369,7 +415,7 @@ async def find_corrections_for_session(
     graph_id: str,    # Graph-storage capability id
     session_id: str,  # Owning session id
 ) -> List[Dict[str, Any]]:  # Correction property dicts for the session
-    "List corrections recorded in a session (targeted query by session_id property)."
+    "List corrections recorded in a session (typed property filter)."
 ```
 
 ``` python
@@ -381,9 +427,23 @@ async def find_prior_corrections_by_hash(
     """
     Cross-transcript correction-cache lookup (targeted; the graph IS the lexicon).
     
-    A correction made on identical content in ANY prior transcript is discoverable
-    here, keyed by content_hash via a CORRECTS-edge join -- the targeted,
-    scale-shaped read the design wants (vs whole-neighborhood get_context).
+    THE stage-4 promotion landing: the raw two-table JOIN this function carried
+    (C-ledger site 6) became ONE typed far-end provenance constraint
+    (`RelationPredicate.node_source`, content-hash-primary per CR-19) — the
+    hottest review-path read is portable now.
+    """
+```
+
+``` python
+def corrections_to_edits(
+    corrections: List[Dict[str, Any]],  # ACTIVE correction property dicts
+) -> List[SpineEdit]:  # The layer's neutral spine-edit operations
+    """
+    Map this core's Correction payloads onto the layer's spine-edit vocabulary.
+    
+    The DOMAIN interpretation (correction_type + payload shapes) stays here;
+    the projection MECHANICS (ordering, latest-wins, prune/replace/boundary
+    semantics) are the layer's (CR-18: C11 migrated).
     """
 ```
 
@@ -393,20 +453,19 @@ def project_effective_spine(
     corrections: List[Dict[str, Any]],  # Applied correction property dicts
 ) -> List[SpineSegment]:  # The effective spine after applying corrections
     """
-    Project the effective spine = layer-0 + applied corrections, resolved in-core.
+    Project the effective spine = layer-0 + applied corrections.
     
-    Revolution-1 supports the operations built this session:
-      - grouping/prune_empty: drop pruned segment ids (re-thread is positional).
-      - text_content/replace_text: replace a segment's text by id.
-    Superseded corrections are skipped. This hand-rolled projection is direct
-    CR-18 spec material (the graph-aware layer should eventually own
-    "give me the effective view of this spine").
+    Stage 5: the projection MECHANICS live in `cjm-context-graph-layer`
+    (`project_effective_spine` over SpineUnits — prune, replace_text, and the
+    reserved boundary_shift, with created_at ordering + latest-wins); this
+    wrapper converts SpineSegments <-> SpineUnits and re-attaches the
+    segment metadata by id.
     """
 ```
 
 ``` python
 def build_text_correction(
-    document_id: str,                      # Document the segment belongs to
+    source_id: str,                        # Source the segment belongs to
     segment_id: str,                       # Layer-0 Segment being corrected
     new_text: str,                         # Corrected text
     session_id: str,                       # Owning session id
@@ -423,7 +482,7 @@ def build_text_correction(
     new text in its payload + a CORRECTS edge to the segment. A re-edit adds a
     SUPERSEDES edge (new -> prior) so supersession is graph-native + append-only
     (the prior Correction is never mutated; it is excluded from the effective view
-    because it is a SUPERSEDES target). Direct CR-18 spec material.
+    because it is a SUPERSEDES target — the C16 semantics, layer-resolved).
     """
 ```
 
@@ -431,7 +490,7 @@ def build_text_correction(
 async def commit_text_correction(
     queue: JobQueue,                       # Started job queue
     graph_id: str,                         # Graph-storage capability id
-    document_id: str,                      # Document the segment belongs to
+    source_id: str,                        # Source the segment belongs to
     segment_id: str,                       # Layer-0 Segment being corrected
     new_text: str,                         # Corrected text
     session_id: str,                       # Owning session id
@@ -445,34 +504,50 @@ async def commit_text_correction(
 
 ``` python
 def active_corrections(
-    corrections: List[Dict[str, Any]],  # Corrections (e.g. from load_document_corrections)
+    corrections: List[Dict[str, Any]],  # Corrections (e.g. from load_source_corrections)
     superseded_ids: set,                # Ids that are SUPERSEDES targets
 ) -> List[Dict[str, Any]]:  # Only the effective (non-superseded) corrections
-    "Filter to the effective correction set (drop SUPERSEDES targets; append-only supersession)."
+    "Filter to the effective correction set (the layer's resolve_active over a read superseded set)."
 ```
 
 ``` python
 async def _superseded_ids(
     queue: JobQueue,            # Started job queue
-    graph_id: str,             # Graph-storage capability id
+    graph_id: str,              # Graph-storage capability id
     correction_ids: List[str],  # Candidate correction ids
 ) -> set:  # Subset that are SUPERSEDES targets
-    "Return which of the given corrections have been superseded (are SUPERSEDES targets)."
+    "Which of the given corrections are SUPERSEDES targets (typed id-list batch)."
 ```
 
 ``` python
-async def load_document_corrections(
-    queue: JobQueue,   # Started job queue
-    graph_id: str,     # Graph-storage capability id
-    document_id: str,  # Document node id
-) -> Tuple[List[Dict[str, Any]], set]:  # (all corrections for the doc, superseded id set)
+async def load_source_corrections(
+    queue: JobQueue,  # Started job queue
+    graph_id: str,    # Graph-storage capability id
+    source_id: str,   # Source node id
+) -> Tuple[List[Dict[str, Any]], set]:  # (all corrections for the source, superseded id set)
     """
-    Load every Correction targeting a document (across sessions) + the superseded-id set.
+    Load every Correction targeting a Source (across sessions) + the superseded-id set.
     
-    Document-scoped (corrections carry payload.document_id) so the effective view is
-    a property of the document, not one session -- the persistence/resume/reopen
-    requirement. Append-only: supersession is read from SUPERSEDES edges, never a
-    status mutation.
+    Source-scoped (corrections carry payload.source_id — a dotted-path typed
+    predicate) so the effective view is a property of the SOURCE, not one
+    session — the persistence/resume/reopen requirement. Append-only:
+    supersession is read from SUPERSEDES edges, never a status mutation.
+    """
+```
+
+``` python
+async def find_active_text_corrections_batch(
+    queue: JobQueue,         # Started job queue
+    graph_id: str,           # Graph-storage capability id
+    segment_ids: List[str],  # Segments to look up
+) -> Dict[str, Dict[str, Any]]:  # segment_id -> active text correction
+    """
+    Active text corrections for MANY segments in TWO round-trips (C17).
+    
+    One far-end batch read (Corrections with CORRECTS edges into the id set;
+    `RelationPredicate.node_ids`) + one superseded-set read — replacing the
+    per-item lookup the review loop paid (a 1,275-item review would have been
+    1,275 queries; now 2). Latest non-superseded correction per segment wins.
     """
 ```
 
@@ -482,18 +557,30 @@ async def find_active_text_correction(
     graph_id: str,    # Graph-storage capability id
     segment_id: str,  # Segment to look up
 ) -> Optional[Dict[str, Any]]:  # The current non-superseded text correction, or None
+    "Single-segment convenience over the batch read (cross-session; latest wins)."
+```
+
+``` python
+async def load_variant_texts(
+    queue: JobQueue,               # Started job queue
+    graph_id: str,                 # Graph-storage capability id
+    segments: List[SpineSegment],  # Spine segments (with text_slices)
+) -> Dict[str, Dict[str, str]]:  # segment_id -> {transcriber: chunk text}
     """
-    Find the active (non-superseded) text correction on a segment, across sessions (latest wins).
+    Resolve per-transcriber chunk texts from the segments' CharSlice refs.
     
-    Cross-session lookup is what makes a re-edit in a LATER session supersede an
-    earlier correction (the resume/reopen requirement). The graph is the cache.
+    Stage 5: the cross-transcriber diff is INTRA-GRAPH — text is stored once
+    per transcriber at the coarse Transcript nodes; this fetches ALL referenced
+    Transcript nodes in ONE batched typed read and slices their text
+    client-side by each segment's char ranges. Replaces the retired
+    second-decomp-manifest positional join (C4/C14's shared-skeleton model).
     """
 ```
 
 #### Variables
 
 ``` python
-_SEGMENTS_SQL = "SELECT n.id, json_extract(n.properties, '$.index'), json_extract(n.properties, '$.text'), json_extract(n.properties, '$.start_time'), json_extract(n.properties, '$.end_time'), n.sources FROM nodes n JOIN edges e ON e.source_id = n.id WHERE e.target_id = ? AND e.relation_type = ? AND n.label = 'Segment' ORDER BY json_extract(n.properties, '$.index')"
+_SPINE_PROJECTION = [6 items]  # + structural "id"
 ```
 
 ### models (`models.ipynb`)
@@ -534,36 +621,72 @@ class CorrectionRelations:
 ```
 
 ``` python
-class Correction(DomainNode):
+@dataclass
+class Correction:
     """
     A single non-destructive correction over the committed spine (overlay node).
     
     Layer-0 spine nodes are immutable; every correction is a supersede-able
-    overlay. Defined in-core as a `DomainNode` subclass (revolution-1) rather
-    than in the shared graph-domain library — its shape is still being validated
-    by real runs; the node/edge construction + effective-view projection are
-    CR-18 spec material, not yet substrate-owned.
+    overlay. Defined IN-CORE (the C6 pattern, kept at stage 5 after
+    cjm-graph-domains dissolved): a plain dataclass mapping itself onto the
+    generic GraphNode. Corrections are DECISIONS (asserted events) — they keep
+    GENERATED ids, the FLIP-TRIGGER-protected class.
     """
+    
+    correction_type: str  # "text_content" | "punctuation" | "grouping"
+    status: str = 'applied'  # "proposed" | "applied" | "superseded"
+    session_id: str = ''  # Owning CorrectionSession id
+    payload: Dict[str, Any] = field(...)  # Type-specific data (new text, prune set, ...)
+    actor: str = 'human'  # "human" | "agent:<id>" | "capability:<name>"
+    canonical_form: Optional[str]  # Optional entity key (cross-transcript matching)
+    rationale: Optional[str]  # Optional human/agent note
+    created_at: float = field(...)  # Unix timestamp
+    id: str = field(...)  # Generated node id (decision = event)
+    
+    def to_graph_node(self) -> GraphNode:  # Generic graph node (label = class name)
+            """Map onto a generic GraphNode (None-valued fields excluded from properties)."""
+            props = {k: v for k, v in asdict(self).items() if k != "id" and v is not None}
+        "Map onto a generic GraphNode (None-valued fields excluded from properties)."
 ```
 
 ``` python
-class CorrectionSession(DomainNode):
-    "A resumable, reopen-able correction review over one or more documents."
+@dataclass
+class CorrectionSession:
+    "A resumable, reopen-able correction review over one or more sources."
+    
+    status: str = 'in_progress'  # "in_progress" | "completed" | "reopened"
+    scope: List[str] = field(...)  # Source node ids in scope
+    started_at: float = field(...)  # Unix timestamp at session start
+    updated_at: float = field(...)  # Unix timestamp of last activity
+    id: str = field(...)  # Generated node id (session = event)
+    
+    def to_graph_node(self) -> GraphNode:  # Generic graph node
+            """Map onto a generic GraphNode (None-valued fields excluded from properties)."""
+            props = {k: v for k, v in asdict(self).items() if k != "id" and v is not None}
+        "Map onto a generic GraphNode (None-valued fields excluded from properties)."
 ```
 
 ``` python
 @dataclass
 class SpineSegment:
-    "A committed layer-0 Segment loaded from the graph (read view)."
+    """
+    A committed layer-0 Segment loaded from the graph (read view).
+    
+    Stage 5 (Source-rooted schema): segments carry an audio `TimeSlice` ref
+    (the stable anchor) + per-transcriber `CharSlice` refs into Transcript
+    nodes; `content_hash` is the AUTHORITATIVE text's hash (the `text_from`
+    slice) — the cross-transcript cache key.
+    """
     
     id: str  # Graph Segment node id
-    index: int  # 0-based position in the document spine
-    text: str  # Segment text (may be empty for silence VAD chunks)
+    index: int  # 0-based position in the source spine
+    text: str  # Layer-0 text (may be empty for silence VAD chunks)
     start_time: Optional[float]  # Source-coordinate start (seconds)
     end_time: Optional[float]  # Source-coordinate end (seconds)
-    source_plugin_name: Optional[str]  # First SourceRef plugin_name (provenance anchor)
-    source_row_id: Optional[str]  # First SourceRef row_id (upstream job_id)
-    content_hash: Optional[str]  # First SourceRef content_hash
+    source_locator: Optional[str]  # Audio SourceRef locator URI (the stable provenance anchor)
+    content_hash: Optional[str]  # Authoritative text slice's content_hash (None when empty)
+    text_from: Optional[str]  # Authoritative Transcript node id (provenance designation)
+    text_slices: List[Dict[str, Any]] = field(...)  # [{transcript, start, end, content_hash}]
     
     def is_empty(self) -> bool:  # True when the segment has no non-whitespace text
         "Empty-text segment (silence VAD chunk with no aligned words; decomp D14)."
@@ -586,11 +709,12 @@ class WorklistItem:
 class CorrectionConfig:
     "Configuration for one correction run."
     
-    graph_plugin: str = 'cjm-capability-graph-sqlite'  # Graph-storage capability id
+    graph_capability: str = 'cjm-capability-graph-sqlite'  # Graph-storage capability id
     graph_db_path: Optional[str]  # Graph DB the spine lives in (from the decomp manifest)
     actor: str = 'human'  # Actor recorded on corrections + review markers
     assume_yes: bool = False  # Auto-accept HITL seams (headless mode)
     prune_empty: bool = True  # Run the D14 empty-segment prune as the first operation
+    rendition_selector: Optional[str]  # Which AudioRendition spine to correct ("raw" | preprocessing substring); None = auto-select the populated one (error if ambiguous)
     
     def to_dict(self) -> Dict[str, Any]:  # Plain-dict snapshot for the manifest
         "Serialize to a plain dict."
@@ -599,19 +723,24 @@ class CorrectionConfig:
 ``` python
 @dataclass
 class CorrectionManifest:
-    "Durable record of one correction run (proto-bundle; chains decomp -> correction; CR-20)."
+    """
+    Durable record of one correction run (proto-bundle; chainable, CR-20).
+    
+    Schema 0.2.0 (stage 5): `documents` became `sources` (Document dissolved
+    into Source); the cross-transcriber diff is intra-graph now, so the
+    secondary-manifest pointer is gone.
+    """
     
     run_id: str  # Unique run identifier
     created_at: float  # Unix timestamp at run start
     config: Dict[str, Any]  # CorrectionConfig snapshot
     decomp_manifest: str  # Path to the consumed decomp run manifest
-    graph_db_path: str  # Graph DB the corrections were written to (shared with decomp)
-    session_id: str  # CorrectionSession node id
-    source_format: str = ''  # Upstream (decomp) manifest format tag
-    source_version: str = ''  # Upstream (decomp) manifest schema version
-    secondary_manifest: Optional[str]  # Optional second-transcriber decomp manifest (diff)
-    signals_used: List[str] = field(...)  # Signal names contributing to the worklist
-    documents: List[Dict[str, Any]] = field(...)  # Per-document outcome records
+    graph_db_path: str  # The shared graph DB the spine + overlay live in
+    session_id: str  # CorrectionSession node id this run used
+    source_format: str = ''  # Upstream manifest format tag (interchange contract)
+    source_version: str = ''  # Upstream manifest schema version
+    signals_used: List[str] = field(...)  # Deterministic signals active this run
+    sources: List[Dict[str, Any]] = field(...)  # Per-source outcome records
     FORMAT: str = field(...)  # Format tag
     VERSION: str = field(...)  # Schema version
     
@@ -643,7 +772,7 @@ from cjm_transcript_correction_core.pipeline import (
     compute_worklist,
     confirm_seam,
     prune_empty_segments,
-    collect_plugin_info,
+    collect_capability_info,
     run_correction,
     review_worklist,
     run_review
@@ -662,7 +791,7 @@ def load_decomp_manifest(
 ``` python
 def resolve_graph_db_path(
     manifest: Dict[str, Any],        # Decomp manifest dict
-    graph_plugin: str,               # Graph-storage capability id
+    graph_capability: str,               # Graph-storage capability id
     override: Optional[str] = None,  # Explicit override (wins)
 ) -> Optional[str]:  # Absolute DB path the spine lives in
     """
@@ -676,9 +805,9 @@ def resolve_graph_db_path(
 
 ``` python
 def compute_worklist(
-    segments: List[SpineSegment],                    # Ordered primary spine
-    review_markers: Dict[str, str],                  # segment_id -> decision (persisted)
-    secondary: Optional[List[SpineSegment]] = None,  # Optional second-transcriber spine (diff)
+    segments: List[SpineSegment],                       # Ordered layer-0 spine
+    review_markers: Dict[str, str],                     # segment_id -> decision (persisted)
+    variants: Optional[Dict[str, Dict[str, str]]] = None,  # segment_id -> {transcriber: text} (intra-graph)
 ) -> List[WorklistItem]:  # Items still needing review, flagged
     """
     Recompute the worklist from layer-0 + signals + review state (only decisions persist).
@@ -714,7 +843,7 @@ async def prune_empty_segments(
     queue: JobQueue,        # Started job queue
     cfg: CorrectionConfig,  # Run configuration
     graph_id: str,          # Graph-storage capability id
-    document_id: str,       # Document being corrected
+    source_id: str,         # Source being corrected
     total_count: int,       # Total segment count (for the summary)
     session_id: str,        # Owning session id
 ) -> Dict[str, Any]:  # {"pruned": n, "correction_id": id|None}
@@ -722,14 +851,15 @@ async def prune_empty_segments(
     First operation: prune empty (silence) segments as one grouping correction (D14).
     
     Deterministic, no-human restructure proof: loads ONLY the empty segments
-    (server-side filter -- scale-shaped), builds a batch grouping Correction +
-    DERIVED_FROM edges, commits via the queue, and records REVIEWED markers
-    (decision=corrected). Layer-0 untouched; reversible by superseding.
+    (server-side filter -- scale-shaped) under the chosen rendition spine, builds
+    a batch grouping Correction + DERIVED_FROM edges, commits via the queue, and
+    records REVIEWED markers (decision=corrected). Layer-0 untouched; reversible
+    by superseding.
     """
 ```
 
 ``` python
-def collect_plugin_info(
+def collect_capability_info(
     manager: CapabilityManager,   # Manager holding the loaded capabilities
     instance_ids: List[str],  # Instance ids to record
 ) -> Dict[str, Dict[str, Any]]:  # instance_id -> {name, version, db_path}
@@ -737,55 +867,66 @@ def collect_plugin_info(
 ```
 
 ``` python
+def _journal_run_event(
+    """
+    Append a host-tier run event to the journal (CR-14 follow-up).
+    
+    The cores are the trusted host writer class: RUN_STARTED/RUN_FINISHED
+    bracket the run so the run manifest (same run_id) links to every job row
+    the run produced. No-op when the manager has no journal store; append
+    failures stay LOUD (journal contract).
+    """
+```
+
+``` python
 async def run_correction(
-    manager: CapabilityManager,                         # Manager with the graph capability loaded
-    queue: JobQueue,                                # Started job queue
-    cfg: CorrectionConfig,                          # Run configuration
-    decomp_manifest_path: str,                      # Decomp run manifest to correct
-    graph_db_path: str,                             # Resolved graph DB path (shared with decomp)
-    run_id: Optional[str] = None,                   # Override run id
-    session_id: Optional[str] = None,               # Resume/reopen an existing session
-    reopen: bool = False,                           # Reopen a completed session
-    secondary_manifest_path: Optional[str] = None,  # Second-transcriber decomp manifest (diff)
+    manager: CapabilityManager,            # Manager with the graph capability loaded
+    queue: JobQueue,                   # Started job queue
+    cfg: CorrectionConfig,             # Run configuration
+    decomp_manifest_path: str,         # Decomp run manifest to correct
+    graph_db_path: str,                # Resolved graph DB path (shared with decomp)
+    run_id: Optional[str] = None,      # Override run id
+    session_id: Optional[str] = None,  # Resume/reopen an existing session
+    reopen: bool = False,              # Reopen a completed session
 ) -> CorrectionManifest:  # Manifest of the correction run
     """
-    Correct every document in a decomp run manifest (prune + worklist surfacing).
+    Correct every source in a decomp run manifest (prune + worklist surfacing).
     
-    Per document: load spine -> [optional secondary spine] -> recompute worklist
-    -> prune empty segments [prune-review seam] -> project effective spine ->
-    record outcome. Resumable: a prior session's review markers drop already-decided
-    segments from the worklist.
+    Per source: load spine (with variant slices) -> recompute worklist -> prune
+    empty segments [prune-review seam] -> project effective spine -> record
+    outcome. The cross-transcriber diff is INTRA-GRAPH (stage 5): variant texts
+    come from the segments' own Transcript slice refs — no second manifest. The
+    fine spine is scoped to the chosen AudioRendition (cfg.rendition_selector;
+    auto-selected when a source has one decomposed rendition). Resumable: a prior
+    session's review markers drop decided segments.
     """
 ```
 
 ``` python
 def _format_worklist_item(
-    item: WorklistItem,                     # The item to present
-    effective_text: str,                    # Current effective text (layer-0 or latest correction)
-    secondary_text: Optional[str] = None,   # Secondary-transcriber text (if divergence)
-    prior_correction: Optional[str] = None, # Suggested text from the cross-transcript cache
-) -> str:  # Multi-line presentation block
     "Render a worklist item for the CLI review seam (text + timing + flags + hints)."
 ```
 
 ``` python
 async def review_worklist(
-    queue: JobQueue,                                      # Started job queue
-    cfg: CorrectionConfig,                                # Run configuration
-    document_id: str,                                     # Document under review
-    worklist: List[WorklistItem],                         # Flagged, undecided items
-    session_id: str,                                      # Owning session id
-    secondary_by_index: Optional[Dict[int, str]] = None,  # index -> secondary text (divergence)
-    max_items: int = 0,                                   # Cap (0 = all)
+    queue: JobQueue,                                    # Started job queue
+    cfg: CorrectionConfig,                              # Run configuration
+    source_id: str,                                     # Source under review
+    worklist: List[WorklistItem],                       # Flagged, undecided items
+    session_id: str,                                    # Owning session id
+    variant_by_segment: Optional[Dict[str, str]] = None,  # segment_id -> divergent variant text
+    max_items: int = 0,                                 # Cap (0 = all)
 ) -> Dict[str, int]:  # {"corrected": n, "skipped": n, "reviewed": n}
     """
     Interactive review loop -> text_content corrections (cheapest HITL seam).
     
-    Per item: present text + timing + flags (+ secondary text + cross-transcript
-    cache hit), then read a decision from stdin:
+    Per item: present text + timing + flags (+ the divergent variant text +
+    cross-transcript cache hit), then read a decision from stdin:
       [a]ccept (mark reviewed) / [e]dit (commit a text_content correction;
       auto-supersedes any prior correction on the segment) / [s]kip / [q]uit.
-    On 'e', the next stdin line is the new text (blank -> adopt the secondary).
+    On 'e', the next stdin line is the new text (blank -> adopt the variant) —
+    adopting a variant IS the "extract the superior lightweight reading" move,
+    and its provenance is the variant slice already on the segment.
     Drivable headless via a stdin pipe (E9-companion); cfg.assume_yes marks every
     item reviewed with no edits.
     """
@@ -793,24 +934,25 @@ async def review_worklist(
 
 ``` python
 async def run_review(
-    manager: CapabilityManager,                         # Manager with the graph capability loaded
-    queue: JobQueue,                                # Started job queue
-    cfg: CorrectionConfig,                          # Run configuration
-    decomp_manifest_path: str,                      # Decomp run manifest to review
-    graph_db_path: str,                             # Resolved graph DB path (shared with decomp)
-    run_id: Optional[str] = None,                   # Override run id
-    session_id: Optional[str] = None,               # Resume/reopen an existing session
-    reopen: bool = False,                           # Reopen a completed session
-    secondary_manifest_path: Optional[str] = None,  # Second-transcriber decomp manifest (diff)
-    max_items: int = 0,                             # Max worklist items to review per doc (0 = all)
+    manager: CapabilityManager,            # Manager with the graph capability loaded
+    queue: JobQueue,                   # Started job queue
+    cfg: CorrectionConfig,             # Run configuration
+    decomp_manifest_path: str,         # Decomp run manifest to review
+    graph_db_path: str,                # Resolved graph DB path (shared with decomp)
+    run_id: Optional[str] = None,      # Override run id
+    session_id: Optional[str] = None,  # Resume/reopen an existing session
+    reopen: bool = False,              # Reopen a completed session
+    max_items: int = 0,                # Max worklist items to review per source (0 = all)
 ) -> CorrectionManifest:  # Manifest of the review run
     """
     Interactive review pass over a decomp manifest's flagged worklist (text corrections).
     
     Like run_correction but enters the text-correction review loop instead of the
     prune. Empty segments are excluded from the review worklist (they belong to the
-    prune); the effective spine is projected from the DOCUMENT's corrections (across
+    prune); the effective spine is projected from the SOURCE's corrections (across
     sessions), so a resumed/reopened session sees prior prune + text corrections.
+    The variant hints come from the segments' own slice refs (intra-graph). The
+    fine spine is scoped to the chosen AudioRendition (cfg.rendition_selector).
     """
 ```
 
@@ -828,7 +970,7 @@ from cjm_transcript_correction_core.signals import (
     fa_coverage_flags,
     levenshtein,
     phonetic_key,
-    cross_transcriber_diff,
+    variant_divergence,
     cluster_variants,
     compute_signal_flags
 )
@@ -918,25 +1060,26 @@ def _normalize_text(text: str) -> str:  # Lowercased alphabetic word tokens, spa
     return " ".join(_WORD_RE.findall((text or "").lower()))
 
 
-def cross_transcriber_diff(
-    primary: List[SpineSegment],    # Primary (e.g. accuracy-model) spine, ordered
-    secondary: List[SpineSegment],  # Secondary (e.g. lightweight-model) spine, ordered
-) -> Dict[int, Tuple[str, str]]:  # primary index -> (primary_text, secondary_text) where they diverge
+def variant_divergence(
+    segments: List[SpineSegment],            # Layer-0 spine (authoritative text)
+    variants: Dict[str, Dict[str, str]],     # segment_id -> {transcriber: chunk text} (from the graph)
+) -> Dict[int, Tuple[str, str]]:  # spine index -> (authoritative_text, first divergent variant)
     "Normalize segment text for cross-transcriber comparison."
 ```
 
 ``` python
-def cross_transcriber_diff(
-    primary: List[SpineSegment],    # Primary (e.g. accuracy-model) spine, ordered
-    secondary: List[SpineSegment],  # Secondary (e.g. lightweight-model) spine, ordered
-) -> Dict[int, Tuple[str, str]]:  # primary index -> (primary_text, secondary_text) where they diverge
+def variant_divergence(
+    segments: List[SpineSegment],            # Layer-0 spine (authoritative text)
+    variants: Dict[str, Dict[str, str]],     # segment_id -> {transcriber: chunk text} (from the graph)
+) -> Dict[int, Tuple[str, str]]:  # spine index -> (authoritative_text, first divergent variant)
     """
-    Positionally diff two transcriber spines of the SAME source.
+    Within-segment cross-transcriber divergence (stage 5: intra-graph).
     
-    Both decomp spines share an identical VAD-chunk skeleton (same audio -> same
-    VAD timing), so they align 1:1 by index; proper-noun / error sites concentrate
-    where the normalized texts diverge (the force-multiplier signal). A length
-    mismatch is recorded at the sentinel key -1.
+    The shared-skeleton model stores every transcriber's chunk text as a slice
+    on ONE segment, so divergence is a WITHIN-NODE comparison now (C14 realized)
+    — no second spine, no positional join. Proper-noun / error sites concentrate
+    where the normalized texts diverge (the force-multiplier signal); the
+    authoritative transcriber's own variant compares equal by construction.
     """
 ```
 
@@ -955,14 +1098,16 @@ def cluster_variants(
 
 ``` python
 def compute_signal_flags(
-    segments: List[SpineSegment],                    # Ordered primary spine
-    secondary: Optional[List[SpineSegment]] = None,  # Optional second-transcriber spine
+    segments: List[SpineSegment],                       # Ordered layer-0 spine
+    variants: Optional[Dict[str, Dict[str, str]]] = None,  # segment_id -> {transcriber: text} (intra-graph)
 ) -> Dict[int, List[str]]:  # segment index -> combined Tier-1 flags
     """
     Combine all deterministic Tier-1 signals into per-segment flags.
     
     The worklist is RECOMPUTED from this each session (only decisions persist);
-    new signals join here and are picked up automatically.
+    new signals join here and are picked up automatically. Stage 5: the
+    transcriber-divergence signal reads the segments' own variant slices
+    (intra-graph), not a second decomp spine.
     """
 ```
 

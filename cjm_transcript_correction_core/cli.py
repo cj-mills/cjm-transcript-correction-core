@@ -33,15 +33,15 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:  # Shared run/revi
     """Attach the capability / session / output arguments shared by `run` and `review`."""
     p.add_argument("manifest", help="Decomp-core run manifest JSON (the committed spine)")
     p.add_argument("--manifests-dir", default=".cjm/manifests", help="Capability manifests directory")
-    p.add_argument("--graph-plugin", default="cjm-capability-graph-sqlite", help="Graph-storage capability name")
+    p.add_argument("--graph-capability", default="cjm-capability-graph-sqlite", help="Graph-storage capability name")
     p.add_argument("--graph-db-path", default=None,
                    help="Override graph DB path (default: the decomp manifest's recorded db_path)")
     p.add_argument("--rendition", default=None,
                    help="Which AudioRendition spine to correct when a source has more than one "
                         "(\"raw\" or a preprocessing substring e.g. \"demucs\"); default: auto-select the "
                         "decomposed one (errors if ambiguous)")
-    p.add_argument("--sysmon-plugin", default=None,
-                   help="MonitorPlugin for empirical attribution (CR-7); loaded first; default: none")
+    p.add_argument("--sysmon-capability", default=None,
+                   help="monitor for empirical attribution (CR-7); loaded first; default: none")
     p.add_argument("--session", default=None, help="Resume an existing CorrectionSession id")
     p.add_argument("--reopen", action="store_true", help="Reopen a completed session (with --session)")
     p.add_argument("--actor", default="human", help="Actor recorded on corrections + review markers")
@@ -104,25 +104,25 @@ async def run_command(
         raise SystemExit(f"decomp manifest not found: {manifest_path}")
 
     decomp = load_decomp_manifest(manifest_path)
-    graph_db_path = resolve_graph_db_path(decomp, args.graph_plugin, override=args.graph_db_path)
+    graph_db_path = resolve_graph_db_path(decomp, args.graph_capability, override=args.graph_db_path)
     if not graph_db_path:
         raise SystemExit("could not resolve graph DB path from manifest; pass --graph-db-path explicitly")
 
     cfg = CorrectionConfig(
-        graph_plugin=args.graph_plugin, graph_db_path=graph_db_path,
+        graph_capability=args.graph_capability, graph_db_path=graph_db_path,
         actor=args.actor, assume_yes=args.yes, prune_empty=not args.no_prune,
         rendition_selector=args.rendition,
     )
 
     manager = CapabilityManager(
         search_paths=[Path(args.manifests_dir)],
-        sysmon_capability_name=args.sysmon_plugin,
+        sysmon_capability_name=args.sysmon_capability,
     )
-    load_order = ([args.sysmon_plugin] if args.sysmon_plugin else []) + [cfg.graph_plugin]
+    load_order = ([args.sysmon_capability] if args.sysmon_capability else []) + [cfg.graph_capability]
     # Point the graph worker at the decomp graph DB (the shared spine) via load-time config.
-    load_capabilities(manager, load_order, configs={cfg.graph_plugin: {"db_path": graph_db_path}})
+    load_capabilities(manager, load_order, configs={cfg.graph_capability: {"db_path": graph_db_path}})
 
-    queue = JobQueue(deps=manager, sysmon_capability_name=args.sysmon_plugin)
+    queue = JobQueue(deps=manager, sysmon_capability_name=args.sysmon_capability)
     await queue.start()
     try:
         manifest = await run_correction(
@@ -157,18 +157,18 @@ async def review_command(
     if not Path(manifest_path).exists():
         raise SystemExit(f"decomp manifest not found: {manifest_path}")
     decomp = load_decomp_manifest(manifest_path)
-    graph_db_path = resolve_graph_db_path(decomp, args.graph_plugin, override=args.graph_db_path)
+    graph_db_path = resolve_graph_db_path(decomp, args.graph_capability, override=args.graph_db_path)
     if not graph_db_path:
         raise SystemExit("could not resolve graph DB path from manifest; pass --graph-db-path explicitly")
 
-    cfg = CorrectionConfig(graph_plugin=args.graph_plugin, graph_db_path=graph_db_path,
+    cfg = CorrectionConfig(graph_capability=args.graph_capability, graph_db_path=graph_db_path,
                            actor=args.actor, assume_yes=args.yes, prune_empty=False,
                            rendition_selector=args.rendition)
-    manager = CapabilityManager(search_paths=[Path(args.manifests_dir)], sysmon_capability_name=args.sysmon_plugin)
-    load_order = ([args.sysmon_plugin] if args.sysmon_plugin else []) + [cfg.graph_plugin]
-    load_capabilities(manager, load_order, configs={cfg.graph_plugin: {"db_path": graph_db_path}})
+    manager = CapabilityManager(search_paths=[Path(args.manifests_dir)], sysmon_capability_name=args.sysmon_capability)
+    load_order = ([args.sysmon_capability] if args.sysmon_capability else []) + [cfg.graph_capability]
+    load_capabilities(manager, load_order, configs={cfg.graph_capability: {"db_path": graph_db_path}})
 
-    queue = JobQueue(deps=manager, sysmon_capability_name=args.sysmon_plugin)
+    queue = JobQueue(deps=manager, sysmon_capability_name=args.sysmon_capability)
     await queue.start()
     try:
         manifest = await run_review(

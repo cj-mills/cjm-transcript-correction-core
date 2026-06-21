@@ -10,7 +10,7 @@ Docs: https://cj-mills.github.io/cjm-transcript-correction-corepipeline.html.md"
 
 # %% auto #0
 __all__ = ['logger', 'load_decomp_manifest', 'resolve_graph_db_path', 'compute_worklist', 'confirm_seam', 'prune_empty_segments',
-           'collect_plugin_info', 'run_correction', 'review_worklist', 'run_review']
+           'collect_capability_info', 'run_correction', 'review_worklist', 'run_review']
 
 # %% ../nbs/pipeline.ipynb #bd8dc9acc4fc
 import json
@@ -57,7 +57,7 @@ def load_decomp_manifest(
 
 def resolve_graph_db_path(
     manifest: Dict[str, Any],        # Decomp manifest dict
-    graph_plugin: str,               # Graph-storage capability id
+    graph_capability: str,               # Graph-storage capability id
     override: Optional[str] = None,  # Explicit override (wins)
 ) -> Optional[str]:  # Absolute DB path the spine lives in
     """Resolve the graph DB path: explicit override > the decomp manifest's recorded db_path.
@@ -68,7 +68,7 @@ def resolve_graph_db_path(
     """
     if override:
         return override
-    rec = (manifest.get("plugins", {}) or {}).get(graph_plugin, {}) or {}
+    rec = (manifest.get("capabilities", {}) or {}).get(graph_capability, {}) or {}
     return rec.get("db_path")
 
 # %% ../nbs/pipeline.ipynb #e3685d9fa665
@@ -159,7 +159,7 @@ async def prune_empty_segments(
 
 
 # %% ../nbs/pipeline.ipynb #702078f928ea
-def collect_plugin_info(
+def collect_capability_info(
     manager: CapabilityManager,   # Manager holding the loaded capabilities
     instance_ids: List[str],  # Instance ids to record
 ) -> Dict[str, Dict[str, Any]]:  # instance_id -> {name, version, db_path}
@@ -225,7 +225,7 @@ async def run_correction(
     _journal_run_event(manager, SubstrateEventType.RUN_STARTED.value, run_id, cfg.actor, {
         "core": "cjm-transcript-correction-core", "mode": "correction",
         "decomp_manifest": str(decomp_manifest_path),
-        "graph_plugin": cfg.graph_plugin,
+        "graph_capability": cfg.graph_capability,
     })
     try:
         decomp = load_decomp_manifest(decomp_manifest_path)
@@ -236,14 +236,14 @@ async def run_correction(
 
         # Session: start fresh, or resume/reopen an existing one.
         if session_id:
-            if await get_session(queue, cfg.graph_plugin, session_id) is None:
+            if await get_session(queue, cfg.graph_capability, session_id) is None:
                 raise SystemExit(f"session {session_id} not found in graph")
             if reopen:
-                await set_session_status(queue, cfg.graph_plugin, session_id, "reopened")
+                await set_session_status(queue, cfg.graph_capability, session_id, "reopened")
             sess_id = session_id
             logger.info(f"resumed session {sess_id}")
         else:
-            sess = await start_session(queue, cfg.graph_plugin, source_ids)
+            sess = await start_session(queue, cfg.graph_capability, source_ids)
             sess_id = sess.id
             logger.info(f"started session {sess_id} over {len(source_ids)} source(s)")
 
@@ -257,12 +257,12 @@ async def run_correction(
         )
 
         for sid in source_ids:
-            n = await count_source_segments(queue, cfg.graph_plugin, sid,
+            n = await count_source_segments(queue, cfg.graph_capability, sid,
                                             rendition_selector=cfg.rendition_selector)
-            segments = await load_source_segments(queue, cfg.graph_plugin, sid,
+            segments = await load_source_segments(queue, cfg.graph_capability, sid,
                                                   rendition_selector=cfg.rendition_selector)
-            variants = await load_variant_texts(queue, cfg.graph_plugin, segments)
-            markers = await load_review_markers(queue, cfg.graph_plugin, sess_id)
+            variants = await load_variant_texts(queue, cfg.graph_capability, segments)
+            markers = await load_review_markers(queue, cfg.graph_capability, sess_id)
             worklist = compute_worklist(segments, markers, variants=variants)
             divergences = sum(1 for it in worklist if "transcriber-divergence" in it.flags)
             logger.info(f"[src {sid[:8]}] {n} segment(s); worklist {len(worklist)} flagged; "
@@ -271,9 +271,9 @@ async def run_correction(
 
             prune = {"pruned": 0, "correction_id": None}
             if cfg.prune_empty:
-                prune = await prune_empty_segments(queue, cfg, cfg.graph_plugin, sid, n, sess_id)
+                prune = await prune_empty_segments(queue, cfg, cfg.graph_capability, sid, n, sess_id)
 
-            corrections = await find_corrections_for_session(queue, cfg.graph_plugin, sess_id)
+            corrections = await find_corrections_for_session(queue, cfg.graph_capability, sess_id)
             effective = project_effective_spine(segments, corrections)
             manifest.sources.append({
                 "source_node_id": sid,
@@ -286,7 +286,7 @@ async def run_correction(
                 "effective_segment_count": len(effective),
             })
 
-        await set_session_status(queue, cfg.graph_plugin, sess_id, "completed")
+        await set_session_status(queue, cfg.graph_capability, sess_id, "completed")
     except BaseException as e:
         # The journal exists for exactly this row: a run that DIED records
         # that it was attempted (failures stop being the unattributed case).
@@ -351,7 +351,7 @@ async def review_worklist(
     # per-item hash-cache lookup below stays lazy/per-item: batching it needs
     # a hash-LIST far-end constraint — recorded promotion candidate.)
     active_by_segment = await find_active_text_corrections_batch(
-        queue, cfg.graph_plugin, [it.segment.id for it in items])
+        queue, cfg.graph_capability, [it.segment.id for it in items])
     for item in items:
         seg = item.segment
         active = active_by_segment.get(seg.id)
@@ -359,13 +359,13 @@ async def review_worklist(
         var = variant_by_segment.get(seg.id)
         prior = None
         if seg.content_hash:
-            hits = await find_prior_corrections_by_hash(queue, cfg.graph_plugin, seg.content_hash)
+            hits = await find_prior_corrections_by_hash(queue, cfg.graph_capability, seg.content_hash)
             hits = [h for h in hits if (h.get("payload") or {}).get("segment_id") != seg.id]
             if hits:
                 prior = (hits[0].get("payload") or {}).get("new_text")
         logger.info("review item:\n" + _format_worklist_item(item, effective_text, var, prior))
         if cfg.assume_yes:
-            await record_review_markers(queue, cfg.graph_plugin, session_id, [(seg.id, "reviewed")])
+            await record_review_markers(queue, cfg.graph_capability, session_id, [(seg.id, "reviewed")])
             counts["reviewed"] += 1
             continue
         try:
@@ -382,21 +382,21 @@ async def review_worklist(
             if not new_text and var:
                 new_text = var
             if not new_text:
-                await record_review_markers(queue, cfg.graph_plugin, session_id, [(seg.id, "skipped")])
+                await record_review_markers(queue, cfg.graph_capability, session_id, [(seg.id, "skipped")])
                 counts["skipped"] += 1
                 continue
             cid = await commit_text_correction(
-                queue, cfg.graph_plugin, source_id, seg.id, new_text, session_id,
+                queue, cfg.graph_capability, source_id, seg.id, new_text, session_id,
                 old_text=effective_text, supersedes_id=(active.get("id") if active else None),
                 actor=cfg.actor)
             logger.info(f"  #{seg.index}: text correction {cid}"
                         + (f" supersedes {active['id']}" if active else ""))
             counts["corrected"] += 1
         elif decision in ("s", "skip"):
-            await record_review_markers(queue, cfg.graph_plugin, session_id, [(seg.id, "skipped")])
+            await record_review_markers(queue, cfg.graph_capability, session_id, [(seg.id, "skipped")])
             counts["skipped"] += 1
         else:
-            await record_review_markers(queue, cfg.graph_plugin, session_id, [(seg.id, "reviewed")])
+            await record_review_markers(queue, cfg.graph_capability, session_id, [(seg.id, "reviewed")])
             counts["reviewed"] += 1
     return counts
 
@@ -432,7 +432,7 @@ async def run_review(
     _journal_run_event(manager, SubstrateEventType.RUN_STARTED.value, run_id, cfg.actor, {
         "core": "cjm-transcript-correction-core", "mode": "review",
         "decomp_manifest": str(decomp_manifest_path),
-        "graph_plugin": cfg.graph_plugin,
+        "graph_capability": cfg.graph_capability,
     })
     try:
         decomp = load_decomp_manifest(decomp_manifest_path)
@@ -442,14 +442,14 @@ async def run_review(
             raise SystemExit("decomp manifest lists no sources (pre-0.2.0 manifest? re-run decomp)")
 
         if session_id:
-            if await get_session(queue, cfg.graph_plugin, session_id) is None:
+            if await get_session(queue, cfg.graph_capability, session_id) is None:
                 raise SystemExit(f"session {session_id} not found in graph")
             if reopen:
-                await set_session_status(queue, cfg.graph_plugin, session_id, "reopened")
+                await set_session_status(queue, cfg.graph_capability, session_id, "reopened")
             sess_id = session_id
             logger.info(f"resumed session {sess_id}")
         else:
-            sess = await start_session(queue, cfg.graph_plugin, source_ids)
+            sess = await start_session(queue, cfg.graph_capability, source_ids)
             sess_id = sess.id
             logger.info(f"started review session {sess_id} over {len(source_ids)} source(s)")
 
@@ -463,15 +463,15 @@ async def run_review(
         )
 
         for sid in source_ids:
-            n = await count_source_segments(queue, cfg.graph_plugin, sid,
+            n = await count_source_segments(queue, cfg.graph_capability, sid,
                                             rendition_selector=cfg.rendition_selector)
-            segments = await load_source_segments(queue, cfg.graph_plugin, sid,
+            segments = await load_source_segments(queue, cfg.graph_capability, sid,
                                                   rendition_selector=cfg.rendition_selector)
-            variants = await load_variant_texts(queue, cfg.graph_plugin, segments)
+            variants = await load_variant_texts(queue, cfg.graph_capability, segments)
             variant_by_segment: Dict[str, str] = {}
             for i, (auth, var) in variant_divergence(segments, variants).items():
                 variant_by_segment[segments[i].id] = var
-            markers = await load_review_markers(queue, cfg.graph_plugin, sess_id)
+            markers = await load_review_markers(queue, cfg.graph_capability, sess_id)
             worklist = [it for it in compute_worklist(segments, markers, variants=variants)
                         if not it.segment.is_empty]
             logger.info(f"[src {sid[:8]}] {n} segment(s); review worklist {len(worklist)} "
@@ -479,7 +479,7 @@ async def run_review(
             counts = await review_worklist(queue, cfg, sid, worklist, sess_id,
                                            variant_by_segment=variant_by_segment, max_items=max_items)
 
-            corrections, superseded = await load_source_corrections(queue, cfg.graph_plugin, sid)
+            corrections, superseded = await load_source_corrections(queue, cfg.graph_capability, sid)
             active = active_corrections(corrections, superseded)
             effective = project_effective_spine(segments, active)
             manifest.sources.append({
@@ -492,7 +492,7 @@ async def run_review(
                         f"reviewed={counts['reviewed']}; active corrections={len(active)}; "
                         f"effective spine={len(effective)}")
 
-        await set_session_status(queue, cfg.graph_plugin, sess_id, "completed")
+        await set_session_status(queue, cfg.graph_capability, sess_id, "completed")
     except BaseException as e:
         # The journal exists for exactly this row: a run that DIED records
         # that it was attempted (failures stop being the unattributed case).

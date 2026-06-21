@@ -121,7 +121,7 @@ class WorklistItem:
 @dataclass
 class CorrectionConfig:
     """Configuration for one correction run."""
-    graph_plugin: str = "cjm-capability-graph-sqlite"  # Graph-storage capability id
+    graph_capability: str = "cjm-capability-graph-sqlite"  # Graph-storage capability id
     graph_db_path: Optional[str] = None            # Graph DB the spine lives in (from the decomp manifest)
     actor: str = "human"                           # Actor recorded on corrections + review markers
     assume_yes: bool = False                       # Auto-accept HITL seams (headless mode)
