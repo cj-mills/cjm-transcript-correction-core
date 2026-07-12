@@ -10,7 +10,6 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = {text = "Apache-2.0"}
 authors = [{name = "Christian J. Mills", email = "9126128+cj-mills@users.noreply.github.com"}]
-keywords = ['nbdev']
 classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
@@ -19,18 +18,12 @@ dependencies = ['cjm_substrate>=0.0.51', 'cjm_context_graph_primitives>=0.0.12',
 
 [project.urls]
 Repository = "https://github.com/cj-mills/cjm-transcript-correction-core"
-Documentation = "https://cj-mills.github.io/cjm-transcript-correction-core/"
 
 [project.scripts]
 cjm-transcript-correction-core = "cjm_transcript_correction_core.cli:main"
-
-[project.entry-points.nbdev]
-cjm_transcript_correction_core = "cjm_transcript_correction_core._modidx:d"
 
 [tool.setuptools.dynamic]
 version = {attr = "cjm_transcript_correction_core.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["cjm_transcript_correction_core*"]
-
-[tool.nbdev]

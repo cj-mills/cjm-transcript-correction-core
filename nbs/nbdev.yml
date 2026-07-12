@@ -1,9 +1,0 @@
-project:
-  output-dir: _docs
-
-website:
-  title: "cjm-transcript-correction-core"
-  site-url: "https://cj-mills.github.io/cjm-transcript-correction-core"
-  description: "A frontend-agnostic core for the transcript correction workflow — the first downstream graph-extension core; composes the graph-storage capability worker into a headless pipeline that applies unified, non-destructive corrections (text, punctuation, segmentation) as a supersede-able overlay on a committed decomposition spine, recomputes the review worklist from deterministic signals, and exposes a CLI as its first driver."
-  repo-branch: main
-  repo-url: "https://github.com/cj-mills/cjm-transcript-correction-core"
