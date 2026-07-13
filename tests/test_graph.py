@@ -4,8 +4,11 @@ Projected from the graph notebook's two pure-check cells at the golden-reference
 (no runtime; graph I/O paths are exercised by the e2e harnesses in tests_manual/)."""
 from cjm_transcript_correction_core.graph import (
     active_corrections,
+    build_boundary_shift_correction,
     build_prune_correction,
+    build_reject_review,
     build_text_correction,
+    corrections_to_edits,
     project_effective_spine,
 )
 from cjm_transcript_correction_core.models import SpineSegment
@@ -69,3 +72,70 @@ def test_build_text_correction_and_active_filter():
     assert next(e for e in te if e["relation_type"] == "SUPERSEDES")["target_id"] == "prevCorr"
     assert [c["id"] for c in active_corrections(
         [{"id": "a"}, {"id": "b"}, {"id": "c"}], {"b"})] == ["a", "c"]
+
+
+def test_build_boundary_shift_correction():
+    node, edges = build_boundary_shift_correction(
+        "src1", "a", "b", "wor", "push", session_id="s1")
+    p = node["properties"]["payload"]
+    assert node["properties"]["correction_type"] == "grouping"
+    assert p["operation"] == "shift_boundary"
+    assert p["boundary_after"] == "a" and p["right_segment_id"] == "b"
+    assert p["text"] == "wor" and p["direction"] == "push"
+    assert [(e["relation_type"], e["target_id"]) for e in edges] == [
+        ("CORRECTS", "a"), ("CORRECTS", "b")]
+    try:
+        build_boundary_shift_correction("src1", "a", "b", "x", "sideways", session_id="s1")
+        assert False, "invalid direction must raise"
+    except ValueError:
+        pass
+
+
+def test_boundary_shift_projection_push_and_pull():
+    # push: FA-misassigned whole words move right, single-space junction (DEC on 58b2e0a0)
+    segs = [SpineSegment(id="a", index=0, text="Mr. Gorbachev, tear"),
+            SpineSegment(id="b", index=1, text="down this wall.")]
+    node, _ = build_boundary_shift_correction("src1", "a", "b", "tear", "push", session_id="s1")
+    props = dict(node["properties"])
+    props["id"] = node["id"]
+    eff = project_effective_spine(segs, [props])
+    assert [s.text for s in eff] == ["Mr. Gorbachev,", "tear down this wall."]
+
+    # pull: the mirror — the right unit's head belongs to the left
+    node2, _ = build_boundary_shift_correction("src1", "a", "b", "down", "pull", session_id="s1")
+    props2 = dict(node2["properties"])
+    props2["id"] = node2["id"]
+    eff2 = project_effective_spine(segs, [props2])
+    assert [s.text for s in eff2] == ["Mr. Gorbachev, tear down", "this wall."]
+
+    # empty-neighbor (the falsified-D14 class): push into a starved chunk, both sides clean
+    starved = [SpineSegment(id="a", index=0, text="largest naval battle in history"),
+               SpineSegment(id="b", index=1, text="")]
+    node3, _ = build_boundary_shift_correction("src1", "a", "b", "in history", "push", session_id="s1")
+    props3 = dict(node3["properties"])
+    props3["id"] = node3["id"]
+    eff3 = project_effective_spine(starved, [props3])
+    assert [s.text for s in eff3] == ["largest naval battle", "in history"]
+
+
+def test_reject_review_and_proposed_exclusion():
+    # a proposed correction never enters the effective view (awaiting a verdict)
+    prop = {"id": "p1", "correction_type": "text_content", "status": "proposed",
+            "payload": {"operation": "replace_text", "segment_id": "a", "new_text": "NOPE"}}
+    assert project_effective_spine(SEGS, [prop])[0].text == "hello"
+
+    # reject-as-supersede: the review node SUPERSEDES the proposal
+    node, edges = build_reject_review("src1", "p1", session_id="s1", rationale="wrong word")
+    assert node["properties"]["correction_type"] == "review"
+    assert node["properties"]["payload"]["operation"] == "reject"
+    assert node["properties"]["payload"]["rejected_id"] == "p1"
+    assert len(edges) == 1
+    assert edges[0]["relation_type"] == "SUPERSEDES" and edges[0]["target_id"] == "p1"
+
+    # a review node maps to NO spine edit
+    props = dict(node["properties"])
+    props["id"] = node["id"]
+    assert corrections_to_edits([props]) == []
+
+    # the active filter drops the rejected proposal (as _superseded_ids would report)
+    assert [c["id"] for c in active_corrections([prop, props], {"p1"})] == [node["id"]]

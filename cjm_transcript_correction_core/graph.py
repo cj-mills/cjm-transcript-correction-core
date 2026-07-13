@@ -258,7 +258,7 @@ def _edge(
 
 
 def build_correction_node(
-    correction_type: str,                  # "text_content" | "punctuation" | "grouping"
+    correction_type: str,                  # "text_content" | "punctuation" | "grouping" | "review"
     session_id: str,                       # Owning session id
     payload: Dict[str, Any],               # Type-specific payload
     actor: str = "human",                  # Actor
@@ -429,7 +429,9 @@ def corrections_to_edits(
     """
     edits: List[SpineEdit] = []
     for c in corrections:
-        if c.get("status") == "superseded":  # legacy status skip retained
+        if c.get("status") in ("superseded", "proposed"):
+            # superseded: legacy skip retained; proposed: awaiting a review
+            # verdict — a proposal never enters the effective view (DEC 7861d27e).
             continue
         ctype = c.get("correction_type")
         payload = c.get("payload", {}) or {}
@@ -438,6 +440,15 @@ def corrections_to_edits(
             edits.append(SpineEdit(edit_id=c["id"], op="prune",
                                    targets=list(payload.get("pruned_segment_ids") or []),
                                    created_at=created))
+        elif ctype == "grouping" and payload.get("operation") == "shift_boundary":
+            left = payload.get("boundary_after")
+            if left is not None:
+                edits.append(SpineEdit(edit_id=c["id"], op="boundary_shift",
+                                       targets=[t for t in (left, payload.get("right_segment_id")) if t],
+                                       payload={"boundary_after": left,
+                                                "text": payload.get("text", ""),
+                                                "direction": payload.get("direction", "push")},
+                                       created_at=created))
         elif ctype == "text_content" and payload.get("operation") == "replace_text":
             sid = payload.get("segment_id")
             if sid is not None:
@@ -648,3 +659,83 @@ async def load_variant_texts(
         if per_t:
             out[s.id] = per_t
     return out
+
+
+def build_boundary_shift_correction(
+    source_id: str,                        # Source the boundary belongs to
+    left_segment_id: str,                  # Layer-0 Segment LEFT of the boundary (the layer's `boundary_after`)
+    right_segment_id: str,                 # Layer-0 Segment RIGHT of the boundary (recorded; layer re-derives from order)
+    text: str,                             # The exact text moved across the boundary (verbatim, whitespace included)
+    direction: str,                        # "push" (left tail -> right head) | "pull" (the mirror)
+    session_id: str,                       # Owning session id
+    supersedes_id: Optional[str] = None,   # Prior Correction this one replaces (re-edit)
+    actor: str = "human",                  # Actor
+    rationale: Optional[str] = None,       # Optional note
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (correction node dict, edge dicts)
+    """Build a grouping Correction that moves text across one segment boundary.
+
+    The FA-misassignment gesture (an ALIGNMENT error, not a transcription
+    error): text sits on the wrong side of a boundary; 1:1 audio alignment is
+    preserved (segment count and positions never change). The payload carries
+    the layer's `boundary_shift` op vocabulary; the layer validates the moved
+    text VERBATIM at projection time and fails loudly on mismatch. CORRECTS
+    edges anchor BOTH boundary segments.
+    """
+    if direction not in ("push", "pull"):
+        raise ValueError(f"boundary-shift direction must be 'push' or 'pull', got {direction!r}")
+    payload = {"operation": "shift_boundary", "source_id": source_id,
+               "boundary_after": left_segment_id, "right_segment_id": right_segment_id,
+               "text": text, "direction": direction}
+    node = build_correction_node("grouping", session_id, payload, actor=actor,
+                                 rationale=rationale).to_graph_node()
+    edges = [make_edge(node.id, left_segment_id, CorrectionRelations.CORRECTS),
+             make_edge(node.id, right_segment_id, CorrectionRelations.CORRECTS)]
+    if supersedes_id:
+        edges.append(make_edge(node.id, supersedes_id, CorrectionRelations.SUPERSEDES))
+    return node.to_dict(), edges
+
+
+def build_reject_review(
+    source_id: str,                   # Source the rejected correction belongs to (source-scoped loads)
+    rejected_id: str,                 # The prior Correction (typically a proposal) being rejected
+    session_id: str,                  # Owning session id
+    actor: str = "human",             # Actor (the reviewer)
+    rationale: Optional[str] = None,  # Optional note (why it was rejected)
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (review node dict, edge dicts)
+    """Build a review Correction that REJECTS a prior correction (reject-as-supersede).
+
+    An append-only VERDICT: rejection is a SUPERSEDES edge from a small
+    `review` node, never a status mutation — `resolve_active` then excludes
+    the rejected correction with the machinery supersession already uses, and
+    the verdict carries actor/rationale/timestamp. A review node maps to NO
+    spine edit (`corrections_to_edits` has no arm for it) so it can never
+    touch the effective view itself. The ACCEPT verdict is deferred until
+    agents actually propose; it rides this same node shape.
+    """
+    payload = {"operation": "reject", "source_id": source_id, "rejected_id": rejected_id}
+    node = build_correction_node("review", session_id, payload, actor=actor,
+                                 rationale=rationale).to_graph_node()
+    edges = [make_edge(node.id, rejected_id, CorrectionRelations.SUPERSEDES)]
+    return node.to_dict(), edges
+
+
+async def commit_boundary_shift_correction(
+    queue: JobQueue,                       # Started job queue
+    graph_id: str,                         # Graph-storage capability id
+    source_id: str,                        # Source the boundary belongs to
+    left_segment_id: str,                  # Segment LEFT of the boundary
+    right_segment_id: str,                 # Segment RIGHT of the boundary
+    text: str,                             # Verbatim text moved across the boundary
+    direction: str,                        # "push" | "pull"
+    session_id: str,                       # Owning session id
+    supersedes_id: Optional[str] = None,   # Prior Correction to supersede (re-edit)
+    actor: str = "human",                  # Actor
+) -> str:  # The new Correction node id
+    """Commit a boundary-shift correction (node + CORRECTS x2 [+ SUPERSEDES]) + REVIEWED markers on both segments."""
+    node, edges = build_boundary_shift_correction(
+        source_id, left_segment_id, right_segment_id, text, direction, session_id,
+        supersedes_id=supersedes_id, actor=actor)
+    await commit_nodes_edges(queue, graph_id, [node], edges)
+    await record_review_markers(queue, graph_id, session_id,
+                                [(left_segment_id, "corrected"), (right_segment_id, "corrected")])
+    return node["id"]
