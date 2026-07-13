@@ -5,6 +5,7 @@ Projected from the graph notebook's two pure-check cells at the golden-reference
 from cjm_transcript_correction_core.graph import (
     active_corrections,
     build_boundary_shift_correction,
+    build_prune_amendment,
     build_prune_correction,
     build_reject_review,
     build_text_correction,
@@ -139,3 +140,41 @@ def test_reject_review_and_proposed_exclusion():
 
     # the active filter drops the rejected proposal (as _superseded_ids would report)
     assert [c["id"] for c in active_corrections([prop, props], {"p1"})] == [node["id"]]
+
+
+def test_prune_amendment_rescues_boundary_shift_target():
+    # the falsified-D14 rescue: prune covers an empty chunk, a boundary shift
+    # gives it text, the amendment must un-prune it or projection drops the text
+    segs = [SpineSegment(id="a", index=0, text="largest naval battle in history"),
+            SpineSegment(id="b", index=1, text=""),
+            SpineSegment(id="c", index=2, text="the end")]
+    prune_node, _ = build_prune_correction("src1", [segs[1]], session_id="s1")
+    prune = dict(prune_node["properties"])
+    prune["id"] = prune_node["id"]
+    prune["created_at"] = 1.0
+
+    shift_node, _ = build_boundary_shift_correction("src1", "a", "b", "in history", "push",
+                                                    session_id="s1")
+    shift = dict(shift_node["properties"])
+    shift["id"] = shift_node["id"]
+    shift["created_at"] = 2.0
+
+    # without the amendment the pruned position swallows the moved text
+    eff = project_effective_spine(segs, [prune, shift])
+    assert [s.id for s in eff] == ["a", "c"]
+
+    amend_node, amend_edges = build_prune_amendment(prune, ["b"], session_id="s1")
+    amend = dict(amend_node["properties"])
+    amend["id"] = amend_node["id"]
+    amend["created_at"] = 3.0
+    assert amend["payload"]["pruned_segment_ids"] == []
+    assert amend["payload"]["pruned_count"] == 0
+    assert amend["payload"]["source_id"] == "src1"
+    sup = [e for e in amend_edges if e["relation_type"] == "SUPERSEDES"]
+    assert len(sup) == 1 and sup[0]["target_id"] == prune["id"]
+
+    # the amendment SUPERSEDES the prune -> active set = shift + amendment
+    active = active_corrections([prune, shift, amend], {prune["id"]})
+    eff2 = project_effective_spine(segs, active)
+    assert [s.id for s in eff2] == ["a", "b", "c"]
+    assert eff2[0].text == "largest naval battle" and eff2[1].text == "in history"

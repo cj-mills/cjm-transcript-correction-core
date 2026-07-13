@@ -739,3 +739,45 @@ async def commit_boundary_shift_correction(
     await record_review_markers(queue, graph_id, session_id,
                                 [(left_segment_id, "corrected"), (right_segment_id, "corrected")])
     return node["id"]
+
+
+def build_prune_amendment(
+    prior: Dict[str, Any],            # The ACTIVE prune Correction being amended (property dict + id)
+    unprune_ids: List[str],           # Segment ids to REMOVE from the prune set (rescued positions)
+    session_id: str,                  # Owning session id
+    actor: str = "human",             # Actor
+    rationale: Optional[str] = None,  # Optional note
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (correction node dict, edge dicts)
+    """Build a grouping Correction that supersedes a prune with a REDUCED set (unprune).
+
+    The append-only inverse of build_prune_correction for single positions: a
+    boundary shift that gives text to a pruned segment RESCUES it (the
+    falsified-D14 class), and the segment must leave the prune set or the
+    layer's projection drops it — WITH its new text — from the effective view.
+    The amendment re-carries the prior payload minus the rescued ids plus a
+    SUPERSEDES edge; DERIVED_FROM edges re-anchor the still-pruned ids.
+    """
+    prior_payload = dict(prior.get("payload") or {})
+    remaining = [sid for sid in (prior_payload.get("pruned_segment_ids") or [])
+                 if sid not in set(unprune_ids)]
+    payload = {"operation": "prune_empty", "source_id": prior_payload.get("source_id"),
+               "pruned_segment_ids": remaining, "pruned_count": len(remaining)}
+    node = build_correction_node("grouping", session_id, payload, actor=actor,
+                                 rationale=rationale).to_graph_node()
+    edges = [make_edge(node.id, sid, CorrectionRelations.DERIVED_FROM) for sid in remaining]
+    edges.append(make_edge(node.id, prior["id"], CorrectionRelations.SUPERSEDES))
+    return node.to_dict(), edges
+
+
+async def commit_prune_amendment(
+    queue: JobQueue,            # Started job queue
+    graph_id: str,              # Graph-storage capability id
+    prior: Dict[str, Any],      # The ACTIVE prune Correction being amended
+    unprune_ids: List[str],     # Segment ids rescued from the prune set
+    session_id: str,            # Owning session id
+    actor: str = "human",       # Actor
+) -> Dict[str, Any]:  # The amended correction as a property dict + id (local-echo ready)
+    """Commit an unprune amendment (node + DERIVED_FROM edges + SUPERSEDES)."""
+    node, edges = build_prune_amendment(prior, unprune_ids, session_id, actor=actor)
+    await commit_nodes_edges(queue, graph_id, [node], edges)
+    return _node_to_correction_dict(node)
