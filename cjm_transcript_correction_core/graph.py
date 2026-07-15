@@ -14,6 +14,7 @@ from cjm_context_graph_primitives.query import (EdgeQuery, EdgeQueryResult, Node
                                                 NodeQueryResult, OrderBy, PropertyPredicate,
                                                 RelationPredicate, SourcePredicate)
 from cjm_substrate.core.queue import JobQueue, JobStatus
+from cjm_transcript_correction_core.journal import journal_correction_op, segment_anchor
 from cjm_transcript_correction_core.models import (Correction, CorrectionRelations,
                                                    CorrectionSession, SpineSegment)
 from cjm_transcript_graph_schema.schema import TranscriptGraphLabels
@@ -318,10 +319,16 @@ async def start_session(
     queue: JobQueue,   # Started job queue
     graph_id: str,     # Graph-storage capability id
     scope: List[str],  # Source node ids in scope
+    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
 ) -> CorrectionSession:  # The committed CorrectionSession
     """Create + commit a new CorrectionSession node."""
     sess = CorrectionSession(scope=scope)
-    await commit_nodes_edges(queue, graph_id, [sess.to_graph_node().to_dict()], [])
+    node = sess.to_graph_node().to_dict()
+    await commit_nodes_edges(queue, graph_id, [node], [])
+    if journal_path:
+        journal_correction_op(journal_path, "session-start", actor="human",
+                              session_id=node["id"], args={"scope": scope},
+                              nodes=[node], edges=[], op_id=node["id"])
     return sess
 
 
@@ -342,14 +349,23 @@ async def set_session_status(
     graph_id: str,    # Graph-storage capability id
     session_id: str,  # CorrectionSession node id
     status: str,      # New status ("in_progress" | "completed" | "reopened")
+    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
 ) -> None:
     """Update a session's status + updated_at.
 
     The ONLY update_node use in this core: a CorrectionSession is OVERLAY metadata
     whose lifecycle is mutable. Layer-0 Segments + Corrections stay append-only.
+    Its journal op replays via update_node (last-wins in append order), not wires.
     """
+    ts = time.time()
     await graph_task(queue, graph_id, "update_node", node_id=session_id,
-                     properties={"status": status, "updated_at": time.time()})
+                     properties={"status": status, "updated_at": ts})
+    if journal_path:
+        journal_correction_op(journal_path, "session-status", actor="human",
+                              session_id=session_id,
+                              args={"session_id": session_id, "status": status,
+                                    "updated_at": ts},
+                              nodes=[], edges=[])
 
 
 async def record_review_markers(
@@ -357,11 +373,21 @@ async def record_review_markers(
     graph_id: str,                     # Graph-storage capability id
     session_id: str,                   # Owning session id
     decisions: List[Tuple[str, str]],  # (segment_id, decision) pairs
+    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
 ) -> int:  # Number of REVIEWED edges committed
     """Persist per-(session, segment) review markers as REVIEWED edges."""
     edges = [_edge(session_id, seg_id, CorrectionRelations.REVIEWED, {"decision": dec})
              for seg_id, dec in decisions]
-    return (await commit_nodes_edges(queue, graph_id, [], edges))["edges"]
+    n = (await commit_nodes_edges(queue, graph_id, [], edges))["edges"]
+    if journal_path:
+        # No anchor: markers are derivative session state — the CORRECTION op carries
+        # the anchor (DEC ccbab9f5 point 5 scopes anchors to correction ops), and the
+        # extra segment reads priced the TUI keystroke (journal-lag finding).
+        journal_correction_op(journal_path, "review-markers", actor="human",
+                              session_id=session_id,
+                              args={"decisions": [list(d) for d in decisions]},
+                              nodes=[], edges=edges)
+    return n
 
 
 async def load_review_markers(
@@ -526,13 +552,24 @@ async def commit_text_correction(
     supersedes_id: Optional[str] = None,   # Prior Correction to supersede (re-edit)
     actor: str = "human",                  # Actor
     canonical_form: Optional[str] = None,  # Optional entity key
+    journal_path: Optional[str] = None,    # Sidecar journal — append the op on success (None = unjournaled)
 ) -> str:  # The new Correction node id
     """Commit a text_content correction (node + CORRECTS [+ SUPERSEDES]) + a REVIEWED marker."""
     node, edges = build_text_correction(
         source_id, segment_id, new_text, session_id, old_text=old_text,
         supersedes_id=supersedes_id, actor=actor, canonical_form=canonical_form)
     await commit_nodes_edges(queue, graph_id, [node], edges)
-    await record_review_markers(queue, graph_id, session_id, [(segment_id, "corrected")])
+    if journal_path:
+        journal_correction_op(journal_path, "text-correction", actor=actor,
+                              session_id=session_id,
+                              args={"source_id": source_id, "segment_id": segment_id,
+                                    "new_text": new_text, "old_text": old_text,
+                                    "supersedes_id": supersedes_id,
+                                    "canonical_form": canonical_form},
+                              anchor=await segment_anchor(queue, graph_id, [segment_id]),
+                              nodes=[node], edges=edges, op_id=node["id"])
+    await record_review_markers(queue, graph_id, session_id, [(segment_id, "corrected")],
+                                journal_path=journal_path)
     return node["id"]
 
 
@@ -730,14 +767,25 @@ async def commit_boundary_shift_correction(
     session_id: str,                       # Owning session id
     supersedes_id: Optional[str] = None,   # Prior Correction to supersede (re-edit)
     actor: str = "human",                  # Actor
+    journal_path: Optional[str] = None,    # Sidecar journal — append the op on success (None = unjournaled)
 ) -> str:  # The new Correction node id
     """Commit a boundary-shift correction (node + CORRECTS x2 [+ SUPERSEDES]) + REVIEWED markers on both segments."""
     node, edges = build_boundary_shift_correction(
         source_id, left_segment_id, right_segment_id, text, direction, session_id,
         supersedes_id=supersedes_id, actor=actor)
     await commit_nodes_edges(queue, graph_id, [node], edges)
+    if journal_path:
+        journal_correction_op(journal_path, "boundary-shift", actor=actor,
+                              session_id=session_id,
+                              args={"source_id": source_id, "left_segment_id": left_segment_id,
+                                    "right_segment_id": right_segment_id, "text": text,
+                                    "direction": direction, "supersedes_id": supersedes_id},
+                              anchor=await segment_anchor(queue, graph_id,
+                                                          [left_segment_id, right_segment_id]),
+                              nodes=[node], edges=edges, op_id=node["id"])
     await record_review_markers(queue, graph_id, session_id,
-                                [(left_segment_id, "corrected"), (right_segment_id, "corrected")])
+                                [(left_segment_id, "corrected"), (right_segment_id, "corrected")],
+                                journal_path=journal_path)
     return node["id"]
 
 
@@ -776,8 +824,15 @@ async def commit_prune_amendment(
     unprune_ids: List[str],     # Segment ids rescued from the prune set
     session_id: str,            # Owning session id
     actor: str = "human",       # Actor
+    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
 ) -> Dict[str, Any]:  # The amended correction as a property dict + id (local-echo ready)
     """Commit an unprune amendment (node + DERIVED_FROM edges + SUPERSEDES)."""
     node, edges = build_prune_amendment(prior, unprune_ids, session_id, actor=actor)
     await commit_nodes_edges(queue, graph_id, [node], edges)
+    if journal_path:
+        journal_correction_op(journal_path, "prune-amendment", actor=actor,
+                              session_id=session_id,
+                              args={"prior_id": prior.get("id"), "unprune_ids": unprune_ids},
+                              anchor=await segment_anchor(queue, graph_id, unprune_ids),
+                              nodes=[node], edges=edges, op_id=node["id"])
     return _node_to_correction_dict(node)

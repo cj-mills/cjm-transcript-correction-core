@@ -8,12 +8,10 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 
 - **`cjm_transcript_correction_core.cli`** — The CLI driver — the correction core's first (and currently only) frontend. run <decomp-manifest> corrects the committed spine in the decomp graph DB, pointing the graph worker at that shared DB via load-time config, with optional session resume/reopen; review runs the interactive text-correction loop (the cross-transcriber diff is intra-graph since stage 5).
 - **`cjm_transcript_correction_core.graph`** — The correction overlay's graph I/O: targeted (scale-shaped) reads of a committed spine via the graph-storage query action, construction of Correction / CorrectionSession nodes + CORRECTS / SUPERSEDES / DERIVED_FROM / REVIEWED edges, the in-core effective-spine projection (layer-0 + applied corrections), and commit through the job queue. Hand-rolled (revolution-1) = direct CR-18 spec material; append-only on layer-0 (never update/delete a Segment).
+- **`cjm_transcript_correction_core.journal`**
 - **`cjm_transcript_correction_core.models`** — Overlay data shapes for the transcript-correction workflow: the Correction / CorrectionSession graph nodes + their relation registry, the read view of a committed spine segment, the worklist item, run configuration, and the correction run manifest (proto-bundle that chains decomp -> correction).
 - **`cjm_transcript_correction_core.pipeline`** — The headless correction workflow: load a decomp run manifest, resolve the shared graph DB, start/resume/reopen a CorrectionSession, recompute the worklist from deterministic signals + persisted review state, run the D14 empty-segment prune (first operation), and record a chainable correction run manifest — with a cheapest-form HITL approval seam.
 - **`cjm_transcript_correction_core.signals`** — Pure deterministic Tier-1 signal functions (no capability calls): empty-segment detection, bidirectional boundary punctuation/capitalization heuristics, forced-alignment coverage flags, positional cross-transcriber diff, and phonetic + edit-distance variant clustering. The worklist is recomputed from these each session; revolution-1 builds ZERO new capabilities.
-- **`tests.test_graph`** — Tests for cjm_transcript_correction_core.graph — overlay construction + effective spine.
-- **`tests.test_models`** — Tests for cjm_transcript_correction_core.models — correction overlay data shapes.
-- **`tests.test_signals`** — Tests for cjm_transcript_correction_core.signals — pure deterministic Tier-1 signals.
 
 ## API
 
@@ -28,10 +26,15 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 ### `cjm_transcript_correction_core.graph`
 
 - `active_corrections` _function_ — Filter to the effective correction set (the layer's resolve_active over a read superseded set).
+- `build_boundary_shift_correction` _function_ — Build a grouping Correction that moves text across one segment boundary.
 - `build_correction_node` _function_ — Construct a Correction overlay node (pure; commit happens separately).
+- `build_prune_amendment` _function_ — Build a grouping Correction that supersedes a prune with a REDUCED set (unprune).
 - `build_prune_correction` _function_ — Build one batch grouping Correction that prunes empty segments (D14).
+- `build_reject_review` _function_ — Build a review Correction that REJECTS a prior correction (reject-as-supersede).
 - `build_text_correction` _function_ — Build a text_content Correction + its CORRECTS (+ optional SUPERSEDES) edges.
+- `commit_boundary_shift_correction` _function_ — Commit a boundary-shift correction (node + CORRECTS x2 [+ SUPERSEDES]) + REVIEWED markers on both segments.
 - `commit_nodes_edges` _function_ — Commit overlay nodes/edges through the layer's idempotent extend_graph.
+- `commit_prune_amendment` _function_ — Commit an unprune amendment (node + DERIVED_FROM edges + SUPERSEDES).
 - `commit_text_correction` _function_ — Commit a text_content correction (node + CORRECTS [+ SUPERSEDES]) + a REVIEWED marker.
 - `corrections_to_edits` _function_ — Map this core's Correction payloads onto the layer's spine-edit vocabulary.
 - `count_source_segments` _function_ — Count a Source's segments server-side under its chosen rendition (typed count mode).
@@ -52,6 +55,13 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `source_audio_segment_ids` _function_ — The Source's coarse spine (one small typed read; ordered by index).
 - `start_session` _function_ — Create + commit a new CorrectionSession node.
 - `submit_and_wait` _function_ — Submit one capability job, wait for it, return its result (raise on failure).
+
+### `cjm_transcript_correction_core.journal`
+
+- `correction_replay_handlers` _function_ — The correction core's registered replay vocabulary (replay stays DOMAIN-OWNED).
+- `journal_correction_op` _function_ — Append one correction op — envelope + semantic args + the EXACT wires committed.
+- `segment_anchor` _function_ — The run-independent anchor stamped on every correction op (DEC ccbab9f5 point 5).
+- `sidecar_journal_path` _function_ — The db's sidecar journal path (DEC ccbab9f5 point 3: placement is per-workflow,
 
 ### `cjm_transcript_correction_core.models`
 
@@ -87,31 +97,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `phonetic_key` _function_ — Compute a coarse phonetic key for a word (groups like-sounding variants).
 - `variant_divergence` _function_ — Within-segment cross-transcriber divergence (stage 5: intra-graph).
 
-### `tests.test_graph`
-
-- `test_build_prune_correction` _function_
-- `test_build_text_correction_and_active_filter` _function_
-- `test_latest_wins_ordering_from_layer` _function_
-- `test_project_effective_spine_prune_replace_supersede` _function_
-
-### `tests.test_models`
-
-- `test_correction_graph_node_mapping` _function_
-- `test_correction_relations_registry` _function_
-- `test_correction_session_node` _function_
-- `test_manifest_save_round_trip` _function_
-- `test_manifest_shape_and_run_id` _function_
-- `test_spine_segment_and_worklist_item` _function_
-
-### `tests.test_signals`
-
-- `test_boundary_punct_caps_flags` _function_
-- `test_clustering_primitives` _function_
-- `test_compute_signal_flags_combined` _function_
-- `test_empty_and_coverage_flags` _function_
-- `test_variant_divergence_within_segment` _function_
-
 ## Dependencies
 
-**Depends on:** `cjm-substrate`
+**Depends on:** `cjm-context-graph-layer`, `cjm-context-graph-primitives`, `cjm-substrate`, `cjm-transcript-graph-schema`
 **Used by:** `cjm-transcript-correction-tui`

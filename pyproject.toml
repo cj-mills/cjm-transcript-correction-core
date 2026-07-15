@@ -14,7 +14,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
 ]
-dependencies = ['cjm_substrate>=0.0.51', 'cjm_context_graph_primitives>=0.0.12', 'cjm-context-graph-layer>=0.0.8', 'cjm-transcript-graph-schema>=0.0.7']
+dependencies = ['cjm_substrate>=0.0.51', 'cjm_context_graph_primitives>=0.0.14', 'cjm-context-graph-layer>=0.0.8', 'cjm-transcript-graph-schema>=0.0.7']
 
 [project.urls]
 Repository = "https://github.com/cj-mills/cjm-transcript-correction-core"
