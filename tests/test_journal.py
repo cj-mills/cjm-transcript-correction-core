@@ -1,8 +1,8 @@
 """The correction journal: sidecar path + op envelope (pure half; replay is e2e-proven)."""
 
 from cjm_context_graph_primitives.journal import read_journal
-from cjm_transcript_correction_core.journal import (correction_replay_handlers,
-                                                    journal_correction_op, sidecar_journal_path)
+from cjm_transcript_correction_core.journal import correction_replay_handlers, journal_correction_op
+from cjm_context_graph_layer.journal import sidecar_journal_path
 
 
 def test_sidecar_journal_path():

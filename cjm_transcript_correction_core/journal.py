@@ -16,17 +16,6 @@ from cjm_context_graph_primitives.journal import append_op
 from cjm_context_graph_primitives.query import NodeQuery
 
 
-def sidecar_journal_path(
-    db_path: str,  # The workflow graph db path (e.g. .../context_graph.db)
-) -> str:  # The sidecar write-journal path next to it (.../context_graph.writes.jsonl)
-    """The db's sidecar journal path (DEC ccbab9f5 point 3: placement is per-workflow,
-    NEXT TO the db it is the source of truth for). Derived, never configured — one
-    less ambient default (the explicit-db-path guardrail extended to the journal)."""
-    if db_path.endswith(".db"):
-        return db_path[: -len(".db")] + ".writes.jsonl"
-    return db_path + ".writes.jsonl"
-
-
 async def segment_anchor(
     queue: Any,               # Started job queue
     graph_id: str,            # Graph-storage capability id
