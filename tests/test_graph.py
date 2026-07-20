@@ -5,12 +5,15 @@ Projected from the graph notebook's two pure-check cells at the golden-reference
 from cjm_transcript_correction_core.graph import (
     active_corrections,
     build_boundary_shift_correction,
+    build_mark_correction,
     build_prune_amendment,
     build_prune_correction,
     build_reject_review,
     build_text_correction,
     corrections_to_edits,
+    open_marks,
     project_effective_spine,
+    reanchor_span,
 )
 from cjm_transcript_correction_core.models import SpineSegment
 
@@ -178,3 +181,94 @@ def test_prune_amendment_rescues_boundary_shift_target():
     eff2 = project_effective_spine(segs, active)
     assert [s.id for s in eff2] == ["a", "b", "c"]
     assert eff2[0].text == "largest naval battle" and eff2[1].text == "in history"
+
+
+def test_build_mark_correction_anchor_shapes():
+    # segment: one CORRECTS edge, non-mutating payload vocabulary
+    node, edges = build_mark_correction("src1", {"kind": "segment", "segment_id": "a"},
+                                        "suspect", session_id="s1", note="check later")
+    props = node["properties"]
+    assert props["correction_type"] == "mark"
+    assert props["payload"]["operation"] == "mark"
+    assert props["payload"]["mark_class"] == "suspect"
+    assert props["rationale"] == "check later"
+    assert [(e["relation_type"], e["target_id"]) for e in edges] == [("CORRECTS", "a")]
+    # boundary: CORRECTS x2 (the shift gesture's coordinates; seams allowed)
+    _, edges = build_mark_correction(
+        "src1", {"kind": "boundary", "boundary_after": "a", "right_segment_id": "b"},
+        "repeat-omission", session_id="s1")
+    assert [(e["relation_type"], e["target_id"]) for e in edges] == [
+        ("CORRECTS", "a"), ("CORRECTS", "b")]
+    # span: offsets + verbatim snapshot ride the anchor; supersession is an edge
+    node, edges = build_mark_correction(
+        "src1", {"kind": "span", "segment_id": "c", "char_start": 0, "char_end": 5,
+                 "text_snapshot": "world"},
+        "homophone-substitution", session_id="s1", supersedes_id="m0")
+    assert node["properties"]["payload"]["anchor"]["text_snapshot"] == "world"
+    assert ("SUPERSEDES", "m0") in [(e["relation_type"], e["target_id"]) for e in edges]
+
+
+def test_build_mark_correction_validation():
+    def rejects(anchor, mark_class="suspect"):
+        try:
+            build_mark_correction("src1", anchor, mark_class, session_id="s1")
+        except ValueError:
+            return True
+        return False
+    assert rejects({"kind": "segment", "segment_id": "a"}, mark_class="   ")
+    # punctuation-led classes are reserved for gestures (the '`-`' junk-mark drive find)
+    assert rejects({"kind": "segment", "segment_id": "a"}, mark_class="-")
+    assert rejects({"kind": "segment", "segment_id": "a"}, mark_class="`-`")
+    assert rejects({"kind": "sentence", "segment_id": "a"})
+    assert rejects({"kind": "segment"})
+    assert rejects({"kind": "boundary", "boundary_after": "a"})
+    # a span without its snapshot could never re-anchor — refused at build time
+    assert rejects({"kind": "span", "segment_id": "a", "char_start": 0, "char_end": 2})
+
+
+def test_mark_never_touches_projection():
+    """The DEC 2a231843 invariant: a mark is invisible to the effective view BY
+    CONSTRUCTION — corrections_to_edits has no arm for correction_type "mark"."""
+    node, _ = build_mark_correction("src1", {"kind": "segment", "segment_id": "b"},
+                                    "hesitation-omission", session_id="s1")
+    props = dict(node["properties"])
+    props["id"] = node["id"]
+    assert corrections_to_edits([props]) == []
+    out = project_effective_spine(SEGS, [props])
+    assert [(s.id, s.text) for s in out] == [(s.id, s.text) for s in SEGS]
+
+
+def test_open_marks_lifecycle():
+    m1, _ = build_mark_correction("src1", {"kind": "segment", "segment_id": "a"},
+                                  "suspect", session_id="s1")
+    m2, _ = build_mark_correction("src1", {"kind": "boundary", "boundary_after": "a",
+                                           "right_segment_id": "b"},
+                                  "repeat-omission", session_id="s1")
+    fix, _ = build_text_correction("src1", "a", "Hello", session_id="s1",
+                                   supersedes_id=m1["id"])
+    rows = []
+    for n in (m1, m2, fix):
+        p = dict(n["properties"])
+        p["id"] = n["id"]
+        rows.append(p)
+    # open until something supersedes: the discharging correction closes m1
+    assert [m["id"] for m in open_marks(rows, set())] == [m1["id"], m2["id"]]
+    assert [m["id"] for m in open_marks(rows, {m1["id"]})] == [m2["id"]]
+    # a dismissal review (reject-as-supersede) closes m2 and is not itself a mark
+    rej, _ = build_reject_review("src1", m2["id"], session_id="s1")
+    p = dict(rej["properties"])
+    p["id"] = rej["id"]
+    assert open_marks(rows + [p], {m1["id"], m2["id"]}) == []
+
+
+def test_reanchor_span():
+    a = {"char_start": 6, "char_end": 11, "text_snapshot": "world"}
+    assert reanchor_span(a, "hello world") == (6, 11)         # exact offsets verified
+    assert reanchor_span(a, "well, hello world") == (12, 17)  # edited text -> snapshot re-found
+    assert reanchor_span(a, "goodbye moon") is None           # gone -> degrade to segment level
+    # multiple occurrences: the one nearest the recorded start wins
+    assert reanchor_span({"char_start": 0, "char_end": 2, "text_snapshot": "ab"},
+                         "ab ab") == (0, 2)
+    assert reanchor_span({"char_start": 3, "char_end": 5, "text_snapshot": "ab"},
+                         "ab ab") == (3, 5)
+    assert reanchor_span({"text_snapshot": ""}, "x") is None

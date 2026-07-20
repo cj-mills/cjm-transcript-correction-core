@@ -33,4 +33,11 @@ def test_journal_correction_op_envelope(tmp_path):
     assert len(read_journal(j)) == 2
     # every registered replay verb has a handler
     assert set(correction_replay_handlers()) == {"session-start", "boundary-shift", "text-correction",
-                                                 "prune-amendment", "review-markers", "session-status"}
+                                                 "prune-amendment", "mark", "mark-dismiss",
+                                                 "review-markers", "session-status"}
+
+
+def test_replay_handlers_cover_mark_verbs():
+    """Marks are BORN JOURNALED (DEC 2a231843): both verbs replay as wire ops."""
+    handlers = correction_replay_handlers()
+    assert "mark" in handlers and "mark-dismiss" in handlers

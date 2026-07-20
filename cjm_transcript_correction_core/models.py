@@ -35,7 +35,7 @@ class Correction:
     generic GraphNode. Corrections are DECISIONS (asserted events) — they keep
     GENERATED ids, the FLIP-TRIGGER-protected class.
     """
-    correction_type: str                                   # "text_content" | "punctuation" | "grouping" | "review"
+    correction_type: str                                   # "text_content" | "punctuation" | "grouping" | "review" | "mark"
     status: str = "applied"                                # "proposed" | "applied" | "superseded"
     session_id: str = ""                                   # Owning CorrectionSession id
     payload: Dict[str, Any] = field(default_factory=dict)  # Type-specific data (new text, prune set, ...)
@@ -169,3 +169,22 @@ class CorrectionManifest:
 def new_run_id() -> str:  # e.g. "correct_20260608_153000_1a2b3c4d"
     """Generate a unique, sortable correction run id."""
     return f"correct_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+
+
+# The RECOMMENDED mark-class slate (DEC 2a231843) — an OPEN vocabulary: classes are
+# DATA, not schema. A mark commits with any non-empty class string; this tuple is
+# the evidence-derived starting set (census dc31c33c + the drive evidence chain)
+# that pickers and status hints surface, so a new class found mid-walk is a journal
+# entry, never a core release.
+RECOMMENDED_MARK_CLASSES = (
+    "hesitation-omission",     # single Um / 'you know' slots dropped (fill dominates)
+    "repeat-omission",         # dropped repeated words/stutters — the omission-entangled boundary case
+    "meta-speech-omission",    # spoken 'Quote' / 'End Quote' markers dropped
+    "meta-speech-executed",    # meta-speech rendered AS punctuation instead
+    "homophone-substitution",  # context-vs-acoustics substitution (where/were)
+    "proper-noun-suspect",     # entity spelling suspect (Hiroo/Hiro/Hero)
+    "orthographic-drift",      # decoder-state capitalization/orthography decay
+    "granularity-mismatch",    # VAD split lands mid-word/mid-token
+    "foreign-speech",          # non-English speech garbled into English (montage/quote cases; drive-minted 2026-07-19)
+    "suspect",                 # free-note catch-all — flag now, judge later
+)

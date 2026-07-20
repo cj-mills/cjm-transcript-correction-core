@@ -96,6 +96,7 @@ def correction_replay_handlers() -> Dict[str, Any]:  # verb -> async handler(que
 
     return {"session-start": _apply_wires, "boundary-shift": _apply_wires,
             "text-correction": _apply_wires, "prune-amendment": _apply_wires,
+            "mark": _apply_wires, "mark-dismiss": _apply_wires,
             "review-markers": _apply_wires, "session-status": _apply_session_status}
 
 

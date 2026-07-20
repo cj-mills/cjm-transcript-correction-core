@@ -259,7 +259,7 @@ def _edge(
 
 
 def build_correction_node(
-    correction_type: str,                  # "text_content" | "punctuation" | "grouping" | "review"
+    correction_type: str,                  # "text_content" | "punctuation" | "grouping" | "review" | "mark"
     session_id: str,                       # Owning session id
     payload: Dict[str, Any],               # Type-specific payload
     actor: str = "human",                  # Actor
@@ -376,7 +376,8 @@ async def record_review_markers(
     journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
 ) -> int:  # Number of REVIEWED edges committed
     """Persist per-(session, segment) review markers as REVIEWED edges."""
-    edges = [_edge(session_id, seg_id, CorrectionRelations.REVIEWED, {"decision": dec})
+    edges = [_edge(session_id, seg_id, CorrectionRelations.REVIEWED,
+                   {"decision": dec, "ts": time.time()})
              for seg_id, dec in decisions]
     n = (await commit_nodes_edges(queue, graph_id, [], edges))["edges"]
     if journal_path:
@@ -395,11 +396,21 @@ async def load_review_markers(
     graph_id: str,    # Graph-storage capability id
     session_id: str,  # Owning session id
 ) -> Dict[str, str]:  # segment_id -> decision for the session
-    """Load a session's review markers (typed edge projection over REVIEWED edges)."""
+    """Load a session's review markers (typed edge projection over REVIEWED edges).
+
+    Markers are EVENTS (a re-decision appends — the _edge docstring's contract),
+    so the read is LATEST-WINS by the marker's ts, and a latest decision of
+    "unreviewed" means UNDECIDED: the segment drops out of the returned map
+    entirely (the space-undo gesture; compute_worklist then re-surfaces it).
+    Historical edges without ts sort first, so any re-decision beats them.
+    """
     q = EdgeQuery(source_id=session_id, relation_type=CorrectionRelations.REVIEWED,
-                  project=["decision"])
+                  project=["decision", "ts"])
     res = await graph_task(queue, graph_id, "query_edges", query=q.to_dict())
-    return {r["target_id"]: r["decision"] for r in (res.rows or [])}
+    latest: Dict[str, str] = {}
+    for r in sorted((res.rows or []), key=lambda r: float(r.get("ts") or 0.0)):
+        latest[r["target_id"]] = r["decision"]
+    return {sid: dec for sid, dec in latest.items() if dec != "unreviewed"}
 
 
 def _node_to_correction_dict(
@@ -836,3 +847,178 @@ async def commit_prune_amendment(
                               anchor=await segment_anchor(queue, graph_id, unprune_ids),
                               nodes=[node], edges=edges, op_id=node["id"])
     return _node_to_correction_dict(node)
+
+
+def mark_anchor_segments(
+    anchor: Dict[str, Any],  # Mark anchor: {"kind": "segment" | "boundary" | "span", ...}
+) -> List[str]:  # The layer-0 Segment ids the anchor touches (CORRECTS targets)
+    """Validate a mark anchor and list the Segment ids it touches.
+
+    The three anchor shapes (DEC 2a231843): `segment` {segment_id} ·
+    `boundary` {boundary_after, right_segment_id} (the boundary AFTER a
+    segment — the shift gesture's coordinates) · `span` {segment_id,
+    char_start, char_end, text_snapshot} (offsets into the segment's effective
+    text AT MARK TIME; the snapshot is what re-anchoring trusts — see
+    `reanchor_span` — the offsets are only its hint).
+    """
+    kind = anchor.get("kind")
+    if kind == "segment":
+        ids = [anchor.get("segment_id")]
+    elif kind == "boundary":
+        ids = [anchor.get("boundary_after"), anchor.get("right_segment_id")]
+    elif kind == "span":
+        ids = [anchor.get("segment_id")]
+        if not anchor.get("text_snapshot") or anchor.get("char_start") is None \
+                or anchor.get("char_end") is None:
+            raise ValueError("span mark anchor needs char_start, char_end and a text_snapshot")
+    else:
+        raise ValueError(f"mark anchor kind must be 'segment' | 'boundary' | 'span', got {kind!r}")
+    if any(not sid for sid in ids):
+        raise ValueError(f"{kind} mark anchor is missing its segment id(s): {anchor!r}")
+    return [str(sid) for sid in ids]
+
+
+def build_mark_correction(
+    source_id: str,                       # Source the marked segment(s) belong to
+    anchor: Dict[str, Any],               # Anchor: segment | boundary | span (see mark_anchor_segments)
+    mark_class: str,                      # Open-vocabulary class (RECOMMENDED_MARK_CLASSES is the slate)
+    session_id: str,                      # Owning session id
+    supersedes_id: Optional[str] = None,  # Prior mark this one replaces (re-mark)
+    actor: str = "human",                 # Actor ("human" | "capability:<name>" for pass-2 assists)
+    note: Optional[str] = None,           # Optional free-text note
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (correction node dict, edge dicts)
+    """Build a NON-MUTATING mark Correction (DEC 2a231843: routed attention).
+
+    A mark is a placeholder correction: it records that a slot needs judgment
+    (an omission-entangled boundary, a suspect entity, ...) WITHOUT resolving
+    anything — `corrections_to_edits` has no arm for it, so it can never touch
+    the effective view. It closes by SUPERSESSION: the real correction that
+    discharges it passes `supersedes_id=<mark id>`, or a dismissal supersedes
+    it (`commit_mark_dismissal`, riding the reject-review shape). CORRECTS
+    edges anchor every touched segment so marks surface in segment-scoped
+    reads.
+    """
+    mc = (mark_class or "").strip()
+    if not mc:
+        raise ValueError("mark_class must be a non-empty string")
+    if not mc[:1].isalnum():
+        raise ValueError(f"mark_class must start with a letter or digit, got {mark_class!r}"
+                         " — punctuation-led tokens are reserved for gestures ('-' dismissal)")
+    seg_ids = mark_anchor_segments(anchor)
+    payload = {"operation": "mark", "source_id": source_id,
+               "anchor": dict(anchor), "mark_class": mc}
+    node = build_correction_node("mark", session_id, payload, actor=actor,
+                                 rationale=note).to_graph_node()
+    edges = [make_edge(node.id, sid, CorrectionRelations.CORRECTS) for sid in seg_ids]
+    if supersedes_id:
+        edges.append(make_edge(node.id, supersedes_id, CorrectionRelations.SUPERSEDES))
+    return node.to_dict(), edges
+
+
+async def commit_mark_correction(
+    queue: JobQueue,                      # Started job queue
+    graph_id: str,                        # Graph-storage capability id
+    source_id: str,                       # Source the marked segment(s) belong to
+    anchor: Dict[str, Any],               # Anchor: segment | boundary | span
+    mark_class: str,                      # Open-vocabulary class
+    session_id: str,                      # Owning session id
+    supersedes_id: Optional[str] = None,  # Prior mark to supersede (re-mark)
+    actor: str = "human",                 # Actor
+    note: Optional[str] = None,           # Optional free-text note
+    journal_path: Optional[str] = None,   # Sidecar journal — append the op on success (None = unjournaled)
+) -> str:  # The new mark Correction node id
+    """Commit a mark (node + CORRECTS per anchored segment [+ SUPERSEDES]).
+
+    NO review marker: a mark is routed attention, not a review decision — the
+    walked-past state stays exactly as the operator left it.
+    """
+    node, edges = build_mark_correction(source_id, anchor, mark_class, session_id,
+                                        supersedes_id=supersedes_id, actor=actor, note=note)
+    await commit_nodes_edges(queue, graph_id, [node], edges)
+    if journal_path:
+        journal_correction_op(journal_path, "mark", actor=actor, session_id=session_id,
+                              args={"source_id": source_id, "anchor": dict(anchor),
+                                    "mark_class": mark_class, "note": note,
+                                    "supersedes_id": supersedes_id},
+                              anchor=await segment_anchor(queue, graph_id,
+                                                          mark_anchor_segments(anchor)),
+                              nodes=[node], edges=edges, op_id=node["id"])
+    return node["id"]
+
+
+async def commit_mark_dismissal(
+    queue: JobQueue,                     # Started job queue
+    graph_id: str,                       # Graph-storage capability id
+    source_id: str,                      # Source the mark belongs to
+    mark_id: str,                        # The open mark being dismissed
+    session_id: str,                     # Owning session id
+    actor: str = "human",                # Actor (the dismisser)
+    note: Optional[str] = None,          # Optional note (why dismissed)
+    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+) -> str:  # The review node id that superseded the mark
+    """Dismiss an open mark WITHOUT a correction (reject-as-supersede).
+
+    Rides the review verdict shape (`build_reject_review`): dismissal is a
+    SUPERSEDES edge from a small review node — append-only, carrying
+    actor/note/timestamp — and `open_marks` then excludes the mark. No anchor
+    on the journal op: dismissal is derivative session state, like review
+    markers (the ccbab9f5 anchor scope).
+    """
+    node, edges = build_reject_review(source_id, mark_id, session_id,
+                                      actor=actor, rationale=note)
+    await commit_nodes_edges(queue, graph_id, [node], edges)
+    if journal_path:
+        journal_correction_op(journal_path, "mark-dismiss", actor=actor,
+                              session_id=session_id,
+                              args={"source_id": source_id, "mark_id": mark_id, "note": note},
+                              nodes=[node], edges=edges, op_id=node["id"])
+    return node["id"]
+
+
+def open_marks(
+    corrections: List[Dict[str, Any]],  # Corrections (e.g. from load_source_corrections)
+    superseded_ids: set,                # Ids that are SUPERSEDES targets
+) -> List[Dict[str, Any]]:  # The OPEN marks (not yet discharged/dismissed), oldest first
+    """Filter to the OPEN marks — the pass-2 worklist ('query open marks, walk them').
+
+    A mark leaves this set the moment anything supersedes it (the discharging
+    correction or a dismissal review) — resolution is read from SUPERSEDES
+    edges, never a status mutation.
+    """
+    marks = [c for c in corrections
+             if c.get("correction_type") == "mark"
+             and (c.get("payload") or {}).get("operation") == "mark"
+             and c.get("id") not in superseded_ids]
+    marks.sort(key=lambda c: c.get("created_at") or 0.0)
+    return marks
+
+
+def reanchor_span(
+    anchor: Dict[str, Any],  # A span mark anchor (char_start / char_end / text_snapshot)
+    effective_text: str,     # The segment's CURRENT effective text
+) -> Optional[Tuple[int, int]]:  # Current (char_start, char_end); None = degrade to segment level
+    """Re-locate a span anchor in text that may have been edited since mark time.
+
+    The SNAPSHOT is the anchor's truth; the recorded offsets are only its hint
+    (DEC 2a231843): exact offsets verified first, then the snapshot occurrence
+    NEAREST the recorded start, else None — the caller degrades the mark to
+    segment level (which usually means the marked text was addressed).
+    """
+    snap = anchor.get("text_snapshot")
+    if not snap:
+        return None
+    try:
+        cs, ce = int(anchor.get("char_start")), int(anchor.get("char_end"))
+    except (TypeError, ValueError):
+        cs, ce = -1, -1
+    if 0 <= cs <= ce <= len(effective_text) and effective_text[cs:ce] == snap:
+        return cs, ce
+    hits: List[int] = []
+    at = effective_text.find(snap)
+    while at != -1:
+        hits.append(at)
+        at = effective_text.find(snap, at + 1)
+    if not hits:
+        return None
+    best = min(hits, key=lambda h: abs(h - cs) if cs >= 0 else h)
+    return best, best + len(snap)
