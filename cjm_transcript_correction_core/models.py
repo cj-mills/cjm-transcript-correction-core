@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Union
 from uuid import uuid4
 
 from cjm_context_graph_primitives.graph import GraphNode
+from cjm_substrate.core.workspace import relativize_recorded
 
 
 class CorrectionRelations:
@@ -158,11 +159,16 @@ class CorrectionManifest:
     def save(
         self,
         path: Union[str, Path],  # Destination JSON file (parent dirs created)
+        workspace=None,  # Active Workspace; owned paths record as ${WS}/<rel> (5daadfc4 rung f)
     ) -> Path:  # The written path
-        """Write the manifest as pretty-printed JSON."""
+        """Write the manifest as pretty-printed JSON.
+
+        With `workspace`, recorded paths under its root take the ${WS}/ token
+        form (relativize_recorded), so the manifest relocates with the
+        workspace; readers resolve via resolve_recorded_tree at load."""
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(json.dumps(self.to_dict(), indent=2))
+        out.write_text(json.dumps(relativize_recorded(self.to_dict(), workspace), indent=2))
         return out
 
 

@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 from cjm_substrate.core.journal_store import JournalEvent, SubstrateEventType
 from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
+from cjm_substrate.core.workspace import resolve_recorded_tree
 from cjm_transcript_correction_core.graph import (active_corrections, build_prune_correction,
                                                   commit_nodes_edges, commit_text_correction,
                                                   count_source_segments,
@@ -31,8 +32,11 @@ logger = logging.getLogger(__name__)
 def load_decomp_manifest(
     path: str,  # Path to a decomp-core run manifest JSON
 ) -> Dict[str, Any]:  # Parsed manifest dict
-    """Load + lightly validate a decomp-core run manifest (untyped JSON; CR-20 interchange)."""
-    data = json.loads(Path(path).read_text())
+    """Load + lightly validate a decomp-core run manifest (untyped JSON; CR-20 interchange).
+
+    ${WS}/ recorded paths (5daadfc4 rung f) resolve to absolute here, anchored
+    at the manifest's own location (active workspace as fallback)."""
+    data = resolve_recorded_tree(json.loads(Path(path).read_text()), Path(path))
     fmt = data.get("format", "")
     if "decomp-core" not in fmt:
         logger.warning(f"unexpected decomp manifest format: {fmt!r} (continuing)")

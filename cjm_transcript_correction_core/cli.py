@@ -3,11 +3,13 @@
 import argparse
 import asyncio
 import logging
+import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
+from cjm_substrate.core.workspace import resolve_workspace
 from cjm_transcript_correction_core.models import CorrectionConfig
 from cjm_transcript_correction_core.pipeline import (load_decomp_manifest, resolve_graph_db_path,
                                                      run_correction, run_review)
@@ -18,7 +20,13 @@ logger = logging.getLogger(__name__)
 def _add_common_run_args(p: argparse.ArgumentParser) -> None:  # Shared run/review arguments
     """Attach the capability / session / output arguments shared by `run` and `review`."""
     p.add_argument("manifest", help="Decomp-core run manifest JSON (the committed spine)")
-    p.add_argument("--manifests-dir", default=".cjm/manifests", help="Capability manifests directory")
+    p.add_argument("--manifests-dir", default=None,
+                   help="Capability manifests directory (default: the workspace's .cjm/manifests "
+                        "when one is active, else .cjm/manifests under the cwd)")
+    p.add_argument("--workspace", default=None,
+                   help="Workspace root (5daadfc4; default: CJM_WORKSPACE env, else upward walk "
+                        "from cwd). Supplies manifests/output defaults and is exported so "
+                        "capability workers resolve workspace-scoped paths")
     p.add_argument("--graph-capability", default="cjm-capability-graph-sqlite", help="Graph-storage capability name")
     p.add_argument("--graph-db-path", default=None,
                    help="Override graph DB path (default: the decomp manifest's recorded db_path)")
@@ -31,7 +39,9 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:  # Shared run/revi
     p.add_argument("--session", default=None, help="Resume an existing CorrectionSession id")
     p.add_argument("--reopen", action="store_true", help="Reopen a completed session (with --session)")
     p.add_argument("--actor", default="human", help="Actor recorded on corrections + review markers")
-    p.add_argument("--output", default=None, help="Correction-manifest output path (default: runs/<run_id>.json)")
+    p.add_argument("--output", default=None,
+                   help="Correction-manifest output path (default: <workspace>/runs/<run_id>.json "
+                        "when a workspace is active, else runs/<run_id>.json under the cwd)")
     p.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
 
 
@@ -84,6 +94,14 @@ async def run_command(
     args: argparse.Namespace,  # Parsed args for the `run` subcommand
 ) -> int:  # Process exit code
     """Execute the `run` subcommand: correct a decomp manifest's committed spine."""
+    # 5daadfc4 workspace: resolve BEFORE any substrate config loads; export so
+    # the process tree (substrate config, capability workers) is workspace-scoped.
+    ws = resolve_workspace(explicit=getattr(args, "workspace", None))
+    if ws is not None:
+        os.environ["CJM_WORKSPACE"] = str(ws.root)
+    if args.manifests_dir is None:
+        args.manifests_dir = (str(ws.substrate_data_dir / "manifests")
+                              if ws is not None else ".cjm/manifests")
     manifest_path = str(Path(args.manifest).resolve())
     if not Path(manifest_path).exists():
         raise SystemExit(f"decomp manifest not found: {manifest_path}")
@@ -122,8 +140,9 @@ async def run_command(
             except Exception as e:  # Best-effort teardown; never mask the run's outcome
                 logger.warning(f"unload {iid} failed: {e}")
 
-    out = Path(args.output) if args.output else Path("runs") / f"{manifest.run_id}.json"
-    manifest.save(out)
+    out = (Path(args.output) if args.output
+           else (ws.runs_dir if ws is not None else Path("runs")) / f"{manifest.run_id}.json")
+    manifest.save(out, workspace=ws)
     n_sources = len(manifest.sources)
     n_pruned = sum(s.get("pruned", 0) for s in manifest.sources)
     n_flagged = sum(s.get("worklist_flagged", 0) for s in manifest.sources)
@@ -137,6 +156,13 @@ async def review_command(
     args: argparse.Namespace,  # Parsed args for the `review` subcommand
 ) -> int:  # Process exit code
     """Execute the `review` subcommand: interactive text corrections over the flagged worklist."""
+    # 5daadfc4 workspace: same early resolution + export as run_command.
+    ws = resolve_workspace(explicit=getattr(args, "workspace", None))
+    if ws is not None:
+        os.environ["CJM_WORKSPACE"] = str(ws.root)
+    if args.manifests_dir is None:
+        args.manifests_dir = (str(ws.substrate_data_dir / "manifests")
+                              if ws is not None else ".cjm/manifests")
     manifest_path = str(Path(args.manifest).resolve())
     if not Path(manifest_path).exists():
         raise SystemExit(f"decomp manifest not found: {manifest_path}")
@@ -167,8 +193,9 @@ async def review_command(
             except Exception as e:  # Best-effort teardown; never mask the run's outcome
                 logger.warning(f"unload {iid} failed: {e}")
 
-    out = Path(args.output) if args.output else Path("runs") / f"{manifest.run_id}.json"
-    manifest.save(out)
+    out = (Path(args.output) if args.output
+           else (ws.runs_dir if ws is not None else Path("runs")) / f"{manifest.run_id}.json")
+    manifest.save(out, workspace=ws)
     n_corr = sum(s.get("corrected", 0) for s in manifest.sources)
     n_active = sum(s.get("active_corrections", 0) for s in manifest.sources)
     print(f"correction manifest: {out}")
