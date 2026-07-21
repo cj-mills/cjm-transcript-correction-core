@@ -22,6 +22,9 @@ Repository = "https://github.com/cj-mills/cjm-transcript-correction-core"
 [project.scripts]
 cjm-transcript-correction-core = "cjm_transcript_correction_core.cli:main"
 
+[project.entry-points."cjm_context_graph_layer.replay"]
+correction = "cjm_transcript_correction_core.journal:correction_replay_handlers"
+
 [tool.setuptools.dynamic]
 version = {attr = "cjm_transcript_correction_core.__version__"}
 

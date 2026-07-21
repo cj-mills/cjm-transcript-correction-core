@@ -28,11 +28,14 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `active_corrections` _function_ — Filter to the effective correction set (the layer's resolve_active over a read superseded set).
 - `build_boundary_shift_correction` _function_ — Build a grouping Correction that moves text across one segment boundary.
 - `build_correction_node` _function_ — Construct a Correction overlay node (pure; commit happens separately).
+- `build_mark_correction` _function_ — Build a NON-MUTATING mark Correction (DEC 2a231843: routed attention).
 - `build_prune_amendment` _function_ — Build a grouping Correction that supersedes a prune with a REDUCED set (unprune).
 - `build_prune_correction` _function_ — Build one batch grouping Correction that prunes empty segments (D14).
 - `build_reject_review` _function_ — Build a review Correction that REJECTS a prior correction (reject-as-supersede).
 - `build_text_correction` _function_ — Build a text_content Correction + its CORRECTS (+ optional SUPERSEDES) edges.
 - `commit_boundary_shift_correction` _function_ — Commit a boundary-shift correction (node + CORRECTS x2 [+ SUPERSEDES]) + REVIEWED markers on both segments.
+- `commit_mark_correction` _function_ — Commit a mark (node + CORRECTS per anchored segment [+ SUPERSEDES]).
+- `commit_mark_dismissal` _function_ — Dismiss an open mark WITHOUT a correction (reject-as-supersede).
 - `commit_nodes_edges` _function_ — Commit overlay nodes/edges through the layer's idempotent extend_graph.
 - `commit_prune_amendment` _function_ — Commit an unprune amendment (node + DERIVED_FROM edges + SUPERSEDES).
 - `commit_text_correction` _function_ — Commit a text_content correction (node + CORRECTS [+ SUPERSEDES]) + a REVIEWED marker.
@@ -48,7 +51,10 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `load_source_corrections` _function_ — Load every Correction targeting a Source (across sessions) + the superseded-id set.
 - `load_source_segments` _function_ — Load a Source's fine Segment spine under its chosen rendition (typed query surface).
 - `load_variant_texts` _function_ — Resolve per-transcriber chunk texts from the segments' CharSlice refs.
+- `mark_anchor_segments` _function_ — Validate a mark anchor and list the Segment ids it touches.
+- `open_marks` _function_ — Filter to the OPEN marks — the pass-2 worklist ('query open marks, walk them').
 - `project_effective_spine` _function_ — Project the effective spine = layer-0 + applied corrections.
+- `reanchor_span` _function_ — Re-locate a span anchor in text that may have been edited since mark time.
 - `record_review_markers` _function_ — Persist per-(session, segment) review markers as REVIEWED edges.
 - `resolve_source_renditions` _function_ — Pick the AudioRendition set whose fine Segment spine correction operates on.
 - `set_session_status` _function_ — Update a session's status + updated_at.

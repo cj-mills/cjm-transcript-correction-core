@@ -11,7 +11,8 @@ append discipline lives in `cjm_context_graph_primitives.journal`.
 
 from typing import Any, Dict, List, Optional
 
-from cjm_context_graph_layer.ops import extend_graph, graph_task
+from cjm_context_graph_layer.journal import wires_handlers
+from cjm_context_graph_layer.ops import graph_task
 from cjm_context_graph_primitives.journal import append_op
 from cjm_context_graph_primitives.query import NodeQuery
 
@@ -81,23 +82,21 @@ def journal_correction_op(
 def correction_replay_handlers() -> Dict[str, Any]:  # verb -> async handler(queue, graph_id, op)
     """The correction core's registered replay vocabulary (replay stays DOMAIN-OWNED).
 
-    Pass to `cjm_context_graph_layer.journal.replay_journal(handlers=...)`: wire-carrying
-    ops re-apply through the layer's idempotent extend (replayed wires collide into
-    verified no-ops); `session-status` is the core's only update_node write, replayed
-    last-wins in append order."""
-    async def _apply_wires(queue: Any, graph_id: str, op: Dict[str, Any]) -> None:
-        w = op.get("wires") or {}
-        await extend_graph(queue, graph_id, w.get("nodes") or [], w.get("edges") or [])
-
+    Exported through the `cjm_context_graph_layer.replay` entry-point group (DEC
+    426658f1) and unioned by `composed_replay_handlers`: wire-carrying verbs register
+    the layer's shared `apply_wires` — the single wires-replay authority, identity-
+    comparable across cores, which keeps cross-core verb collisions checkable;
+    `session-status` is the core's only update_node write, replayed last-wins in
+    append order."""
     async def _apply_session_status(queue: Any, graph_id: str, op: Dict[str, Any]) -> None:
         a = op["args"]
         await graph_task(queue, graph_id, "update_node", node_id=a["session_id"],
                          properties={"status": a["status"], "updated_at": a["updated_at"]})
 
-    return {"session-start": _apply_wires, "boundary-shift": _apply_wires,
-            "text-correction": _apply_wires, "prune-amendment": _apply_wires,
-            "mark": _apply_wires, "mark-dismiss": _apply_wires,
-            "review-markers": _apply_wires, "session-status": _apply_session_status}
+    handlers = wires_handlers("session-start", "boundary-shift", "text-correction",
+                              "prune-amendment", "mark", "mark-dismiss", "review-markers")
+    handlers["session-status"] = _apply_session_status
+    return handlers
 
 
 # A Source's content hash is IMMUTABLE — read once per process, not per commit
