@@ -25,5 +25,6 @@ data_dir: ./.cjm
 # Capabilities configuration file
 capabilities_config: ./capabilities_test.yaml
 
-# Shared model storage (platform-independent)
-models_dir: ./models
+# Shared model storage: the system-tier model cache (DEC d123510a — one cache,
+# opt-in per project; workspace = data/runs/config, system cache = models)
+models_dir: /mnt/SN850X_8TB_EXT4/Model_Cache
