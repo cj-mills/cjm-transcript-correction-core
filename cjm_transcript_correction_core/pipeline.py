@@ -128,7 +128,8 @@ async def prune_empty_segments(
     by superseding.
     """
     empties = await load_empty_segments(queue, graph_id, source_id,
-                                        rendition_selector=cfg.rendition_selector)
+                                        rendition_selector=cfg.rendition_selector,
+                                        skeleton_selector=cfg.skeleton_selector)
     if not empties:
         logger.info(f"[prune] {source_id}: no empty segments")
         return {"pruned": 0, "correction_id": None}
@@ -244,9 +245,11 @@ async def run_correction(
 
         for sid in source_ids:
             n = await count_source_segments(queue, cfg.graph_capability, sid,
-                                            rendition_selector=cfg.rendition_selector)
+                                            rendition_selector=cfg.rendition_selector,
+                                            skeleton_selector=cfg.skeleton_selector)
             segments = await load_source_segments(queue, cfg.graph_capability, sid,
-                                                  rendition_selector=cfg.rendition_selector)
+                                                  rendition_selector=cfg.rendition_selector,
+                                                  skeleton_selector=cfg.skeleton_selector)
             variants = await load_variant_texts(queue, cfg.graph_capability, segments)
             markers = await load_review_markers(queue, cfg.graph_capability, sess_id)
             worklist = compute_worklist(segments, markers, variants=variants)
@@ -448,9 +451,11 @@ async def run_review(
 
         for sid in source_ids:
             n = await count_source_segments(queue, cfg.graph_capability, sid,
-                                            rendition_selector=cfg.rendition_selector)
+                                            rendition_selector=cfg.rendition_selector,
+                                            skeleton_selector=cfg.skeleton_selector)
             segments = await load_source_segments(queue, cfg.graph_capability, sid,
-                                                  rendition_selector=cfg.rendition_selector)
+                                                  rendition_selector=cfg.rendition_selector,
+                                                  skeleton_selector=cfg.skeleton_selector)
             variants = await load_variant_texts(queue, cfg.graph_capability, segments)
             variant_by_segment: Dict[str, str] = {}
             for i, (auth, var) in variant_divergence(segments, variants).items():

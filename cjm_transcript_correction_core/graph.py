@@ -54,6 +54,8 @@ async def submit_and_wait(
 
 _SPINE_PROJECTION = ["index", "text", "start_time", "end_time", "text_from", "sources"]  # + structural "id"
 
+LEGACY_SKELETON = "legacy"  # --skeleton selector naming the pre-split spine (segments without a skeleton_hash prop)
+
 
 def _row_to_spine_segment(row: Dict[str, Any]) -> SpineSegment:  # One projected row -> SpineSegment
     """Build a SpineSegment from a projected row (audio anchor + per-transcriber slices)."""
@@ -192,12 +194,14 @@ async def load_source_segments(
     limit: Optional[int] = None,            # Optional page size
     offset: Optional[int] = None,           # Optional page offset
     rendition_selector: Optional[str] = None,  # Which rendition spine (None = auto-select)
+    skeleton_selector: Optional[str] = None,   # Which SKELETON spine ("legacy" | hash prefix); None = auto, refuses when >1 coexist
 ) -> List[SpineSegment]:  # Ordered spine segments (by index)
-    """Load a Source's fine Segment spine under its chosen rendition (typed query surface)."""
+    """Load a Source's fine Segment spine under its chosen rendition + skeleton (typed query surface)."""
     rendition_ids = await resolve_source_renditions(queue, graph_id, source_id, rendition_selector)
     if not rendition_ids:
         return []
-    q = _spine_query(rendition_ids, limit=limit, offset=int(offset or 0))
+    where = await _resolve_spine_where(queue, graph_id, rendition_ids, skeleton_selector)
+    q = _spine_query(rendition_ids, limit=limit, offset=int(offset or 0), where=where)
     res = await graph_task(queue, graph_id, "query_nodes", query=q.to_dict())
     return [_row_to_spine_segment(r) for r in (res.rows or [])]
 
@@ -207,6 +211,7 @@ async def load_empty_segments(
     graph_id: str,    # Graph-storage capability id
     source_id: str,   # Source node id
     rendition_selector: Optional[str] = None,  # Which rendition spine (None = auto-select)
+    skeleton_selector: Optional[str] = None,   # Which SKELETON spine ("legacy" | hash prefix); None = auto, refuses when >1 coexist
 ) -> List[SpineSegment]:  # Only the empty-text segments (server-side filtered)
     """Load ONLY a Source's empty-text segments under its chosen rendition (D14 prune).
 
@@ -217,10 +222,11 @@ async def load_empty_segments(
     rendition_ids = await resolve_source_renditions(queue, graph_id, source_id, rendition_selector)
     if not rendition_ids:
         return []
+    spine = await _resolve_spine_where(queue, graph_id, rendition_ids, skeleton_selector)
     r1 = await graph_task(queue, graph_id, "query_nodes", query=_spine_query(
-        rendition_ids, where=[PropertyPredicate("text", "eq", "")]).to_dict())
+        rendition_ids, where=spine + [PropertyPredicate("text", "eq", "")]).to_dict())
     r2 = await graph_task(queue, graph_id, "query_nodes", query=_spine_query(
-        rendition_ids, where=[PropertyPredicate("text", "is_null")]).to_dict())
+        rendition_ids, where=spine + [PropertyPredicate("text", "is_null")]).to_dict())
     segs = [_row_to_spine_segment(r) for r in (r1.rows or []) + (r2.rows or [])]
     segs.sort(key=lambda s: s.index)
     return segs
@@ -231,12 +237,14 @@ async def count_source_segments(
     graph_id: str,    # Graph-storage capability id
     source_id: str,   # Source node id
     rendition_selector: Optional[str] = None,  # Which rendition spine (None = auto-select)
-) -> int:  # Number of fine Segment nodes under the Source's chosen rendition
-    """Count a Source's segments server-side under its chosen rendition (typed count mode)."""
+    skeleton_selector: Optional[str] = None,   # Which SKELETON spine ("legacy" | hash prefix); None = auto, refuses when >1 coexist
+) -> int:  # Number of fine Segment nodes under the Source's chosen rendition + skeleton
+    """Count a Source's segments server-side under its chosen rendition + skeleton (typed count mode)."""
     rendition_ids = await resolve_source_renditions(queue, graph_id, source_id, rendition_selector)
     if not rendition_ids:
         return 0
-    q = _spine_query(rendition_ids, order_by=None, project=None, count=True)
+    where = await _resolve_spine_where(queue, graph_id, rendition_ids, skeleton_selector)
+    q = _spine_query(rendition_ids, order_by=None, project=None, count=True, where=where)
     res = await graph_task(queue, graph_id, "query_nodes", query=q.to_dict())
     return int(res.count or 0)
 
@@ -506,9 +514,19 @@ def project_effective_spine(
     reserved boundary_shift, with created_at ordering + latest-wins); this
     wrapper converts SpineSegments <-> SpineUnits and re-attaches the
     segment metadata by id.
+
+    SPINE-SCOPED (DEC f1024568 migration v0 = none): corrections are loaded
+    SOURCE-wide, but parallel skeletons share no segment ids — an edit anchored
+    to another spine's ids is simply not part of THIS spine's overlay, so it is
+    dropped here rather than crashing the layer's loud unknown-target
+    validation (2026-07-22 drive: legacy boundary-shifts SpineEditError'd the
+    sentence-split spine's open).
     """
     units = [SpineUnit(id=s.id, text=s.text) for s in segments]
-    out_units = layer_project_effective_spine(units, corrections_to_edits(corrections))
+    known = {u.id for u in units}
+    edits = [e for e in corrections_to_edits(corrections)
+             if all(t in known for t in e.targets)]
+    out_units = layer_project_effective_spine(units, edits)
     by_id = {u.id: u.text for u in out_units}
     out: List[SpineSegment] = []
     for s in segments:
@@ -1022,3 +1040,105 @@ def reanchor_span(
         return None
     best = min(hits, key=lambda h: abs(h - cs) if cs >= 0 else h)
     return best, best + len(snap)
+
+
+async def _list_spines(
+    queue: JobQueue,           # Started job queue
+    graph_id: str,             # Graph-storage capability id
+    rendition_ids: List[str],  # The chosen rendition chain group
+) -> List[Dict[str, Any]]:  # [{"skeleton_hash", "split_policy", "segments"}], legacy first
+    """Group the fine Segments under a rendition set by SKELETON (parallel spines).
+
+    One bounded projection (two props over the PART_OF far-end batch), grouped
+    client-side — group-by aggregates stay deferred in the typed query surface.
+    A None skeleton_hash = the pre-split LEGACY spine (nodes committed before
+    the prop existed); it sorts first so pickers show it as the incumbent.
+    """
+    q = _spine_query(rendition_ids, order_by=None,
+                     project=["skeleton_hash", "split_policy"])
+    res = await graph_task(queue, graph_id, "query_nodes", query=q.to_dict())
+    groups: Dict[Optional[str], Dict[str, Any]] = {}
+    for r in (res.rows or []):
+        key = r.get("skeleton_hash")
+        g = groups.setdefault(key, {"skeleton_hash": key, "split_policy": None,
+                                    "segments": 0})
+        g["segments"] += 1
+        if r.get("split_policy"):
+            g["split_policy"] = r["split_policy"]
+    return sorted(groups.values(),
+                  key=lambda g: (g["skeleton_hash"] is not None,
+                                 g["skeleton_hash"] or ""))
+
+
+async def list_source_spines(
+    queue: JobQueue,  # Started job queue
+    graph_id: str,    # Graph-storage capability id
+    source_id: str,   # Source node id
+    rendition_selector: Optional[str] = None,  # Which rendition chain (None = auto)
+) -> List[Dict[str, Any]]:  # [{"skeleton_hash", "split_policy", "segments"}], legacy first
+    """The SPINES coexisting under a Source's chosen rendition (DEC f1024568).
+
+    The picker/discovery surface: each row is one skeleton — the legacy
+    (pre-split) spine has skeleton_hash None; sentence-split spines carry their
+    composite hash + policy tag. Empty when nothing is decomposed yet.
+    """
+    rendition_ids = await resolve_source_renditions(queue, graph_id, source_id,
+                                                    rendition_selector)
+    if not rendition_ids:
+        return []
+    return await _list_spines(queue, graph_id, rendition_ids)
+
+
+async def _resolve_spine_where(
+    queue: JobQueue,                 # Started job queue
+    graph_id: str,                   # Graph-storage capability id
+    rendition_ids: List[str],        # The chosen rendition chain group
+    selector: Optional[str] = None,  # "legacy" | a skeleton-hash (prefix ok) | None = auto
+) -> List[PropertyPredicate]:  # where-predicates scoping the chosen spine ([] = sole spine, no filter)
+    """Resolve which SKELETON spine reads operate on (the rendition pattern, one
+    level down).
+
+    Reads the observed spine set, then delegates the selector semantics to the
+    pure `spine_where_for` (auto refuses when several coexist; "legacy" = the
+    pre-split prop-absent spine; otherwise a unique hash/hex-tail prefix).
+    """
+    return spine_where_for(await _list_spines(queue, graph_id, rendition_ids), selector)
+
+
+def spine_where_for(
+    spines: List[Dict[str, Any]],    # _list_spines rows ({"skeleton_hash", "split_policy", "segments"})
+    selector: Optional[str] = None,  # "legacy" | a skeleton-hash (prefix ok) | None = auto
+) -> List[PropertyPredicate]:  # where-predicates scoping the chosen spine ([] = sole spine, no filter)
+    """Resolve a skeleton selector against the observed spine set (pure).
+
+    Auto (None): a sole spine needs no filter; MULTIPLE coexisting spines
+    refuse loudly (unfiltered reads would MIX them — the f1024568 hazard) and
+    name the choices. Explicit: "legacy" scopes to pre-split nodes (prop
+    absent); anything else matches one skeleton hash (full value, or a
+    case-insensitive prefix of the hash / its hex tail).
+    """
+    def _label(s: Dict[str, Any]) -> str:
+        h = s["skeleton_hash"]
+        tag = s.get("split_policy") or ("vad-only" if h else LEGACY_SKELETON)
+        return f"{tag}:{h.split(':')[-1][:8]}" if h else tag
+
+    if selector is None:
+        if len(spines) <= 1:
+            return []
+        raise ValueError(
+            f"{len(spines)} spines coexist under this rendition "
+            f"({', '.join(_label(s) for s in spines)}); pass --skeleton "
+            f"('{LEGACY_SKELETON}' or a hash prefix) to choose one")
+    sel = selector.strip().lower()
+    if sel == LEGACY_SKELETON:
+        if not any(s["skeleton_hash"] is None for s in spines):
+            raise ValueError(f"no {LEGACY_SKELETON} spine here "
+                             f"(available: {[_label(s) for s in spines]})")
+        return [PropertyPredicate("skeleton_hash", "is_null")]
+    hits = [s for s in spines if s["skeleton_hash"] and
+            (s["skeleton_hash"].lower().startswith(sel)
+             or s["skeleton_hash"].split(":")[-1].lower().startswith(sel))]
+    if len(hits) != 1:
+        raise ValueError(f"--skeleton {selector!r} matches {len(hits)} spine(s) "
+                         f"(available: {[_label(s) for s in spines]})")
+    return [PropertyPredicate("skeleton_hash", "eq", hits[0]["skeleton_hash"])]

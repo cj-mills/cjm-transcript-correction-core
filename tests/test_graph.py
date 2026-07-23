@@ -11,9 +11,11 @@ from cjm_transcript_correction_core.graph import (
     build_reject_review,
     build_text_correction,
     corrections_to_edits,
+    LEGACY_SKELETON,
     open_marks,
     project_effective_spine,
     reanchor_span,
+    spine_where_for,
 )
 from cjm_transcript_correction_core.models import SpineSegment
 
@@ -272,3 +274,62 @@ def test_reanchor_span():
     assert reanchor_span({"char_start": 3, "char_end": 5, "text_snapshot": "ab"},
                          "ab ab") == (3, 5)
     assert reanchor_span({"text_snapshot": ""}, "x") is None
+
+
+def test_spine_where_for_selector_semantics():
+    legacy = {"skeleton_hash": None, "split_policy": None, "segments": 950}
+    split = {"skeleton_hash": "sha256:abc123def", "split_policy": "sentence-split/v1",
+             "segments": 1100}
+    # Sole spine (either kind): no filter needed — reads stay unscoped.
+    assert spine_where_for([legacy]) == []
+    assert spine_where_for([split]) == []
+    # Coexisting spines + auto: refuse loudly (unfiltered reads would MIX them).
+    try:
+        spine_where_for([legacy, split])
+        assert False, "auto over coexisting spines must refuse"
+    except ValueError as e:
+        assert "--skeleton" in str(e)
+    # Explicit selectors: legacy -> prop-absent filter; hash/hex-tail prefix -> eq.
+    [p] = spine_where_for([legacy, split], LEGACY_SKELETON)
+    assert (p.prop, p.op) == ("skeleton_hash", "is_null")
+    for sel in ("sha256:abc123def", "sha256:abc", "abc123", "ABC"):
+        [p] = spine_where_for([legacy, split], sel)
+        assert (p.prop, p.op, p.value) == ("skeleton_hash", "eq", "sha256:abc123def")
+    # A selector matching nothing (or a missing legacy spine) refuses with the roster.
+    for bad in ("nope", LEGACY_SKELETON):
+        try:
+            spine_where_for([split], bad)
+            assert False, f"selector {bad!r} must refuse"
+        except ValueError:
+            pass
+
+
+def test_projection_ignores_foreign_spine_corrections():
+    # Corrections load SOURCE-wide but anchor by segment id; parallel spines
+    # share no ids (DEC f1024568), so another spine's edits must be inert on
+    # this one — not a layer SpineEditError (the 2026-07-22 split-spine crash).
+    spine = [SpineSegment(id="n1", index=0, text="hello world"),
+             SpineSegment(id="n2", index=1, text="foo")]
+    foreign = [
+        {"id": "c1", "correction_type": "grouping", "status": "applied",
+         "created_at": 1.0,
+         "payload": {"operation": "shift_boundary", "boundary_after": "old1",
+                     "right_segment_id": "old2", "text": "word",
+                     "direction": "push"}},
+        {"id": "c2", "correction_type": "grouping", "status": "applied",
+         "created_at": 2.0,
+         "payload": {"operation": "prune_empty", "pruned_segment_ids": ["old3"]}},
+        {"id": "c3", "correction_type": "text_content", "status": "applied",
+         "created_at": 3.0,
+         "payload": {"operation": "replace_text", "segment_id": "old1",
+                     "new_text": "nope"}},
+    ]
+    out = project_effective_spine(spine, foreign)
+    assert [(s.id, s.text) for s in out] == [("n1", "hello world"), ("n2", "foo")]
+    # ...while THIS spine's own corrections still apply.
+    own = [{"id": "c4", "correction_type": "text_content", "status": "applied",
+            "created_at": 4.0,
+            "payload": {"operation": "replace_text", "segment_id": "n2",
+                        "new_text": "bar"}}]
+    assert [s.text for s in project_effective_spine(spine, foreign + own)] \
+        == ["hello world", "bar"]

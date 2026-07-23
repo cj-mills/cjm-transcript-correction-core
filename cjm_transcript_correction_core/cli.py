@@ -34,6 +34,10 @@ def _add_common_run_args(p: argparse.ArgumentParser) -> None:  # Shared run/revi
                    help="Which AudioRendition spine to correct when a source has more than one "
                         "(\"raw\" or a preprocessing substring e.g. \"demucs\"); default: auto-select the "
                         "decomposed one (errors if ambiguous)")
+    p.add_argument("--skeleton", default=None,
+                   help="Which SKELETON spine to correct when several coexist under one rendition "
+                        "(sentence-split, DEC f1024568): \"legacy\" = the pre-split spine, or a "
+                        "skeleton-hash prefix; default: auto (errors when >1 coexist)")
     p.add_argument("--sysmon-capability", default=None,
                    help="monitor for empirical attribution (CR-7); loaded first; default: none")
     p.add_argument("--session", default=None, help="Resume an existing CorrectionSession id")
@@ -114,7 +118,7 @@ async def run_command(
     cfg = CorrectionConfig(
         graph_capability=args.graph_capability, graph_db_path=graph_db_path,
         actor=args.actor, assume_yes=args.yes, prune_empty=not args.no_prune,
-        rendition_selector=args.rendition,
+        rendition_selector=args.rendition, skeleton_selector=args.skeleton,
     )
 
     manager = CapabilityManager(
@@ -173,7 +177,7 @@ async def review_command(
 
     cfg = CorrectionConfig(graph_capability=args.graph_capability, graph_db_path=graph_db_path,
                            actor=args.actor, assume_yes=args.yes, prune_empty=False,
-                           rendition_selector=args.rendition)
+                           rendition_selector=args.rendition, skeleton_selector=args.skeleton)
     manager = CapabilityManager(search_paths=[Path(args.manifests_dir)], sysmon_capability_name=args.sysmon_capability)
     load_order = ([args.sysmon_capability] if args.sysmon_capability else []) + [cfg.graph_capability]
     load_capabilities(manager, load_order, configs={cfg.graph_capability: {"db_path": graph_db_path}})
