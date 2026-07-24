@@ -538,7 +538,9 @@ def project_effective_spine(
                              source_locator=s.source_locator, content_hash=s.content_hash,
                              text_from=s.text_from, text_slices=s.text_slices)
         out.append(s)
-    return out
+    # Timing corrections compose AFTER the text projection (core-side — the
+    # layer's edit vocabulary stays text-scoped until a second consumer).
+    return apply_time_nudges(out, corrections)
 
 
 def build_text_correction(
@@ -1142,3 +1144,115 @@ def spine_where_for(
         raise ValueError(f"--skeleton {selector!r} matches {len(hits)} spine(s) "
                          f"(available: {[_label(s) for s in spines]})")
     return [PropertyPredicate("skeleton_hash", "eq", hits[0]["skeleton_hash"])]
+
+
+def build_time_nudge_correction(
+    source_id: str,                        # Source the nudged boundary belongs to
+    edits: List[Dict[str, Any]],           # 1-2 edge edits: {"segment_id", "edge": "start"|"end", "old_time", "new_time"}
+    session_id: str,                       # Owning session id
+    boundary_words: Optional[Dict[str, Any]] = None,  # {"left": str|None, "right": str|None} — the words at the boundary (flywheel context)
+    step_s: Optional[float] = None,        # The press's signed step (seconds; the granularity record)
+    actor: str = "human",                  # Actor
+    rationale: Optional[str] = None,       # Optional note
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (correction node dict, edge dicts)
+    """Build a timing Correction that nudges segment boundary TIMES (node + CORRECTS edges).
+
+    The 3f9948d6 surface: FA boundary imprecision (2e42a737 — mid-word cuts,
+    numeral slivers) is corrected by ear, one edge at a time; a WELDED point
+    cut moves both edges in ONE correction (atomic — the cut point is one
+    decision). Payload keeps OLD and NEW absolute times per edge plus the
+    boundary words, so (prediction, correction, context) finetuning pairs for
+    VAD+FA derive straight from the journal (the hitl-correction-flywheel
+    extension from VAD labels to FA word timings). Non-destructive: layer-0
+    Segment times are untouched; the effective view applies nudges via
+    apply_time_nudges (latest-wins per edge, created_at order).
+    """
+    payload = {"operation": "time_nudge", "source_id": source_id,
+               "edits": [dict(e) for e in edits]}
+    if boundary_words:
+        payload["boundary_words"] = dict(boundary_words)
+    if step_s is not None:
+        payload["step_s"] = float(step_s)
+    node = build_correction_node("timing", session_id, payload, actor=actor,
+                                 rationale=rationale).to_graph_node()
+    edges = [make_edge(node.id, str(e["segment_id"]), CorrectionRelations.CORRECTS)
+             for e in edits]
+    return node.to_dict(), edges
+
+
+async def commit_time_nudge_correction(
+    queue: JobQueue,                       # Started job queue
+    graph_id: str,                         # Graph-storage capability id
+    source_id: str,                        # Source the nudged boundary belongs to
+    edits: List[Dict[str, Any]],           # 1-2 edge edits: {"segment_id", "edge", "old_time", "new_time"}
+    session_id: str,                       # Owning session id
+    boundary_words: Optional[Dict[str, Any]] = None,  # Words at the boundary (flywheel context)
+    step_s: Optional[float] = None,        # The press's signed step (seconds)
+    actor: str = "human",                  # Actor
+    journal_path: Optional[str] = None,    # Sidecar journal — append the op on success (None = unjournaled)
+) -> str:  # The new Correction node id
+    """Commit a time-nudge correction (node + CORRECTS per touched segment).
+
+    No review marker: a nudge is a boundary-time decision made mid-walk, not a
+    verdict on the segment's text — the walk's ✎/✓ bookkeeping stays with text
+    ops. The journal op carries the full payload (old/new per edge + boundary
+    words + step), the flywheel's training-pair record."""
+    node, edges = build_time_nudge_correction(
+        source_id, edits, session_id, boundary_words=boundary_words,
+        step_s=step_s, actor=actor)
+    await commit_nodes_edges(queue, graph_id, [node], edges)
+    if journal_path:
+        journal_correction_op(journal_path, "time-nudge", actor=actor,
+                              session_id=session_id,
+                              args={"source_id": source_id, "edits": [dict(e) for e in edits],
+                                    "boundary_words": dict(boundary_words or {}),
+                                    "step_s": step_s},
+                              anchor=await segment_anchor(
+                                  queue, graph_id,
+                                  [str(e["segment_id"]) for e in edits]),
+                              nodes=[node], edges=edges, op_id=node["id"])
+    return node["id"]
+
+
+def apply_time_nudges(
+    segments: List[SpineSegment],       # The (text-)projected effective spine
+    corrections: List[Dict[str, Any]],  # ACTIVE correction property dicts
+) -> List[SpineSegment]:  # Segments with nudged start/end times applied
+    """Apply timing corrections onto segment times (latest-wins per edge).
+
+    Time edits stay CORE-SIDE: the layer's SpineEdit vocabulary is text-scoped
+    (prune / replace_text / boundary_shift), and a second consumer has not yet
+    demanded a layer-level time op — so the wrapper composes this after the
+    text projection. Nudges apply in created_at order and each edge keeps the
+    LAST new_time (repeated presses chain; every press journals old/new, so
+    the training-pair record is the CHAIN, the projection only its endpoint).
+    Spine-scoped like text edits: edits anchored to another skeleton's ids are
+    dropped, not errors."""
+    nudges = [c for c in corrections
+              if c.get("correction_type") == "timing"
+              and (c.get("payload") or {}).get("operation") == "time_nudge"]
+    if not nudges:
+        return segments
+    known = {s.id for s in segments}
+    times: Dict[Tuple[str, str], float] = {}
+    for c in sorted(nudges, key=lambda c: float(c.get("created_at") or 0.0)):
+        for e in (c.get("payload") or {}).get("edits") or []:
+            sid, edge = e.get("segment_id"), e.get("edge")
+            if sid in known and edge in ("start", "end") and e.get("new_time") is not None:
+                times[(sid, edge)] = float(e["new_time"])
+    if not times:
+        return segments
+    out: List[SpineSegment] = []
+    for s in segments:
+        ns = times.get((s.id, "start"))
+        ne = times.get((s.id, "end"))
+        if ns is None and ne is None:
+            out.append(s)
+            continue
+        out.append(SpineSegment(
+            id=s.id, index=s.index, text=s.text,
+            start_time=ns if ns is not None else s.start_time,
+            end_time=ne if ne is not None else s.end_time,
+            source_locator=s.source_locator, content_hash=s.content_hash,
+            text_from=s.text_from, text_slices=s.text_slices))
+    return out

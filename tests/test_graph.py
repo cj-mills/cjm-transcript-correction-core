@@ -333,3 +333,46 @@ def test_projection_ignores_foreign_spine_corrections():
                         "new_text": "bar"}}]
     assert [s.text for s in project_effective_spine(spine, foreign + own)] \
         == ["hello world", "bar"]
+
+
+def test_time_nudge_build_and_projection():
+    """3f9948d6: a timing correction nudges segment boundary TIMES through the
+    effective projection — welded point cuts move both edges in ONE atomic
+    correction, repeated nudges chain latest-wins per edge, foreign-spine
+    edits drop, and layer-0 times stay untouched (non-destructive)."""
+    from cjm_transcript_correction_core.graph import (apply_time_nudges,
+                                                      build_time_nudge_correction,
+                                                      project_effective_spine)
+    node, edges = build_time_nudge_correction(
+        "src-1",
+        [{"segment_id": "a", "edge": "end", "old_time": 5.0, "new_time": 5.1},
+         {"segment_id": "b", "edge": "start", "old_time": 5.0, "new_time": 5.1}],
+        "sess-1", boundary_words={"left": "history", "right": "The"}, step_s=0.1)
+    assert node["label"] == "Correction"
+    assert node["properties"]["correction_type"] == "timing"
+    assert node["properties"]["payload"]["boundary_words"] == {"left": "history", "right": "The"}
+    assert {e["target_id"] for e in edges} == {"a", "b"}
+
+    segs = [SpineSegment(id="a", index=0, text="one", start_time=0.0, end_time=5.0),
+            SpineSegment(id="b", index=1, text="two", start_time=5.0, end_time=9.0)]
+
+    def nudge(created, edits):
+        return {"id": f"c{created}", "correction_type": "timing", "status": "applied",
+                "created_at": created,
+                "payload": {"operation": "time_nudge", "source_id": "src-1",
+                            "edits": edits}}
+
+    weld = nudge(1.0, [{"segment_id": "a", "edge": "end", "old_time": 5.0, "new_time": 5.1},
+                       {"segment_id": "b", "edge": "start", "old_time": 5.0, "new_time": 5.1}])
+    again = nudge(2.0, [{"segment_id": "a", "edge": "end", "old_time": 5.1, "new_time": 5.2},
+                        {"segment_id": "b", "edge": "start", "old_time": 5.1, "new_time": 5.2}])
+    foreign = nudge(3.0, [{"segment_id": "zz-other-spine", "edge": "end",
+                           "old_time": 1.0, "new_time": 2.0}])
+    out = apply_time_nudges(segs, [again, weld, foreign])   # order-independent input
+    assert (out[0].end_time, out[1].start_time) == (5.2, 5.2)   # latest-wins chain
+    assert out[0].start_time == 0.0 and out[1].end_time == 9.0  # untouched edges keep layer-0
+    assert segs[0].end_time == 5.0                              # non-destructive
+    # composes through the effective projection (text edits + nudges together)
+    projected = project_effective_spine(segs, [weld])
+    assert projected[0].end_time == 5.1 and projected[1].start_time == 5.1
+    assert projected[0].text == "one"
