@@ -195,3 +195,15 @@ RECOMMENDED_MARK_CLASSES = (
     "foreign-speech",          # non-English speech garbled into English (montage/quote cases; drive-minted 2026-07-19)
     "suspect",                 # free-note catch-all — flag now, judge later
 )
+
+# The RECOMMENDED insert-label slate (DEC 3d3fa2a8 + the C.1 drive) — the same
+# OPEN-vocabulary regime as mark classes: labels are DATA, not schema; this
+# tuple seeds the I-editor's numbered menu, and a new label typed mid-walk is a
+# journal entry, never a core release. "um" and friends land as TEXT (e-edit)
+# under hesitation-marker — label = phenomenon class, text = verbatim content.
+RECOMMENDED_INSERT_LABELS = (
+    "inhale",              # audible breath bookend (the isolation pattern's anchor case)
+    "hesitation-marker",   # um / uh / you-know slots the transcript dropped
+    "throat-clear",        # non-speech vocalization
+    "missed-speech",       # a chunk VAD never cut (the de994164 dispatch class)
+)

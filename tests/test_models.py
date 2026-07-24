@@ -58,3 +58,13 @@ def test_manifest_save_round_trip(tmp_path):
                            graph_db_path="/tmp/g.db", session_id="s1")
     out = m.save(tmp_path / "runs" / "m.json")
     assert json.loads(out.read_text())["run_id"] == "r"
+
+
+def test_recommended_insert_labels_slate():
+    """DEC 3d3fa2a8 + the C.1 drive: the insert-label slate is DATA (open
+    vocabulary, the RECOMMENDED_MARK_CLASSES regime) — every entry must be a
+    valid label (alnum-led — punctuation-led tokens are gesture-reserved)."""
+    from cjm_transcript_correction_core.models import RECOMMENDED_INSERT_LABELS
+    assert "inhale" in RECOMMENDED_INSERT_LABELS
+    assert all(c[:1].isalnum() for c in RECOMMENDED_INSERT_LABELS)
+    assert len(set(RECOMMENDED_INSERT_LABELS)) == len(RECOMMENDED_INSERT_LABELS)
