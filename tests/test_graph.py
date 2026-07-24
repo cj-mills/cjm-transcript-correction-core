@@ -449,5 +449,17 @@ def test_chunk_insert_build_and_projection():
                             "start_time": 5.0, "end_time": 5.5, "text": ""}}
     assert [s.id for s in apply_chunk_inserts(segs, [fallback])] == ["a", "f2", "b"]
 
+    # several inserts STACK in one gap (inhale · um · inhale): shared layer-0
+    # anchor, ordered by (start_time, created_at) — the C.1 drive find
+    i1 = {"id": "g1", "correction_type": "insertion", "created_at": 1.0,
+          "payload": {"operation": "chunk_insert", "source_id": "src-1",
+                      "after_segment_id": "a", "before_segment_id": "b",
+                      "start_time": 4.5, "end_time": 4.8, "text": "", "label": "inhale"}}
+    i2 = {"id": "g2", "correction_type": "insertion", "created_at": 2.0,
+          "payload": {"operation": "chunk_insert", "source_id": "src-1",
+                      "after_segment_id": "a", "before_segment_id": "b",
+                      "start_time": 4.8, "end_time": 4.8, "text": "", "label": "um"}}
+    assert [s.id for s in apply_chunk_inserts(segs, [i2, i1])] == ["a", "g1", "g2", "b"]
+
     # removal = reject-as-supersede: the ordinary active filter excludes it
     assert active_corrections([zwp], {zw["id"]}) == []
