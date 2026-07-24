@@ -376,3 +376,78 @@ def test_time_nudge_build_and_projection():
     projected = project_effective_spine(segs, [weld])
     assert projected[0].end_time == 5.1 and projected[1].start_time == 5.1
     assert projected[0].text == "one"
+
+
+def test_chunk_insert_build_and_projection():
+    """DEC 3d3fa2a8: an insertion Correction synthesizes a chunk the skeleton
+    never cut — overlay-projected (synthetic id = the Correction's node id),
+    placed after its left flank, text latest-wins across the payload and
+    replace_text corrections targeting the synthetic id, nudges compose after
+    insertion (zero-width inserts grow by their edges), and supersession
+    removes it through the ordinary active filter."""
+    from cjm_transcript_correction_core.graph import (apply_chunk_inserts,
+                                                      build_chunk_insert_correction)
+    node, edges = build_chunk_insert_correction(
+        "src-1", "a", 4.5, 6.0, "sess-1", before_segment_id="b", label="inhale")
+    assert node["label"] == "Correction"
+    p = node["properties"]["payload"]
+    assert node["properties"]["correction_type"] == "insertion"
+    assert p["operation"] == "chunk_insert" and p["label"] == "inhale"
+    assert p["after_segment_id"] == "a" and p["before_segment_id"] == "b"
+    assert p["text"] == ""                       # born empty
+    assert [(e["relation_type"], e["target_id"]) for e in edges] == [
+        ("CORRECTS", "a"), ("CORRECTS", "b")]
+    try:
+        build_chunk_insert_correction("src-1", "a", 6.0, 4.5, "sess-1")
+        assert False, "negative span must raise"
+    except ValueError:
+        pass
+
+    segs = [SpineSegment(id="a", index=0, text="one", start_time=0.0, end_time=4.5),
+            SpineSegment(id="b", index=1, text="two", start_time=6.0, end_time=9.0)]
+    ins = dict(node["properties"])
+    ins["id"] = node["id"]
+    eff = project_effective_spine(segs, [ins])
+    assert [s.id for s in eff] == ["a", node["id"], "b"]
+    assert eff[1].text == "" and (eff[1].start_time, eff[1].end_time) == (4.5, 6.0)
+    assert eff[1].index == 0                     # layer-0 coordinate of the left flank
+
+    # missed speech arrives by e-edit: replace_text targets the SYNTHETIC id
+    # (invisible to the layer projection — applied at the insert stage)
+    txt = {"id": "t1", "correction_type": "text_content", "created_at": 2.0,
+           "payload": {"operation": "replace_text", "segment_id": node["id"],
+                       "new_text": "dispatch audio"}}
+    assert project_effective_spine(segs, [ins, txt])[1].text == "dispatch audio"
+
+    # nudges compose AFTER insertion: a zero-width insert grows by its edges
+    zw, _ = build_chunk_insert_correction("src-1", "a", 4.5, 4.5, "sess-1")
+    zwp = dict(zw["properties"])
+    zwp["id"] = zw["id"]
+    grow = {"id": "n1", "correction_type": "timing", "created_at": 3.0,
+            "payload": {"operation": "time_nudge", "source_id": "src-1",
+                        "edits": [{"segment_id": zw["id"], "edge": "end",
+                                   "old_time": 4.5, "new_time": 4.62}]}}
+    out = project_effective_spine(segs, [zwp, grow])
+    assert (out[1].start_time, out[1].end_time) == (4.5, 4.62)
+
+    # a proposed insertion never enters the effective view (awaiting a verdict)
+    prop = dict(zwp)
+    prop["status"] = "proposed"
+    assert [s.id for s in apply_chunk_inserts(segs, [prop])] == ["a", "b"]
+
+    # foreign-spine inserts drop, not error (the f1024568 spine-scoping rule)
+    foreign = {"id": "f1", "correction_type": "insertion",
+               "payload": {"operation": "chunk_insert", "source_id": "src-1",
+                           "after_segment_id": "zz", "before_segment_id": "zz2",
+                           "start_time": 1.0, "end_time": 2.0, "text": ""}}
+    assert [s.id for s in apply_chunk_inserts(segs, [foreign])] == ["a", "b"]
+
+    # a vanished left flank (pruned away downstream) falls back to the right flank
+    fallback = {"id": "f2", "correction_type": "insertion",
+                "payload": {"operation": "chunk_insert", "source_id": "src-1",
+                            "after_segment_id": "gone", "before_segment_id": "b",
+                            "start_time": 5.0, "end_time": 5.5, "text": ""}}
+    assert [s.id for s in apply_chunk_inserts(segs, [fallback])] == ["a", "f2", "b"]
+
+    # removal = reject-as-supersede: the ordinary active filter excludes it
+    assert active_corrections([zwp], {zw["id"]}) == []

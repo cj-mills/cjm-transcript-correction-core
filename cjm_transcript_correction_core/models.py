@@ -36,7 +36,7 @@ class Correction:
     generic GraphNode. Corrections are DECISIONS (asserted events) — they keep
     GENERATED ids, the FLIP-TRIGGER-protected class.
     """
-    correction_type: str                                   # "text_content" | "punctuation" | "grouping" | "review" | "mark" | "timing"
+    correction_type: str                                   # "text_content" | "punctuation" | "grouping" | "review" | "mark" | "timing" | "insertion"
     status: str = "applied"                                # "proposed" | "applied" | "superseded"
     session_id: str = ""                                   # Owning CorrectionSession id
     payload: Dict[str, Any] = field(default_factory=dict)  # Type-specific data (new text, prune set, ...)

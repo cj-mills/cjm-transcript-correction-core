@@ -267,7 +267,7 @@ def _edge(
 
 
 def build_correction_node(
-    correction_type: str,                  # "text_content" | "punctuation" | "grouping" | "review" | "mark"
+    correction_type: str,                  # "text_content" | "punctuation" | "grouping" | "review" | "mark" | "timing" | "insertion"
     session_id: str,                       # Owning session id
     payload: Dict[str, Any],               # Type-specific payload
     actor: str = "human",                  # Actor
@@ -538,9 +538,11 @@ def project_effective_spine(
                              source_locator=s.source_locator, content_hash=s.content_hash,
                              text_from=s.text_from, text_slices=s.text_slices)
         out.append(s)
-    # Timing corrections compose AFTER the text projection (core-side — the
-    # layer's edit vocabulary stays text-scoped until a second consumer).
-    return apply_time_nudges(out, corrections)
+    # Structural + timing corrections compose AFTER the text projection
+    # (core-side — the layer's edit vocabulary stays text-scoped): chunk
+    # inserts synthesize first, so time nudges can grow a synthetic chunk's
+    # edges (the zero-width insert+nudge isolation pattern, DEC 3d3fa2a8).
+    return apply_time_nudges(apply_chunk_inserts(out, corrections), corrections)
 
 
 def build_text_correction(
@@ -1255,4 +1257,192 @@ def apply_time_nudges(
             end_time=ne if ne is not None else s.end_time,
             source_locator=s.source_locator, content_hash=s.content_hash,
             text_from=s.text_from, text_slices=s.text_slices))
+    return out
+
+
+def build_chunk_insert_correction(
+    source_id: str,                       # Source the inserted chunk belongs to
+    after_segment_id: str,                # Layer-0 Segment the insertion follows (placement anchor)
+    start_time: float,                    # Inserted span start (source-coordinate seconds)
+    end_time: float,                      # Inserted span end (== start_time = zero-width, grown by nudges)
+    session_id: str,                      # Owning session id
+    before_segment_id: Optional[str] = None,  # Layer-0 Segment right of the gap (None at spine tail)
+    label: Optional[str] = None,          # Optional annotation class (open mark-class vocabulary)
+    text: str = "",                       # Born-empty text (missed speech arrives by e-edit)
+    actor: str = "human",                 # Actor
+    rationale: Optional[str] = None,      # Optional note
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (correction node dict, edge dicts)
+    """Build an insertion Correction that adds a chunk the skeleton never cut (DEC 3d3fa2a8).
+
+    OVERLAY-PROJECTED: layer-0 stays a pure function of config over audio — the
+    chunk exists only as this Correction, synthesized into the effective spine
+    by apply_chunk_inserts, so re-decomposition never collides with it. The
+    Correction's OWN NODE ID doubles as the synthetic segment's id (the 1:1
+    mapping): later corrections that target the inserted chunk (time nudges
+    growing a zero-width insert, replace_text carrying missed speech) anchor
+    THIS node — real edges to a real node. Born empty with an optional
+    annotation label (inhale/um/throat-clear — the isolation pattern wants
+    labels, not transcripts); undo = supersession (commit_chunk_insert_removal).
+    CORRECTS edges anchor the flanking layer-0 segments.
+    """
+    if not after_segment_id:
+        raise ValueError("chunk insert needs after_segment_id (the gap follows a segment)")
+    if float(end_time) < float(start_time):
+        raise ValueError(f"chunk insert span is negative ({start_time}..{end_time})")
+    payload = {"operation": "chunk_insert", "source_id": source_id,
+               "after_segment_id": after_segment_id,
+               "before_segment_id": before_segment_id,
+               "start_time": float(start_time), "end_time": float(end_time),
+               "text": text}
+    if label:
+        payload["label"] = str(label)
+    node = build_correction_node("insertion", session_id, payload, actor=actor,
+                                 rationale=rationale).to_graph_node()
+    edges = [make_edge(node.id, after_segment_id, CorrectionRelations.CORRECTS)]
+    if before_segment_id:
+        edges.append(make_edge(node.id, before_segment_id, CorrectionRelations.CORRECTS))
+    return node.to_dict(), edges
+
+
+async def commit_chunk_insert_correction(
+    queue: JobQueue,                      # Started job queue
+    graph_id: str,                        # Graph-storage capability id
+    source_id: str,                       # Source the inserted chunk belongs to
+    after_segment_id: str,                # Segment the insertion follows
+    start_time: float,                    # Span start (source seconds)
+    end_time: float,                      # Span end (== start = zero-width)
+    session_id: str,                      # Owning session id
+    before_segment_id: Optional[str] = None,  # Right flank (None at spine tail)
+    label: Optional[str] = None,          # Optional annotation class
+    actor: str = "human",                 # Actor
+    journal_path: Optional[str] = None,   # Sidecar journal — append the op on success (None = unjournaled)
+) -> str:  # The new insertion Correction node id (= the synthetic segment id)
+    """Commit a chunk insertion (node + CORRECTS per flank).
+
+    No review marker: the inserted chunk is born UNREVIEWED — judging its audio
+    (and typing its text) is exactly the work that follows the insert. The
+    journal op anchors the flanking layer-0 segments: run-independent
+    coordinates for the gap the human filled — with the label, the flywheel's
+    labeled-VAD-gold record (a span the skeleton missed, classified by ear).
+    """
+    node, edges = build_chunk_insert_correction(
+        source_id, after_segment_id, start_time, end_time, session_id,
+        before_segment_id=before_segment_id, label=label, actor=actor)
+    await commit_nodes_edges(queue, graph_id, [node], edges)
+    if journal_path:
+        journal_correction_op(journal_path, "chunk-insert", actor=actor,
+                              session_id=session_id,
+                              args={"source_id": source_id,
+                                    "after_segment_id": after_segment_id,
+                                    "before_segment_id": before_segment_id,
+                                    "start_time": float(start_time),
+                                    "end_time": float(end_time), "label": label},
+                              anchor=await segment_anchor(
+                                  queue, graph_id,
+                                  [sid for sid in (after_segment_id, before_segment_id) if sid]),
+                              nodes=[node], edges=edges, op_id=node["id"])
+    return node["id"]
+
+
+async def commit_chunk_insert_removal(
+    queue: JobQueue,                     # Started job queue
+    graph_id: str,                       # Graph-storage capability id
+    source_id: str,                      # Source the insertion belongs to
+    insert_id: str,                      # The chunk_insert Correction being removed
+    session_id: str,                     # Owning session id
+    actor: str = "human",                # Actor
+    note: Optional[str] = None,          # Optional note (why removed)
+    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+) -> str:  # The review node id that superseded the insertion
+    """Remove an inserted chunk WITHOUT touching layer-0 (reject-as-supersede).
+
+    Rides the review verdict shape (build_reject_review), like mark dismissal:
+    a SUPERSEDES edge from a small review node excludes the insertion from the
+    active set, and the synthetic segment leaves the effective view. Later
+    corrections anchored to the synthetic id (nudges, text) become foreign-id
+    edits — dropped by the spine-scoped projection, never errors. No anchor on
+    the journal op: removal is a verdict on an overlay node, not a layer-0
+    touch (the ccbab9f5 anchor scope).
+    """
+    node, edges = build_reject_review(source_id, insert_id, session_id,
+                                      actor=actor, rationale=note)
+    await commit_nodes_edges(queue, graph_id, [node], edges)
+    if journal_path:
+        journal_correction_op(journal_path, "chunk-insert-remove", actor=actor,
+                              session_id=session_id,
+                              args={"source_id": source_id, "insert_id": insert_id,
+                                    "note": note},
+                              nodes=[node], edges=edges, op_id=node["id"])
+    return node["id"]
+
+
+def apply_chunk_inserts(
+    segments: List[SpineSegment],       # The (text-)projected effective spine
+    corrections: List[Dict[str, Any]],  # ACTIVE correction property dicts
+) -> List[SpineSegment]:  # Spine with synthetic inserted segments spliced in
+    """Synthesize inserted chunks into the effective spine (DEC 3d3fa2a8).
+
+    Insertion stays CORE-SIDE like time nudges — the layer's edit vocabulary is
+    text-scoped and never sees synthetic ids. Each active chunk_insert becomes
+    a SpineSegment whose id IS the Correction's node id (the 1:1 mapping),
+    spliced after its after_segment_id anchor; when the left flank vanished
+    from this projection (a pruned empty chunk), the before_segment_id flank
+    places it instead. Several inserts in one gap order by (start_time,
+    created_at). Text is latest-wins across the insert payload and any
+    replace_text corrections targeting the synthetic id — the e-edit lane,
+    invisible to the layer projection, which only knows layer-0 ids. Synthetic
+    index = the flank's index: indexes are LAYER-0 coordinates and stay honest;
+    the walk distinguishes inserts by id, not index. Spine-scoped: inserts
+    anchored to another skeleton's ids drop, not error. Composes BEFORE
+    apply_time_nudges so nudges can grow a zero-width insert's edges.
+    """
+    inserts = [c for c in corrections
+               if c.get("correction_type") == "insertion"
+               and c.get("status") not in ("superseded", "proposed")
+               and (c.get("payload") or {}).get("operation") == "chunk_insert"]
+    if not inserts:
+        return segments
+    insert_ids = {c["id"] for c in inserts}
+    texts: Dict[str, Tuple[float, str]] = {}
+    for c in corrections:
+        p = c.get("payload") or {}
+        if c.get("correction_type") == "text_content" \
+                and p.get("operation") == "replace_text" \
+                and p.get("segment_id") in insert_ids:
+            created = float(c.get("created_at") or 0.0)
+            prev = texts.get(p["segment_id"])
+            if prev is None or created > prev[0]:
+                texts[p["segment_id"]] = (created, p.get("new_text", ""))
+    known = {s.id for s in segments}
+    after_groups: Dict[str, List[Dict[str, Any]]] = {}
+    before_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for c in inserts:
+        p = c.get("payload") or {}
+        if p.get("after_segment_id") in known:
+            after_groups.setdefault(p["after_segment_id"], []).append(c)
+        elif p.get("before_segment_id") in known:
+            before_groups.setdefault(p["before_segment_id"], []).append(c)
+    if not after_groups and not before_groups:
+        return segments
+
+    def _key(c: Dict[str, Any]) -> Tuple[float, float]:
+        p = c.get("payload") or {}
+        return (float(p.get("start_time") or 0.0), float(c.get("created_at") or 0.0))
+
+    def _synth(c: Dict[str, Any], index: int) -> SpineSegment:
+        p = c.get("payload") or {}
+        override = texts.get(c["id"])
+        return SpineSegment(
+            id=c["id"], index=index,
+            text=override[1] if override else str(p.get("text") or ""),
+            start_time=float(p["start_time"]) if p.get("start_time") is not None else None,
+            end_time=float(p["end_time"]) if p.get("end_time") is not None else None)
+
+    out: List[SpineSegment] = []
+    for s in segments:
+        for c in sorted(before_groups.get(s.id, ()), key=_key):
+            out.append(_synth(c, s.index))
+        out.append(s)
+        for c in sorted(after_groups.get(s.id, ()), key=_key):
+            out.append(_synth(c, s.index))
     return out

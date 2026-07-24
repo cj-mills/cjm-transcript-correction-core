@@ -31,10 +31,13 @@ def test_journal_correction_op_envelope(tmp_path):
                                  args={"direction": "pull"}, nodes=[node], edges=[edge],
                                  anchor=anchor, op_id="corr-1")
     assert len(read_journal(j)) == 2
-    # every registered replay verb has a handler
+    # every journaled verb has a replay handler (replay_journal raises LOUDLY on
+    # unregistered verbs — time-nudge shipped without one and would have crashed
+    # any rebuild over a journal holding nudge ops; caught 2026-07-24)
     assert set(correction_replay_handlers()) == {"session-start", "boundary-shift", "text-correction",
                                                  "prune-amendment", "mark", "mark-dismiss",
-                                                 "review-markers", "session-status"}
+                                                 "review-markers", "session-status", "time-nudge",
+                                                 "chunk-insert", "chunk-insert-remove"}
 
 
 def test_replay_handlers_cover_mark_verbs():

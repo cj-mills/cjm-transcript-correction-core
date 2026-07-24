@@ -94,7 +94,8 @@ def correction_replay_handlers() -> Dict[str, Any]:  # verb -> async handler(que
                          properties={"status": a["status"], "updated_at": a["updated_at"]})
 
     handlers = wires_handlers("session-start", "boundary-shift", "text-correction",
-                              "prune-amendment", "mark", "mark-dismiss", "review-markers")
+                              "prune-amendment", "mark", "mark-dismiss", "review-markers",
+                              "time-nudge", "chunk-insert", "chunk-insert-remove")
     handlers["session-status"] = _apply_session_status
     return handlers
 
