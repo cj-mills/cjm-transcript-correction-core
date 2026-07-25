@@ -328,9 +328,10 @@ async def start_session(
     graph_id: str,     # Graph-storage capability id
     scope: List[str],  # Source node ids in scope
     journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    purpose: Optional[str] = None,  # None = genuine pass; "feature-test" = excludable from flywheel datasets (DEC c86714a4)
 ) -> CorrectionSession:  # The committed CorrectionSession
     """Create + commit a new CorrectionSession node."""
-    sess = CorrectionSession(scope=scope)
+    sess = CorrectionSession(scope=scope, purpose=purpose)
     node = sess.to_graph_node().to_dict()
     await commit_nodes_edges(queue, graph_id, [node], [])
     if journal_path:
@@ -1446,3 +1447,27 @@ def apply_chunk_inserts(
         for c in sorted(after_groups.get(s.id, ()), key=_key):
             out.append(_synth(c, s.index))
     return out
+
+
+async def set_session_purpose(
+    queue: JobQueue,  # Started job queue
+    graph_id: str,    # Graph-storage capability id
+    session_id: str,  # CorrectionSession node id
+    purpose: Optional[str],  # None = genuine pass; "feature-test" = excludable from flywheel datasets (open vocabulary)
+    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+) -> None:
+    """Update a session's purpose + updated_at (the test-session hygiene tag, DEC c86714a4).
+
+    Same overlay-metadata exception as set_session_status: a CorrectionSession's
+    lifecycle is mutable, so this replays via update_node (last-wins in append
+    order), not wires. Doubles as the BACKFILL lane for sessions minted before
+    the tag existed (the C.0/C.1 feature-test passes)."""
+    ts = time.time()
+    await graph_task(queue, graph_id, "update_node", node_id=session_id,
+                     properties={"purpose": purpose, "updated_at": ts})
+    if journal_path:
+        journal_correction_op(journal_path, "session-purpose", actor="human",
+                              session_id=session_id,
+                              args={"session_id": session_id, "purpose": purpose,
+                                    "updated_at": ts},
+                              nodes=[], edges=[])

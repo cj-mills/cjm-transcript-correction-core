@@ -93,10 +93,16 @@ def correction_replay_handlers() -> Dict[str, Any]:  # verb -> async handler(que
         await graph_task(queue, graph_id, "update_node", node_id=a["session_id"],
                          properties={"status": a["status"], "updated_at": a["updated_at"]})
 
+    async def _apply_session_purpose(queue: Any, graph_id: str, op: Dict[str, Any]) -> None:
+        a = op["args"]
+        await graph_task(queue, graph_id, "update_node", node_id=a["session_id"],
+                         properties={"purpose": a["purpose"], "updated_at": a["updated_at"]})
+
     handlers = wires_handlers("session-start", "boundary-shift", "text-correction",
                               "prune-amendment", "mark", "mark-dismiss", "review-markers",
                               "time-nudge", "chunk-insert", "chunk-insert-remove")
     handlers["session-status"] = _apply_session_status
+    handlers["session-purpose"] = _apply_session_purpose
     return handlers
 
 

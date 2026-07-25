@@ -36,8 +36,8 @@ def test_journal_correction_op_envelope(tmp_path):
     # any rebuild over a journal holding nudge ops; caught 2026-07-24)
     assert set(correction_replay_handlers()) == {"session-start", "boundary-shift", "text-correction",
                                                  "prune-amendment", "mark", "mark-dismiss",
-                                                 "review-markers", "session-status", "time-nudge",
-                                                 "chunk-insert", "chunk-insert-remove"}
+                                                 "review-markers", "session-status", "session-purpose",
+                                                 "time-nudge", "chunk-insert", "chunk-insert-remove"}
 
 
 def test_replay_handlers_cover_mark_verbs():

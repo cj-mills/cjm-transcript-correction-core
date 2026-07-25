@@ -27,6 +27,10 @@ def test_correction_session_node():
     sess = CorrectionSession(scope=["src1"])
     assert sess.to_graph_node().label == "CorrectionSession"
     assert sess.to_graph_node().properties["status"] == "in_progress"
+    # purpose=None (genuine pass) stays OFF the node — absence is the genuine marker
+    assert "purpose" not in sess.to_graph_node().properties
+    tagged = CorrectionSession(scope=["src1"], purpose="feature-test")
+    assert tagged.to_graph_node().properties["purpose"] == "feature-test"
 
 
 def test_spine_segment_and_worklist_item():

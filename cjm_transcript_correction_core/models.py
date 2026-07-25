@@ -56,6 +56,7 @@ class Correction:
 class CorrectionSession:
     """A resumable, reopen-able correction review over one or more sources."""
     status: str = "in_progress"                            # "in_progress" | "completed" | "reopened"
+    purpose: Optional[str] = None                          # None = genuine pass; "feature-test" = structurally excludable from flywheel datasets (open vocabulary, DEC c86714a4)
     scope: List[str] = field(default_factory=list)         # Source node ids in scope
     started_at: float = field(default_factory=time.time)   # Unix timestamp at session start
     updated_at: float = field(default_factory=time.time)   # Unix timestamp of last activity
