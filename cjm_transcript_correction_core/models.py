@@ -18,6 +18,7 @@ class CorrectionRelations:
     SUPERSEDES = "SUPERSEDES"      # Correction -> the prior Correction it replaces (undo/update chain)
     DERIVED_FROM = "DERIVED_FROM"  # grouping Correction -> the layer-0 Segments it regroups/prunes
     REVIEWED = "REVIEWED"          # CorrectionSession -> Segment (carries a `decision` property)
+    ASSIGNS = "ASSIGNS"            # speaker Correction -> the Entity it assigns (DEC d6df3a8e)
 
     @classmethod
     def all(cls) -> list:  # All relation type strings
@@ -36,7 +37,7 @@ class Correction:
     generic GraphNode. Corrections are DECISIONS (asserted events) — they keep
     GENERATED ids, the FLIP-TRIGGER-protected class.
     """
-    correction_type: str                                   # "text_content" | "punctuation" | "grouping" | "review" | "mark" | "timing" | "insertion"
+    correction_type: str                                   # "text_content" | "punctuation" | "grouping" | "review" | "mark" | "timing" | "insertion" | "speaker"
     status: str = "applied"                                # "proposed" | "applied" | "superseded"
     session_id: str = ""                                   # Owning CorrectionSession id
     payload: Dict[str, Any] = field(default_factory=dict)  # Type-specific data (new text, prune set, ...)
@@ -194,6 +195,10 @@ RECOMMENDED_MARK_CLASSES = (
     "orthographic-drift",      # decoder-state capitalization/orthography decay
     "granularity-mismatch",    # VAD split lands mid-word/mid-token
     "foreign-speech",          # non-English speech garbled into English (montage/quote cases; drive-minted 2026-07-19)
+    "speaker-merge",           # two speakers fused into one sentence by punctuation (a9cadfec)
+    "voiced-quote",            # speaker performing another voice — quote/character (DEC 44afb2df)
+    "persona-shift",           # deviation from the source's persona default (DEC 44afb2df)
+    "speaker-unresolved",      # cannot individuate the voice — layered audio (DEC 484e2d74)
     "suspect",                 # free-note catch-all — flag now, judge later
 )
 
@@ -208,3 +213,30 @@ RECOMMENDED_INSERT_LABELS = (
     "throat-clear",        # non-speech vocalization
     "missed-speech",       # a chunk VAD never cut (the de994164 dispatch class)
 )
+
+
+@dataclass
+class Entity:
+    """A source-spanning identity in the shared entity substrate (DEC 4ec6a49c).
+
+    Minted by the speaker-assignment lane (physical speakers — DEC 44afb2df) and
+    shared with the proper-noun correction lexicon: the same person as SPEAKER
+    and as corrected proper noun in text resolves to ONE node, so assignment
+    pre-populates the layer the pass-2 assist tier queries. `provisional=True`
+    records a DESCRIPTIVE handle ("HH montage narrator"), not an identification
+    (DEC 484e2d74: individuation and identification are separate acts) —
+    identifying later is a RENAME on this stable id, propagating corpus-wide.
+    Minted-once identities with GENERATED ids, referenced by every assignment.
+    """
+    canonical_name: str                                    # Display name, or a descriptive handle when provisional
+    kind: str = "person"                                   # Entity kind (speakers are persons; the lexicon adds more)
+    provisional: bool = False                              # True = handle is a description, NOT an identification
+    variants: List[str] = field(default_factory=list)      # Observed surface forms (the lexicon convergence)
+    actor: str = "human"                                   # Who minted it
+    created_at: float = field(default_factory=time.time)   # Unix timestamp
+    id: str = field(default_factory=lambda: str(uuid4()))  # Generated node id (the stable identity handle)
+
+    def to_graph_node(self) -> GraphNode:  # Generic graph node
+        """Map onto a generic GraphNode (None-valued fields excluded from properties)."""
+        props = {k: v for k, v in asdict(self).items() if k != "id" and v is not None}
+        return GraphNode(id=self.id, label="Entity", properties=props, sources=[])

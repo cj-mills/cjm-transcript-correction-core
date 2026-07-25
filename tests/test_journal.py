@@ -37,7 +37,8 @@ def test_journal_correction_op_envelope(tmp_path):
     assert set(correction_replay_handlers()) == {"session-start", "boundary-shift", "text-correction",
                                                  "prune-amendment", "mark", "mark-dismiss",
                                                  "review-markers", "session-status", "session-purpose",
-                                                 "time-nudge", "chunk-insert", "chunk-insert-remove"}
+                                                 "time-nudge", "chunk-insert", "chunk-insert-remove",
+                                                 "speaker-entity", "speaker-assign", "entity-rename"}
 
 
 def test_replay_handlers_cover_mark_verbs():

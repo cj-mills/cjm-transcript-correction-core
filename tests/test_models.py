@@ -44,7 +44,7 @@ def test_spine_segment_and_worklist_item():
 
 
 def test_correction_relations_registry():
-    assert set(CorrectionRelations.all()) == {"CORRECTS", "SUPERSEDES", "DERIVED_FROM", "REVIEWED"}
+    assert set(CorrectionRelations.all()) == {"CORRECTS", "SUPERSEDES", "DERIVED_FROM", "REVIEWED", "ASSIGNS"}
 
 
 def test_manifest_shape_and_run_id():
@@ -72,3 +72,20 @@ def test_recommended_insert_labels_slate():
     assert "inhale" in RECOMMENDED_INSERT_LABELS
     assert all(c[:1].isalnum() for c in RECOMMENDED_INSERT_LABELS)
     assert len(set(RECOMMENDED_INSERT_LABELS)) == len(RECOMMENDED_INSERT_LABELS)
+
+
+def test_entity_and_speaker_vocabulary():
+    """DEC 4ec6a49c + 484e2d74: Entity = stable identity handle (provisional =
+    description, not identification); ASSIGNS joins the relation registry; the
+    speaker mark classes seed the slate (44afb2df deviation marks)."""
+    from cjm_transcript_correction_core.models import (Entity, CorrectionRelations,
+                                                       RECOMMENDED_MARK_CLASSES)
+    e = Entity(canonical_name="HH montage narrator", provisional=True)
+    n = e.to_graph_node()
+    assert n.label == "Entity" and n.id == e.id
+    assert n.properties["provisional"] is True and n.properties["kind"] == "person"
+    assert n.properties["canonical_name"] == "HH montage narrator"
+    assert "id" not in n.properties
+    assert "ASSIGNS" in CorrectionRelations.all()
+    for mc in ("speaker-merge", "voiced-quote", "persona-shift", "speaker-unresolved"):
+        assert mc in RECOMMENDED_MARK_CLASSES

@@ -463,3 +463,51 @@ def test_chunk_insert_build_and_projection():
 
     # removal = reject-as-supersede: the ordinary active filter excludes it
     assert active_corrections([zwp], {zw["id"]}) == []
+
+
+def test_speaker_assign_build_and_active_projection():
+    """DEC d6df3a8e: the assignment op envelope — verdict vocabulary enforced,
+    entity binding via ASSIGNS + canonical_form, reassignment supersedes, and
+    the active projection is latest-wins per segment (apply_time_nudges regime)."""
+    import pytest
+    from cjm_transcript_correction_core.graph import (active_speaker_assignments,
+                                                      build_speaker_assign_correction)
+    node, edges = build_speaker_assign_correction(
+        "src-1", ["seg-a", "seg-b"], "ent-1", "sess-1", verdict="accept",
+        proposal={"turn_start": 1.0, "turn_end": 9.5, "cluster": "SPK_00",
+                  "confidence": 0.91})
+    p = node["properties"]
+    assert p["correction_type"] == "speaker" and p["canonical_form"] == "ent-1"
+    assert p["payload"]["verdict"] == "accept"
+    assert p["payload"]["proposal"]["cluster"] == "SPK_00"
+    rels = [(e["relation_type"], e["target_id"]) for e in edges]
+    assert ("CORRECTS", "seg-a") in rels and ("CORRECTS", "seg-b") in rels
+    assert ("ASSIGNS", "ent-1") in rels
+    # reassignment supersedes; unknown verdicts and empty spans refuse
+    node2, edges2 = build_speaker_assign_correction(
+        "src-1", ["seg-a"], "ent-2", "sess-1", verdict="name",
+        supersedes_id=node["id"])
+    assert ("SUPERSEDES", node["id"]) in [(e["relation_type"], e["target_id"])
+                                          for e in edges2]
+    assert "proposal" not in node2["properties"]["payload"]  # unassisted walk
+    with pytest.raises(ValueError):
+        build_speaker_assign_correction("src-1", ["seg-a"], "ent-1", "sess-1",
+                                        verdict="narrator")
+    with pytest.raises(ValueError):
+        build_speaker_assign_correction("src-1", [], "ent-1", "sess-1")
+    with pytest.raises(ValueError):
+        build_speaker_assign_correction("src-1", ["seg-a"], "", "sess-1")
+    # active projection: latest-wins per segment, superseded excluded
+    def corr(cid, created, seg_ids, ent, verdict="name"):
+        return {"id": cid, "correction_type": "speaker", "created_at": created,
+                "payload": {"operation": "speaker_assign", "source_id": "src-1",
+                            "segment_ids": seg_ids, "entity_id": ent,
+                            "verdict": verdict}}
+    a = corr("c1", 1.0, ["seg-a", "seg-b"], "ent-1")
+    b = corr("c2", 2.0, ["seg-b"], "ent-2", verdict="cluster-merge")
+    dead = corr("c0", 3.0, ["seg-a"], "ent-9")
+    act = active_speaker_assignments([b, a, dead], superseded_ids={"c0"})
+    assert act["seg-a"]["entity_id"] == "ent-1"
+    assert act["seg-b"]["entity_id"] == "ent-2"
+    assert act["seg-b"]["verdict"] == "cluster-merge"
+    assert act["seg-b"]["correction_id"] == "c2"

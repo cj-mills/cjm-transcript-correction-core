@@ -16,7 +16,7 @@ from cjm_context_graph_primitives.query import (EdgeQuery, EdgeQueryResult, Node
 from cjm_substrate.core.queue import JobQueue, JobStatus
 from cjm_transcript_correction_core.journal import journal_correction_op, segment_anchor
 from cjm_transcript_correction_core.models import (Correction, CorrectionRelations,
-                                                   CorrectionSession, SpineSegment)
+                                                   CorrectionSession, Entity, SpineSegment)
 from cjm_transcript_graph_schema.schema import TranscriptGraphLabels
 
 # Stage 4: the typed query surface — importing the result classes IS the
@@ -1471,3 +1471,197 @@ async def set_session_purpose(
                               args={"session_id": session_id, "purpose": purpose,
                                     "updated_at": ts},
                               nodes=[], edges=[])
+
+
+async def commit_speaker_entity(
+    queue: JobQueue,                     # Started job queue
+    graph_id: str,                       # Graph-storage capability id
+    canonical_name: str,                 # Display name, or descriptive handle when provisional
+    session_id: str,                     # Session the mint happened in (journal set identity)
+    provisional: bool = False,           # True = descriptive handle, not an identification (DEC 484e2d74)
+    kind: str = "person",                # Entity kind
+    actor: str = "human",                # Actor
+    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+) -> str:  # The new Entity node id
+    """Mint a source-spanning Entity into the shared registry (DEC 4ec6a49c).
+
+    Entities are minted ONCE and referenced by every assignment; distinct-but-
+    unidentified voices mint PROVISIONAL entities under descriptive handles —
+    the stable id is the identity, the name a mutable property (DEC 484e2d74).
+    No segment anchor: the registry is source-spanning, not segment-anchored."""
+    name = (canonical_name or "").strip()
+    if not name:
+        raise ValueError("canonical_name must be a non-empty string")
+    node = Entity(canonical_name=name, kind=kind, provisional=provisional,
+                  actor=actor).to_graph_node().to_dict()
+    await commit_nodes_edges(queue, graph_id, [node], [])
+    if journal_path:
+        journal_correction_op(journal_path, "speaker-entity", actor=actor,
+                              session_id=session_id,
+                              args={"canonical_name": name, "kind": kind,
+                                    "provisional": provisional},
+                              nodes=[node], edges=[], op_id=node["id"])
+    return node["id"]
+
+
+async def rename_speaker_entity(
+    queue: JobQueue,                     # Started job queue
+    graph_id: str,                       # Graph-storage capability id
+    entity_id: str,                      # The stable Entity id (the identity handle)
+    canonical_name: str,                 # The new name (an identification, or a better handle)
+    session_id: str,                     # Session the rename happened in (journal set identity)
+    provisional: Optional[bool] = None,  # New provisional flag; None = unchanged (identifying passes False)
+    actor: str = "human",                # Actor
+    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+) -> None:
+    """Rename an Entity on its STABLE id — identification IS a rename (DEC 484e2d74).
+
+    Every assignment references the id, so one write propagates corpus-wide
+    (the HH montage narrator identified once fixes every episode); flipping
+    `provisional` to False records that a description became an identification.
+    An update op like session-status: replayed last-wins in append order."""
+    name = (canonical_name or "").strip()
+    if not name:
+        raise ValueError("canonical_name must be a non-empty string")
+    updated_at = time.time()
+    props: Dict[str, Any] = {"canonical_name": name, "updated_at": updated_at}
+    if provisional is not None:
+        props["provisional"] = provisional
+    await graph_task(queue, graph_id, "update_node", node_id=entity_id, properties=props)
+    if journal_path:
+        journal_correction_op(journal_path, "entity-rename", actor=actor,
+                              session_id=session_id,
+                              args={"entity_id": entity_id, "canonical_name": name,
+                                    "provisional": provisional, "updated_at": updated_at},
+                              nodes=[], edges=[])
+
+
+async def list_speaker_entities(
+    queue: JobQueue,                 # Started job queue
+    graph_id: str,                   # Graph-storage capability id
+    kind: Optional[str] = "person",  # Entity kind filter; None = the whole substrate
+) -> List[Dict[str, Any]]:  # Entity node dicts, canonical_name order
+    """Read the source-spanning entity registry (the picker's registry tier).
+
+    The registry is people-scale, not segment-scale — one label read suffices;
+    the picker LAYERS it (DEC 4ec6a49c): this source's already-assigned
+    speakers first, then registry-wide, then mint-new."""
+    res = await graph_task(queue, graph_id, "query_nodes",
+                           query=NodeQuery(label="Entity").to_dict())
+    out: List[Dict[str, Any]] = []
+    for n in (res.nodes or []):
+        d = n.to_dict() if isinstance(n, GraphNode) else n
+        if kind is not None and (d.get("properties") or {}).get("kind") != kind:
+            continue
+        out.append(d)
+    out.sort(key=lambda d: ((d.get("properties") or {}).get("canonical_name") or "").lower())
+    return out
+
+
+def build_speaker_assign_correction(
+    source_id: str,                       # Source the assigned segments belong to
+    segment_ids: List[str],               # Layer-0 Segment ids the verdict covers (document order)
+    entity_id: str,                       # The assigned Entity's stable id
+    session_id: str,                      # Owning session id
+    verdict: str = "name",                # "accept" | "split" | "name" | "cluster-merge" (DEC d6df3a8e)
+    proposal: Optional[Dict[str, Any]] = None,  # Machine-proposal snapshot ({turn_start, turn_end, cluster, confidence, ...}); None = unassisted walk
+    supersedes_id: Optional[str] = None,  # Prior speaker Correction this reassignment replaces
+    actor: str = "human",                 # Actor
+    rationale: Optional[str] = None,      # Optional note
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (correction node dict, edge dicts)
+    """Build a speaker Correction — the assignment op envelope (DEC d6df3a8e).
+
+    Binds segments to a PHYSICAL speaker (DEC 44afb2df: the voice producer,
+    never performance semantics — persona is downstream annotation). The
+    payload is the flywheel row: machine PROPOSAL snapshot (absent on
+    unassisted walks — the envelope predates the diarization capability) +
+    human verdict + entity binding; `canonical_form` carries the entity id,
+    the designed cross-transcript key. cluster-merge is FIRST-CLASS: embeddings
+    split character voices, and the same-physical-speaker verdict is prime
+    supervision. Edges: CORRECTS per segment + ASSIGNS -> the Entity
+    [+ SUPERSEDES on reassignment]. Turn-boundary disagreements are NOT a verb
+    here — they reuse time-nudge (the same supervision shape as a wrong VAD
+    boundary). Never touches text/times: assignment is an attribute overlay
+    read via active_speaker_assignments."""
+    if verdict not in ("accept", "split", "name", "cluster-merge"):
+        raise ValueError(f"verdict must be accept | split | name | cluster-merge, got {verdict!r}")
+    ids = [str(s) for s in segment_ids if s]
+    if not ids:
+        raise ValueError("speaker_assign needs at least one segment id")
+    if not entity_id:
+        raise ValueError("speaker_assign needs an entity_id — mint a provisional Entity "
+                         "for unknown voices (DEC 484e2d74), never a bare name")
+    payload: Dict[str, Any] = {"operation": "speaker_assign", "source_id": source_id,
+                               "segment_ids": ids, "entity_id": str(entity_id),
+                               "verdict": verdict}
+    if proposal:
+        payload["proposal"] = dict(proposal)
+    node = build_correction_node("speaker", session_id, payload, actor=actor,
+                                 canonical_form=str(entity_id),
+                                 rationale=rationale).to_graph_node()
+    edges = [make_edge(node.id, sid, CorrectionRelations.CORRECTS) for sid in ids]
+    edges.append(make_edge(node.id, str(entity_id), CorrectionRelations.ASSIGNS))
+    if supersedes_id:
+        edges.append(make_edge(node.id, supersedes_id, CorrectionRelations.SUPERSEDES))
+    return node.to_dict(), edges
+
+
+async def commit_speaker_assign_correction(
+    queue: JobQueue,                      # Started job queue
+    graph_id: str,                        # Graph-storage capability id
+    source_id: str,                       # Source the assigned segments belong to
+    segment_ids: List[str],               # Layer-0 Segment ids the verdict covers
+    entity_id: str,                       # The assigned Entity's stable id
+    session_id: str,                      # Owning session id
+    verdict: str = "name",                # "accept" | "split" | "name" | "cluster-merge"
+    proposal: Optional[Dict[str, Any]] = None,  # Machine-proposal snapshot; None = unassisted
+    supersedes_id: Optional[str] = None,  # Prior speaker Correction being replaced
+    actor: str = "human",                 # Actor
+    journal_path: Optional[str] = None,   # Sidecar journal — append the op on success (None = unjournaled)
+) -> str:  # The new Correction node id
+    """Commit a speaker assignment (node + CORRECTS per segment + ASSIGNS).
+
+    No review marker: assignment is the assignment LANE's own walk state, not
+    a verdict on the segment's text. The journal op carries proposal + verdict
+    + entity id + the run-independent segment anchor — the (prediction,
+    correction, context) dataset row (DEC d6df3a8e)."""
+    node, edges = build_speaker_assign_correction(
+        source_id, segment_ids, entity_id, session_id, verdict=verdict,
+        proposal=proposal, supersedes_id=supersedes_id, actor=actor)
+    await commit_nodes_edges(queue, graph_id, [node], edges)
+    if journal_path:
+        ids = [str(s) for s in segment_ids if s]
+        journal_correction_op(journal_path, "speaker-assign", actor=actor,
+                              session_id=session_id,
+                              args={"source_id": source_id, "segment_ids": ids,
+                                    "entity_id": str(entity_id), "verdict": verdict,
+                                    "proposal": dict(proposal or {}),
+                                    "supersedes_id": supersedes_id},
+                              anchor=await segment_anchor(queue, graph_id, ids),
+                              nodes=[node], edges=edges, op_id=node["id"])
+    return node["id"]
+
+
+def active_speaker_assignments(
+    corrections: List[Dict[str, Any]],  # Correction property dicts (e.g. from load_source_corrections)
+    superseded_ids: set,                # Ids that are SUPERSEDES targets
+) -> Dict[str, Dict[str, Any]]:  # segment_id -> {"entity_id", "verdict", "correction_id"}
+    """Project the ACTIVE speaker assignment per segment (latest-wins).
+
+    Reassignment = supersede, like every overlay verb; among the surviving
+    speaker corrections the latest created_at wins per segment — the
+    apply_time_nudges regime. Assignment never touches text/times: it is an
+    attribute overlay the assignment lane + downstream projections read
+    alongside the effective spine."""
+    assigns = [c for c in corrections
+               if c.get("correction_type") == "speaker"
+               and (c.get("payload") or {}).get("operation") == "speaker_assign"
+               and c.get("id") not in superseded_ids]
+    out: Dict[str, Dict[str, Any]] = {}
+    for c in sorted(assigns, key=lambda c: float(c.get("created_at") or 0.0)):
+        p = c.get("payload") or {}
+        for sid in p.get("segment_ids") or []:
+            out[str(sid)] = {"entity_id": p.get("entity_id"),
+                             "verdict": p.get("verdict"),
+                             "correction_id": c.get("id")}
+    return out

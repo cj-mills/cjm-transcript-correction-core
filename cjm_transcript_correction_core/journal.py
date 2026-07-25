@@ -98,11 +98,22 @@ def correction_replay_handlers() -> Dict[str, Any]:  # verb -> async handler(que
         await graph_task(queue, graph_id, "update_node", node_id=a["session_id"],
                          properties={"purpose": a["purpose"], "updated_at": a["updated_at"]})
 
+    async def _apply_entity_rename(queue: Any, graph_id: str, op: Dict[str, Any]) -> None:
+        a = op["args"]
+        props: Dict[str, Any] = {"canonical_name": a["canonical_name"],
+                                 "updated_at": a["updated_at"]}
+        if a.get("provisional") is not None:
+            props["provisional"] = a["provisional"]
+        await graph_task(queue, graph_id, "update_node", node_id=a["entity_id"],
+                         properties=props)
+
     handlers = wires_handlers("session-start", "boundary-shift", "text-correction",
                               "prune-amendment", "mark", "mark-dismiss", "review-markers",
-                              "time-nudge", "chunk-insert", "chunk-insert-remove")
+                              "time-nudge", "chunk-insert", "chunk-insert-remove",
+                              "speaker-entity", "speaker-assign")
     handlers["session-status"] = _apply_session_status
     handlers["session-purpose"] = _apply_session_purpose
+    handlers["entity-rename"] = _apply_entity_rename
     return handlers
 
 
