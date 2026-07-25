@@ -1665,3 +1665,37 @@ def active_speaker_assignments(
                              "verdict": p.get("verdict"),
                              "correction_id": c.get("id")}
     return out
+
+
+def aggregate_session_purposes(
+    sessions: List[Dict[str, Any]],  # CorrectionSession node dicts
+) -> Dict[str, Dict[str, int]]:  # source_id -> {purpose-or-"genuine": session count}
+    """Fold sessions into a per-source purpose mix (pure; d915d545 picker rung).
+
+    Purpose is SESSION-scoped (a TUI sitting), corrections are spine state —
+    this aggregates session purposes per source, it never re-labels state.
+    Absent purpose = a GENUINE pass (DEC c86714a4's open vocabulary; the
+    d346969e backfill made the tag authoritative for the whole corpus)."""
+    out: Dict[str, Dict[str, int]] = {}
+    for s in sessions:
+        props = s.get("properties") or {}
+        purpose = str(props.get("purpose") or "genuine")
+        for sid in props.get("scope") or []:
+            mix = out.setdefault(str(sid), {})
+            mix[purpose] = mix.get(purpose, 0) + 1
+    return out
+
+
+async def session_purposes_by_source(
+    queue: JobQueue,  # Started job queue
+    graph_id: str,    # Graph-storage capability id
+) -> Dict[str, Dict[str, int]]:  # source_id -> {purpose-or-"genuine": session count}
+    """Read every CorrectionSession once and fold the per-source purpose mix.
+
+    One label read (sessions are sitting-scale, not segment-scale) — the
+    picker's at-a-glance rung (d915d545 a): which sources carry only dev-era
+    edits vs genuine passes, BEFORE opening one."""
+    res = await graph_task(queue, graph_id, "query_nodes",
+                           query=NodeQuery(label="CorrectionSession").to_dict())
+    nodes = [n.to_dict() if isinstance(n, GraphNode) else n for n in (res.nodes or [])]
+    return aggregate_session_purposes(nodes)

@@ -511,3 +511,25 @@ def test_speaker_assign_build_and_active_projection():
     assert act["seg-b"]["entity_id"] == "ent-2"
     assert act["seg-b"]["verdict"] == "cluster-merge"
     assert act["seg-b"]["correction_id"] == "c2"
+
+
+def test_aggregate_session_purposes():
+    """d915d545(a): per-source purpose mix — absent purpose = genuine, multi-
+    source scopes count once per source, purposes stay an open vocabulary."""
+    from cjm_transcript_correction_core.graph import aggregate_session_purposes
+    def sess(purpose, scope):
+        props = {"scope": scope}
+        if purpose is not None:
+            props["purpose"] = purpose
+        return {"id": "s", "properties": props}
+    mix = aggregate_session_purposes([
+        sess("feature-test", ["src-1"]),
+        sess("feature-test", ["src-1", "src-2"]),
+        sess(None, ["src-1"]),
+        sess("spike", ["src-3"]),
+        sess("feature-test", []),          # empty scope contributes nothing
+    ])
+    assert mix["src-1"] == {"feature-test": 2, "genuine": 1}
+    assert mix["src-2"] == {"feature-test": 1}
+    assert mix["src-3"] == {"spike": 1}
+    assert set(mix) == {"src-1", "src-2", "src-3"}
