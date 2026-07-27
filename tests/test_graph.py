@@ -604,3 +604,56 @@ def test_chunk_split_composes_from_existing_verbs():
         assert False, "split at the end must raise"
     except ValueError:
         pass
+
+
+def test_insert_rank_and_split_removal():
+    """FINDING 131ba57a: (a) same-anchor same-start siblings order by
+    (start_time, RANK, created_at) — a later insert lands BEFORE a split's
+    right half when the walked cursor said so; (b) x on a split right half
+    UNSPLITS: one review node supersedes the whole group and the projection
+    returns to the pre-split segment exactly."""
+    from cjm_transcript_correction_core.graph import (build_chunk_insert_correction,
+                                                      build_chunk_split_corrections,
+                                                      find_chunk_split_group)
+
+    segs = [SpineSegment(id="a", index=0, text="alpha beta gamma",
+                         start_time=0.0, end_time=6.0),
+            SpineSegment(id="b", index=1, text="tail", start_time=6.0, end_time=9.0)]
+    nodes, _, ids = build_chunk_split_corrections(
+        "src-1", "a", 2.0, "alpha", "beta gamma", 6.0, "sess-1", "a",
+        before_segment_id="b")
+    corrs = []
+    for n in nodes:
+        c = dict(n["properties"])
+        c["id"] = n["id"]
+        corrs.append(c)
+    for c in corrs:
+        c["created_at"] = 1.0
+
+    # the user scenario: from the LEFT half, insert the inhale AT the weld —
+    # created LATER but rank -1 places it BETWEEN the halves
+    inh, _ = build_chunk_insert_correction("src-1", "a", 2.0, 2.0, "sess-1",
+                                           before_segment_id="b", label="inhale",
+                                           rank=-1.0)
+    ic = dict(inh["properties"])
+    ic["id"] = inh["id"]
+    ic["created_at"] = 2.0
+    assert ic["payload"]["rank"] == -1.0
+    eff = project_effective_spine(segs, corrs + [ic])
+    assert [s.id for s in eff] == ["a", inh["id"], ids["insert_id"], "b"]
+    # without the rank, creation order buries it below the right half
+    ic0 = dict(ic)
+    ic0["payload"] = {k: v for k, v in ic["payload"].items() if k != "rank"}
+    eff0 = project_effective_spine(segs, corrs + [ic0])
+    assert [s.id for s in eff0] == ["a", ids["insert_id"], inh["id"], "b"]
+
+    # unsplit: the group resolves off the rationale marker, and superseding
+    # ALL members restores the pre-split segment exactly
+    group = find_chunk_split_group(corrs, ids["insert_id"])
+    assert sorted(group) == sorted([ids["text_id"], ids["nudge_id"]])
+    assert find_chunk_split_group(corrs, "not-a-split") == []
+    active = active_corrections(corrs, {ids["insert_id"], *group})
+    assert active == []
+    eff2 = project_effective_spine(segs, active)
+    assert [(s.id, s.text, s.start_time, s.end_time) for s in eff2] == [
+        ("a", "alpha beta gamma", 0.0, 6.0), ("b", "tail", 6.0, 9.0)]

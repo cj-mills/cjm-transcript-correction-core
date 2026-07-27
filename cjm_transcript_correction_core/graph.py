@@ -1270,6 +1270,7 @@ def build_chunk_insert_correction(
     before_segment_id: Optional[str] = None,  # Layer-0 Segment right of the gap (None at spine tail)
     label: Optional[str] = None,          # Optional annotation class (open mark-class vocabulary)
     text: str = "",                       # Born-empty text (missed speech arrives by e-edit)
+    rank: float = 0.0,                    # WALKED-ORDER tie-break among same-anchor same-start siblings (FINDING 131ba57a)
     actor: str = "human",                 # Actor
     rationale: Optional[str] = None,      # Optional note
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (correction node dict, edge dicts)
@@ -1297,6 +1298,12 @@ def build_chunk_insert_correction(
                "text": text}
     if label:
         payload["label"] = str(label)
+    if rank:
+        # Same-anchor siblings order by (start_time, rank, created_at): rank
+        # carries the WALKED position when start_times tie (a weld stack) —
+        # creation order alone could never put a later insert BEFORE an
+        # existing same-start sibling (the split-then-isolate case, 131ba57a).
+        payload["rank"] = float(rank)
     node = build_correction_node("insertion", session_id, payload, actor=actor,
                                  rationale=rationale).to_graph_node()
     edges = [make_edge(node.id, after_segment_id, CorrectionRelations.CORRECTS)]
@@ -1315,6 +1322,7 @@ async def commit_chunk_insert_correction(
     session_id: str,                      # Owning session id
     before_segment_id: Optional[str] = None,  # Right flank (None at spine tail)
     label: Optional[str] = None,          # Optional annotation class
+    rank: float = 0.0,                    # Walked-order tie-break among same-start siblings (131ba57a)
     actor: str = "human",                 # Actor
     journal_path: Optional[str] = None,   # Sidecar journal — append the op on success (None = unjournaled)
 ) -> str:  # The new insertion Correction node id (= the synthetic segment id)
@@ -1328,7 +1336,7 @@ async def commit_chunk_insert_correction(
     """
     node, edges = build_chunk_insert_correction(
         source_id, after_segment_id, start_time, end_time, session_id,
-        before_segment_id=before_segment_id, label=label, actor=actor)
+        before_segment_id=before_segment_id, label=label, rank=rank, actor=actor)
     await commit_nodes_edges(queue, graph_id, [node], edges)
     if journal_path:
         journal_correction_op(journal_path, "chunk-insert", actor=actor,
@@ -1337,7 +1345,8 @@ async def commit_chunk_insert_correction(
                                     "after_segment_id": after_segment_id,
                                     "before_segment_id": before_segment_id,
                                     "start_time": float(start_time),
-                                    "end_time": float(end_time), "label": label},
+                                    "end_time": float(end_time), "label": label,
+                                    "rank": float(rank)},
                               anchor=await segment_anchor(
                                   queue, graph_id,
                                   [sid for sid in (after_segment_id, before_segment_id) if sid]),
@@ -1426,9 +1435,14 @@ def apply_chunk_inserts(
     if not after_groups and not before_groups:
         return segments
 
-    def _key(c: Dict[str, Any]) -> Tuple[float, float]:
+    def _key(c: Dict[str, Any]) -> Tuple[float, float, float]:
+        # (start_time, rank, created_at): rank is the WALKED-ORDER tie-break —
+        # same-start weld stacks (a split's right half + an isolation insert
+        # born at the same cut) order by user intent, not creation time
+        # (FINDING 131ba57a; absent rank = 0.0 keeps every prior insert put).
         p = c.get("payload") or {}
-        return (float(p.get("start_time") or 0.0), float(c.get("created_at") or 0.0))
+        return (float(p.get("start_time") or 0.0), float(p.get("rank") or 0.0),
+                float(c.get("created_at") or 0.0))
 
     def _synth(c: Dict[str, Any], index: int) -> SpineSegment:
         p = c.get("payload") or {}
@@ -1806,3 +1820,56 @@ async def commit_chunk_split_correction(
                                   [sid for sid in (after_segment_id, before_segment_id) if sid]),
                               nodes=nodes, edges=edges, op_id=ids["insert_id"])
     return ids
+
+
+def find_chunk_split_group(
+    corrections: List[Dict[str, Any]],  # Correction property dicts (e.g. from load_source_corrections)
+    insert_id: str,                     # A chunk_insert Correction id (a split's right half?)
+) -> List[str]:  # The group's companion correction ids ([] = an ordinary insert, not a split product)
+    """Resolve a split right-half's GROUP — the ac84360a group marker cashed in.
+
+    A chunk split commits three ops whose left replace_text and end time_nudge
+    carry rationale `chunk-split:<insert id>`; this returns those companion
+    ids so removal can supersede the WHOLE decision (unsplit), never just the
+    insert (which orphaned the right text + the truncated tail — FINDING
+    131ba57a follow-on, the retyping cost)."""
+    tag = f"chunk-split:{insert_id}"
+    return [c["id"] for c in corrections if c.get("rationale") == tag]
+
+
+async def commit_chunk_split_removal(
+    queue: JobQueue,                     # Started job queue
+    graph_id: str,                       # Graph-storage capability id
+    source_id: str,                      # Source the split belongs to
+    insert_id: str,                      # The split's right-half insert Correction
+    group_ids: List[str],                # Its companions (find_chunk_split_group)
+    session_id: str,                     # Owning session id
+    actor: str = "human",                # Actor
+    note: Optional[str] = None,          # Optional note (why unsplit)
+    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+) -> str:  # The review node id that superseded the group
+    """UNSPLIT: remove a split's right half AND its whole group (one review
+    node, SUPERSEDES per member).
+
+    Demand arrived minutes after the split shipped: superseding only the
+    insert orphans the right text and leaves the target truncated at the cut
+    (FINDING 131ba57a follow-on) — superseding the GROUP (insert + left
+    replace_text + end time_nudge) returns the projection to the pre-split
+    segment exactly, append-only (the audit trail keeps both the split and
+    its retraction). Later corrections anchored to the right-half id drop as
+    foreign edits (the removal lane's existing semantics); later seam nudges
+    on the TARGET survive as their own latest-wins chain."""
+    payload = {"operation": "reject", "source_id": source_id,
+               "rejected_id": insert_id, "rejected_group": list(group_ids)}
+    node = build_correction_node("review", session_id, payload, actor=actor,
+                                 rationale=note).to_graph_node().to_dict()
+    edges = [make_edge(node["id"], rid, CorrectionRelations.SUPERSEDES)
+             for rid in [insert_id, *group_ids]]
+    await commit_nodes_edges(queue, graph_id, [node], edges)
+    if journal_path:
+        journal_correction_op(journal_path, "chunk-split-remove", actor=actor,
+                              session_id=session_id,
+                              args={"source_id": source_id, "insert_id": insert_id,
+                                    "group_ids": list(group_ids), "note": note},
+                              nodes=[node], edges=edges, op_id=node["id"])
+    return node["id"]
