@@ -57,3 +57,27 @@ def test_compute_signal_flags_combined():
     flags = compute_signal_flags(SEGS, variants=variants)
     assert 1 in flags and "transcriber-divergence" in flags.get(2, [])
     assert "transcriber-divergence" not in flags.get(0, [])
+
+
+def test_speaker_turn_proposals_dominance_and_gaps():
+    from cjm_transcript_correction_core.signals import speaker_turn_proposals
+    segs = [
+        SpineSegment(id="s0", index=0, text="a", start_time=0.0, end_time=10.0),
+        SpineSegment(id="s1", index=1, text="b", start_time=10.0, end_time=20.0),
+        SpineSegment(id="s2", index=2, text="c", start_time=100.0, end_time=110.0),  # no turn coverage
+        SpineSegment(id="s3", index=3, text="d", start_time=None, end_time=None),    # no time span
+    ]
+    turns = [
+        {"start": 0.0, "end": 8.0, "speaker": "SPEAKER_00"},
+        {"start": 8.0, "end": 11.0, "speaker": "SPEAKER_01"},
+        # overlapping speech: both turns cover 12-20; S01 dominates s1
+        {"start": 12.0, "end": 20.0, "speaker": "SPEAKER_01"},
+        {"start": 12.0, "end": 14.0, "speaker": "SPEAKER_00"},
+    ]
+    p = speaker_turn_proposals(segs, turns)
+    assert p["s0"]["cluster"] == "SPEAKER_00" and p["s0"]["overlap"] == 8.0
+    assert p["s0"]["coverage"] == 0.8
+    assert p["s1"]["cluster"] == "SPEAKER_01"
+    assert p["s1"]["overlap"] == 9.0  # 10-11 plus 12-20
+    assert "s2" not in p and "s3" not in p
+    assert speaker_turn_proposals(segs, []) == {}

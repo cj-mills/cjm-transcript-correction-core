@@ -1661,9 +1661,12 @@ def active_speaker_assignments(
     for c in sorted(assigns, key=lambda c: float(c.get("created_at") or 0.0)):
         p = c.get("payload") or {}
         for sid in p.get("segment_ids") or []:
+            # cluster rides the projection: the assign lane's cluster-name-once
+            # memory derives from prior accepts' proposal snapshots (8a4df244).
             out[str(sid)] = {"entity_id": p.get("entity_id"),
                              "verdict": p.get("verdict"),
-                             "correction_id": c.get("id")}
+                             "correction_id": c.get("id"),
+                             "cluster": (p.get("proposal") or {}).get("cluster")}
     return out
 
 

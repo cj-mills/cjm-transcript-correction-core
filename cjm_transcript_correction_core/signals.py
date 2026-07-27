@@ -1,7 +1,7 @@
 """Pure deterministic Tier-1 signal functions (no capability calls): empty-segment detection, bidirectional boundary punctuation/capitalization heuristics, forced-alignment coverage flags, positional cross-transcriber diff, and phonetic + edit-distance variant clustering. The worklist is recomputed from these each session; revolution-1 builds ZERO new capabilities."""
 
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from cjm_transcript_correction_core.models import SpineSegment
 
@@ -206,3 +206,48 @@ def compute_signal_flags(
         for idx in variant_divergence(segments, variants):
             add(idx, ["transcriber-divergence"])
     return flags
+
+
+def speaker_turn_proposals(
+    segments: List[SpineSegment],  # Ordered spine segments (source-coordinate times)
+    turns: List[Dict[str, Any]],   # Diarization turns [{start, end, speaker, ...}], source coordinates
+) -> Dict[str, Dict[str, Any]]:  # segment id -> {"cluster", "overlap", "coverage"}
+    """Dominant diarization cluster per segment — the assign lane's proposal paint.
+
+    Pure time-overlap dominance: accumulate overlap seconds per anonymous
+    cluster label across the (possibly overlapping) turns; the label with the
+    most overlap wins. `coverage` = dominant overlap / segment duration — what
+    the painter dims on and the accept op snapshots. Segments with no time
+    span or no overlapping turn get NO proposal (the lane shows ∅). Cluster
+    labels are result-scoped (never identities) — binding them to Entities is
+    the accept gesture's job (DEC 8a4df244 cluster-name-once)."""
+    out: Dict[str, Dict[str, Any]] = {}
+    ts = sorted((float(t.get("start") or 0.0), float(t.get("end") or 0.0),
+                 str(t.get("speaker") or "")) for t in (turns or []))
+    if not ts:
+        return out
+    lo = 0
+    for seg in segments:
+        if seg.start_time is None or seg.end_time is None:
+            continue
+        s, e = float(seg.start_time), float(seg.end_time)
+        if e <= s:
+            continue
+        # turns sorted by start: one ending at/before this segment's start can
+        # never overlap a LATER segment either — safe to retire it.
+        while lo < len(ts) and ts[lo][1] <= s:
+            lo += 1
+        overlap: Dict[str, float] = {}
+        j = lo
+        while j < len(ts) and ts[j][0] < e:
+            t_s, t_e, label = ts[j]
+            dur = min(e, t_e) - max(s, t_s)
+            if dur > 0 and label:
+                overlap[label] = overlap.get(label, 0.0) + dur
+            j += 1
+        if not overlap:
+            continue
+        cluster, dom = max(overlap.items(), key=lambda kv: kv[1])
+        out[seg.id] = {"cluster": cluster, "overlap": round(dom, 3),
+                       "coverage": round(min(1.0, dom / (e - s)), 3)}
+    return out
