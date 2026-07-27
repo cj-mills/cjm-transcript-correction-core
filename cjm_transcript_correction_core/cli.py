@@ -7,9 +7,12 @@ import os
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from cjm_context_graph_layer.ops import graph_task
+from cjm_context_graph_primitives.query import NodeQuery
 from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
 from cjm_substrate.core.workspace import resolve_workspace
+from cjm_transcript_correction_core.graph import correction_stats, load_source_corrections
 from cjm_transcript_correction_core.models import CorrectionConfig
 from cjm_transcript_correction_core.pipeline import (load_decomp_manifest, resolve_graph_db_path,
                                                      run_correction, run_review)
@@ -70,6 +73,26 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
     _add_common_run_args(review)
     review.add_argument("--review-max", type=int, default=0, help="Max worklist items to review (0 = all)")
     review.add_argument("-y", "--yes", action="store_true", help="Auto-mark every reviewed item (no edits)")
+
+    stats = sub.add_parser(
+        "stats", help="Flywheel accounting: active labeled spans / open marks / op counts per source")
+    stats.add_argument("--manifests-dir", default=None,
+                       help="Capability manifests directory (default: the workspace's .cjm/manifests "
+                            "when one is active, else .cjm/manifests under the cwd)")
+    stats.add_argument("--workspace", default=None,
+                       help="Workspace root (default: CJM_WORKSPACE env, else upward walk from cwd)")
+    stats.add_argument("--graph-capability", default="cjm-capability-graph-sqlite",
+                       help="Graph-storage capability name")
+    stats.add_argument("--graph-db-path", default=None,
+                       help="Graph db path (default: the capability's persisted workspace config)")
+    stats.add_argument("--source", default=None,
+                       help="Source node id or title substring (default: every Source)")
+    stats.add_argument("--label", default=None,
+                       help="Spotlight one label/class (e.g. inhale): prints its insert+mark grand total")
+    stats.add_argument("--genuine-only", action="store_true",
+                       help="Count only corrections from GENUINE sessions (purpose unset/genuine — "
+                            "feature-test noise excluded, DEC c86714a4); supersession stays global")
+    stats.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
     return parser
 
 
@@ -221,4 +244,99 @@ def main(
         return asyncio.run(run_command(args))
     if args.command == "review":
         return asyncio.run(review_command(args))
+    if args.command == "stats":
+        return asyncio.run(stats_command(args))
     raise SystemExit(f"unknown command: {args.command}")
+
+
+async def stats_command(
+    args: argparse.Namespace,  # Parsed args for the `stats` subcommand
+) -> int:  # Process exit code
+    """Execute the `stats` subcommand: flywheel accounting over the shared graph.
+
+    The manual-tally retirement (drive ask 2026-07-27): per Source, the ACTIVE
+    overlay folds into counts — labeled insert spans, split boundaries, open
+    marks by class, op totals — plus the session purpose mix so dev-noise is
+    visible; --genuine-only cuts the counts to genuine-session corrections
+    (the DEC c86714a4 tag), --label spotlights one class corpus-wide (the
+    "how many active inhale spans?" one-liner)."""
+    ws = resolve_workspace(explicit=getattr(args, "workspace", None))
+    if ws is not None:
+        os.environ["CJM_WORKSPACE"] = str(ws.root)
+    if args.manifests_dir is None:
+        args.manifests_dir = (str(ws.substrate_data_dir / "manifests")
+                              if ws is not None else ".cjm/manifests")
+    manager = CapabilityManager(search_paths=[Path(args.manifests_dir)])
+    configs = ({args.graph_capability: {"db_path": args.graph_db_path}}
+               if args.graph_db_path else None)
+    load_capabilities(manager, [args.graph_capability], configs=configs)
+    queue = JobQueue(deps=manager)
+    await queue.start()
+    try:
+        res = await graph_task(queue, args.graph_capability, "query_nodes",
+                               query=NodeQuery(label="Source", project=["title"]).to_dict())
+        sources = [(r["id"], str(r.get("title") or "")) for r in (res.rows or [])]
+        if args.source:
+            needle = args.source.lower()
+            sources = [(i, t) for i, t in sources
+                       if i == args.source or needle in t.lower()]
+        if not sources:
+            print("no matching Source nodes")
+            return 1
+        sres = await graph_task(queue, args.graph_capability, "query_nodes",
+                                query=NodeQuery(label="CorrectionSession").to_dict())
+        genuine_ids = set()
+        purpose_of: Dict[str, str] = {}
+        for n in (sres.nodes or []):
+            d = n.to_dict() if hasattr(n, "to_dict") else n
+            purpose = str((d.get("properties") or {}).get("purpose") or "genuine")
+            purpose_of[d["id"]] = purpose
+            if purpose == "genuine":
+                genuine_ids.add(d["id"])
+        totals: Dict[str, Dict[str, int]] = {"insert_labels": {}, "mark_classes": {}}
+        total_splits = 0
+        for sid, title in sources:
+            corrections, superseded = await load_source_corrections(
+                queue, args.graph_capability, sid)
+            counted = corrections
+            if args.genuine_only:
+                # Purpose scopes the COUNTS; the superseded set stays global —
+                # supersession is spine state whoever committed it.
+                counted = [c for c in corrections if c.get("session_id") in genuine_ids]
+            st = correction_stats(counted, superseded)
+            mix: Dict[str, int] = {}
+            for c in corrections:
+                p = purpose_of.get(str(c.get("session_id")), "genuine")
+                mix[p] = mix.get(p, 0) + 1
+            print(f"== {title or sid}  ({sid}) ==")
+            print("  ops by session purpose: "
+                  + (" ".join(f"{k}x{v}" for k, v in sorted(mix.items())) or "none"))
+            print(f"  active corrections: {st['active']}  ("
+                  + (" ".join(f"{k}={v}" for k, v in sorted(st["ops"].items())) or "none") + ")")
+            print(f"  splits: {st['splits']}")
+            print("  labeled inserts: "
+                  + (" · ".join(f"{k}x{v}" for k, v in sorted(st["insert_labels"].items())) or "none"))
+            print(f"  open marks ({st['open_marks']}): "
+                  + (" · ".join(f"{k}x{v}" for k, v in sorted(st["mark_classes"].items())) or "none"))
+            total_splits += st["splits"]
+            for k, v in st["insert_labels"].items():
+                totals["insert_labels"][k] = totals["insert_labels"].get(k, 0) + v
+            for k, v in st["mark_classes"].items():
+                totals["mark_classes"][k] = totals["mark_classes"].get(k, 0) + v
+        print(f"== TOTALS ({len(sources)} source(s)) ==")
+        print(f"  splits: {total_splits}")
+        print("  labeled inserts: "
+              + (" · ".join(f"{k}x{v}" for k, v in sorted(totals["insert_labels"].items())) or "none"))
+        print("  open marks: "
+              + (" · ".join(f"{k}x{v}" for k, v in sorted(totals["mark_classes"].items())) or "none"))
+        if args.label:
+            ins = totals["insert_labels"].get(args.label, 0)
+            mk = totals["mark_classes"].get(args.label, 0)
+            print(f"  active {args.label!r} spans: {ins + mk} (inserts {ins} + marks {mk})")
+    finally:
+        await queue.stop()
+        try:
+            manager.unload_capability(args.graph_capability)
+        except Exception as e:  # Best-effort teardown; never mask the stats outcome
+            logger.warning(f"unload {args.graph_capability} failed: {e}")
+    return 0

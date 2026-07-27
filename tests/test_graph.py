@@ -657,3 +657,45 @@ def test_insert_rank_and_split_removal():
     eff2 = project_effective_spine(segs, active)
     assert [(s.id, s.text, s.start_time, s.end_time) for s in eff2] == [
         ("a", "alpha beta gamma", 0.0, 6.0), ("b", "tail", 6.0, 9.0)]
+
+
+def test_correction_stats_accounting():
+    """The manual-tally retirement (drive ask 2026-07-27): active labeled
+    spans / splits / open marks fold into counts — split right halves are
+    boundary events (never labeled spans), superseded ops and discharged
+    marks drop, unlabeled inserts stay visible."""
+    from cjm_transcript_correction_core.graph import correction_stats
+
+    def corr(cid, ctype, payload, rationale=None, created=1.0):
+        return {"id": cid, "correction_type": ctype, "payload": payload,
+                "rationale": rationale, "created_at": created}
+
+    corrections = [
+        corr("i1", "insertion", {"operation": "chunk_insert", "label": "inhale"}),
+        corr("i2", "insertion", {"operation": "chunk_insert", "label": "inhale"}),
+        corr("i3", "insertion", {"operation": "chunk_insert"}),          # unlabeled
+        corr("i4", "insertion", {"operation": "chunk_insert", "label": "um"}),
+        corr("sp", "insertion", {"operation": "chunk_insert", "text": "tail"},
+             rationale="chunk-split"),
+        corr("tx", "text_content", {"operation": "replace_text", "segment_id": "a"}),
+        corr("nd", "timing", {"operation": "time_nudge", "edits": []}),
+        corr("m1", "mark", {"operation": "mark", "mark_class": "inhale",
+                            "anchor": {"kind": "segment", "segment_id": "a"}}),
+        corr("m2", "mark", {"operation": "mark", "mark_class": "overlapping-speech",
+                            "anchor": {"kind": "segment", "segment_id": "a"}}),
+        corr("m3", "mark", {"operation": "mark", "mark_class": "inhale",
+                            "anchor": {"kind": "segment", "segment_id": "b"}}),
+    ]
+    st = correction_stats(corrections, {"i4", "m3"})   # um removed, one mark discharged
+    assert st["insert_labels"] == {"inhale": 2, "(unlabeled)": 1}
+    assert st["splits"] == 1
+    assert st["mark_classes"] == {"inhale": 1, "overlapping-speech": 1}
+    assert st["open_marks"] == 2
+    assert st["ops"]["insertion"] == 4 and st["ops"]["text_content"] == 1
+    assert st["active"] == 8
+
+    # the caller's genuine-only cut: filtered corrections, GLOBAL superseded set
+    genuine = [c for c in corrections if c["id"] not in ("i2", "m2")]
+    st2 = correction_stats(genuine, {"i4", "m3"})
+    assert st2["insert_labels"] == {"inhale": 1, "(unlabeled)": 1}
+    assert st2["mark_classes"] == {"inhale": 1}

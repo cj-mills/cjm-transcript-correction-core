@@ -1873,3 +1873,43 @@ async def commit_chunk_split_removal(
                                     "group_ids": list(group_ids), "note": note},
                               nodes=[node], edges=edges, op_id=node["id"])
     return node["id"]
+
+
+def correction_stats(
+    corrections: List[Dict[str, Any]],  # One Source's corrections (load_source_corrections)
+    superseded_ids: set,                # Ids that are SUPERSEDES targets
+) -> Dict[str, Any]:  # {"active","ops","insert_labels","splits","open_marks","mark_classes"}
+    """Fold one Source's ACTIVE overlay into flywheel-accounting counts (pure).
+
+    The manual-tally retirement (drive ask 2026-07-27): "how many active
+    inhale spans?" must be a QUERY, not a human count. Counts: `insert_labels`
+    = active chunk inserts by annotation label (split right halves EXCLUDED —
+    a split is a boundary decision, not a labeled span; unlabeled inserts
+    count under "(unlabeled)"); `splits` = active split right halves;
+    `mark_classes` = OPEN marks by class; `ops` = every active correction by
+    type. Session-purpose scoping is the CALLER's cut (filter the corrections
+    to genuine sessions first, keep the FULL superseded set — supersession is
+    spine state whoever committed it).
+    """
+    active = active_corrections(corrections, superseded_ids)
+    marks = open_marks(corrections, superseded_ids)
+    ops: Dict[str, int] = {}
+    insert_labels: Dict[str, int] = {}
+    splits = 0
+    for c in active:
+        ctype = str(c.get("correction_type"))
+        ops[ctype] = ops.get(ctype, 0) + 1
+        p = c.get("payload") or {}
+        if ctype == "insertion" and p.get("operation") == "chunk_insert":
+            if c.get("rationale") == "chunk-split":
+                splits += 1
+            else:
+                lab = str(p.get("label") or "(unlabeled)")
+                insert_labels[lab] = insert_labels.get(lab, 0) + 1
+    mark_classes: Dict[str, int] = {}
+    for m in marks:
+        mc = str((m.get("payload") or {}).get("mark_class") or "?")
+        mark_classes[mc] = mark_classes.get(mc, 0) + 1
+    return {"active": len(active), "ops": ops, "insert_labels": insert_labels,
+            "splits": splits, "open_marks": len(marks),
+            "mark_classes": mark_classes}
