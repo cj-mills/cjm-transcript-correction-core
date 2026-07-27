@@ -110,7 +110,7 @@ def correction_replay_handlers() -> Dict[str, Any]:  # verb -> async handler(que
     handlers = wires_handlers("session-start", "boundary-shift", "text-correction",
                               "prune-amendment", "mark", "mark-dismiss", "review-markers",
                               "time-nudge", "chunk-insert", "chunk-insert-remove",
-                              "speaker-entity", "speaker-assign")
+                              "chunk-split", "speaker-entity", "speaker-assign")
     handlers["session-status"] = _apply_session_status
     handlers["session-purpose"] = _apply_session_purpose
     handlers["entity-rename"] = _apply_entity_rename

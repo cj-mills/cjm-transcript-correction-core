@@ -1702,3 +1702,107 @@ async def session_purposes_by_source(
                            query=NodeQuery(label="CorrectionSession").to_dict())
     nodes = [n.to_dict() if isinstance(n, GraphNode) else n for n in (res.nodes or [])]
     return aggregate_session_purposes(nodes)
+
+
+def build_chunk_split_corrections(
+    source_id: str,                        # Source the split segment belongs to
+    segment_id: str,                       # The EFFECTIVE segment being split (layer-0 id, or a synthetic insert id)
+    split_time: float,                     # The new boundary (source-coordinate seconds; strictly inside the span)
+    left_text: str,                        # Effective text the (truncated) split target keeps
+    right_text: str,                       # Effective text the new right-half chunk carries
+    end_time: float,                       # The target's CURRENT effective end (becomes the right half's end)
+    session_id: str,                       # Owning session id
+    after_segment_id: str,                 # LAYER-0 anchor the right half splices after (resolved past synthetics)
+    before_segment_id: Optional[str] = None,  # Layer-0 right flank (None at spine tail)
+    old_text: Optional[str] = None,        # The target's prior effective text (for the record)
+    boundary_words: Optional[Dict[str, Any]] = None,  # {"left","right"} words at the NEW boundary (flywheel context)
+    actor: str = "human",                  # Actor
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, str]]:  # (node dicts, edge dicts, {"insert_id","text_id","nudge_id"})
+    """Compose a chunk SPLIT from the EXISTING verbs (work item 99c1d2ba) — no
+    new projection arm, no new wire shape.
+
+    A split mints a boundary INSIDE a chunk — the dual of chunk insertion's
+    chunk-in-a-gap: (1) a chunk_insert carries the right half [split_time,
+    end_time] with its text (its node id IS the new segment's id, the 3d3fa2a8
+    1:1 mapping); (2) a replace_text keeps the left half's text on the split
+    target; (3) a time_nudge truncates the target's end to split_time. The
+    projection already composes text -> inserts -> nudges, so the three land
+    as [left | right] with a WELDED point cut at split_time — the existing
+    nudge keys then move the new seam atomically, and every press journals the
+    flywheel (prediction, correction, context) chain: sub-word precision comes
+    from nudging AFTER the split, never character precision at split time.
+    Works UNIFORMLY on synthetic targets (splitting an inserted chunk):
+    replace_text and nudges on a synthetic id ride the insert-stage lanes, and
+    the right half stacks under the shared layer-0 anchor ordered by
+    start_time. The rationale carries `chunk-split:<insert id>` as the GROUP
+    marker — three ops, discoverable as ONE human decision.
+    """
+    if not left_text or not right_text:
+        raise ValueError("chunk split needs non-empty left and right texts")
+    if float(split_time) >= float(end_time):
+        raise ValueError(f"split_time {split_time} must precede the segment end {end_time}")
+    ins_node, ins_edges = build_chunk_insert_correction(
+        source_id, after_segment_id, float(split_time), float(end_time), session_id,
+        before_segment_id=before_segment_id, text=right_text, actor=actor,
+        rationale="chunk-split")
+    group = f"chunk-split:{ins_node['id']}"
+    txt_node, txt_edges = build_text_correction(
+        source_id, segment_id, left_text, session_id, old_text=old_text,
+        actor=actor, rationale=group)
+    nudge_node, nudge_edges = build_time_nudge_correction(
+        source_id, [{"segment_id": segment_id, "edge": "end",
+                     "old_time": float(end_time), "new_time": float(split_time)}],
+        session_id, boundary_words=boundary_words, actor=actor, rationale=group)
+    return ([ins_node, txt_node, nudge_node],
+            ins_edges + txt_edges + nudge_edges,
+            {"insert_id": ins_node["id"], "text_id": txt_node["id"],
+             "nudge_id": nudge_node["id"]})
+
+
+async def commit_chunk_split_correction(
+    queue: JobQueue,                       # Started job queue
+    graph_id: str,                         # Graph-storage capability id
+    source_id: str,                        # Source the split segment belongs to
+    segment_id: str,                       # The effective segment being split
+    split_time: float,                     # The new boundary (source seconds)
+    left_text: str,                        # Left half's text (stays on the target)
+    right_text: str,                       # Right half's text (rides the new chunk)
+    end_time: float,                       # The target's current effective end
+    session_id: str,                       # Owning session id
+    after_segment_id: str,                 # Layer-0 anchor for the right half
+    before_segment_id: Optional[str] = None,  # Layer-0 right flank (None at tail)
+    old_text: Optional[str] = None,        # Prior effective text (for the record)
+    boundary_words: Optional[Dict[str, Any]] = None,  # Words either side of the new cut
+    actor: str = "human",                  # Actor
+    journal_path: Optional[str] = None,    # Sidecar journal — append the op on success (None = unjournaled)
+) -> Dict[str, str]:  # {"insert_id","text_id","nudge_id"} (insert_id = the right half's segment id)
+    """Commit a chunk split: three composed nodes in ONE atomic batch + ONE journal op.
+
+    No review marker: a split is a boundary decision made mid-walk (the
+    time-nudge regime) — judging each half's text is the work that FOLLOWS.
+    The single `chunk-split` journal op is the flywheel's NEW-BOUNDARY record:
+    a human asserted a cut the skeleton never made, with the words either side
+    and run-independent layer-0 flank anchors; the wires carry all three
+    nodes, so replay is one wire op (the composed semantics never smear across
+    journal entries). Op id = the right half's segment id.
+    """
+    nodes, edges, ids = build_chunk_split_corrections(
+        source_id, segment_id, split_time, left_text, right_text, end_time,
+        session_id, after_segment_id, before_segment_id=before_segment_id,
+        old_text=old_text, boundary_words=boundary_words, actor=actor)
+    await commit_nodes_edges(queue, graph_id, nodes, edges)
+    if journal_path:
+        journal_correction_op(journal_path, "chunk-split", actor=actor,
+                              session_id=session_id,
+                              args={"source_id": source_id, "segment_id": segment_id,
+                                    "split_time": float(split_time),
+                                    "left_text": left_text, "right_text": right_text,
+                                    "end_time": float(end_time),
+                                    "after_segment_id": after_segment_id,
+                                    "before_segment_id": before_segment_id,
+                                    "boundary_words": dict(boundary_words or {})},
+                              anchor=await segment_anchor(
+                                  queue, graph_id,
+                                  [sid for sid in (after_segment_id, before_segment_id) if sid]),
+                              nodes=nodes, edges=edges, op_id=ids["insert_id"])
+    return ids

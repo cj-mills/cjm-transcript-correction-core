@@ -38,7 +38,8 @@ def test_journal_correction_op_envelope(tmp_path):
                                                  "prune-amendment", "mark", "mark-dismiss",
                                                  "review-markers", "session-status", "session-purpose",
                                                  "time-nudge", "chunk-insert", "chunk-insert-remove",
-                                                 "speaker-entity", "speaker-assign", "entity-rename"}
+                                                 "chunk-split", "speaker-entity", "speaker-assign",
+                                                 "entity-rename"}
 
 
 def test_replay_handlers_cover_mark_verbs():

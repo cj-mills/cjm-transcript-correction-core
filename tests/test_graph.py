@@ -533,3 +533,74 @@ def test_aggregate_session_purposes():
     assert mix["src-2"] == {"feature-test": 1}
     assert mix["src-3"] == {"spike": 1}
     assert set(mix) == {"src-1", "src-2", "src-3"}
+
+
+def test_chunk_split_composes_from_existing_verbs():
+    """Work item 99c1d2ba: a chunk SPLIT is three EXISTING verbs (right-half
+    chunk_insert + left-half replace_text + end-truncating time_nudge) that the
+    projection's text -> inserts -> nudges composition lands as [left | right]
+    with a WELDED point cut — no new projection arm. The rationale carries the
+    chunk-split group marker, and splitting the SYNTHETIC right half again
+    works uniformly (the insert-stage text/nudge lanes)."""
+    from cjm_transcript_correction_core.graph import build_chunk_split_corrections
+
+    segs = [SpineSegment(id="a", index=0, text="alpha beta gamma",
+                         start_time=0.0, end_time=6.0),
+            SpineSegment(id="b", index=1, text="tail", start_time=6.0, end_time=9.0)]
+    nodes, edges, ids = build_chunk_split_corrections(
+        "src-1", "a", 2.0, "alpha", "beta gamma", 6.0, "sess-1", "a",
+        before_segment_id="b", old_text="alpha beta gamma",
+        boundary_words={"left": "alpha", "right": "beta"})
+    assert [n["properties"]["correction_type"] for n in nodes] == [
+        "insertion", "text_content", "timing"]
+    ins, txt, ndg = nodes
+    assert ids == {"insert_id": ins["id"], "text_id": txt["id"], "nudge_id": ndg["id"]}
+    # the group marker: three ops, one human decision
+    group = f"chunk-split:{ins['id']}"
+    assert ins["properties"]["rationale"] == "chunk-split"
+    assert txt["properties"]["rationale"] == group
+    assert ndg["properties"]["rationale"] == group
+    assert ins["properties"]["payload"]["text"] == "beta gamma"
+    assert ndg["properties"]["payload"]["edits"] == [
+        {"segment_id": "a", "edge": "end", "old_time": 6.0, "new_time": 2.0}]
+
+    corrs = []
+    for n in nodes:
+        c = dict(n["properties"])
+        c["id"] = n["id"]
+        corrs.append(c)
+    eff = project_effective_spine(segs, corrs)
+    assert [s.id for s in eff] == ["a", ids["insert_id"], "b"]
+    assert (eff[0].text, eff[0].start_time, eff[0].end_time) == ("alpha", 0.0, 2.0)
+    assert (eff[1].text, eff[1].start_time, eff[1].end_time) == ("beta gamma", 2.0, 6.0)
+    # the new seam is WELDED: the existing nudge machinery owns its precision
+
+    # splitting the SYNTHETIC right half again: replace_text/nudge ride the
+    # insert-stage lanes, the new piece stacks under the shared layer-0 anchor
+    n2, e2, ids2 = build_chunk_split_corrections(
+        "src-1", ids["insert_id"], 4.0, "beta", "gamma", 6.0, "sess-1", "a",
+        before_segment_id="b")
+    for n in n2:
+        c = dict(n["properties"])
+        c["id"] = n["id"]
+        corrs.append(c)
+    eff2 = project_effective_spine(segs, corrs)
+    assert [s.id for s in eff2] == ["a", ids["insert_id"], ids2["insert_id"], "b"]
+    assert [(s.text, s.start_time, s.end_time) for s in eff2] == [
+        ("alpha", 0.0, 2.0), ("beta", 2.0, 4.0), ("gamma", 4.0, 6.0),
+        ("tail", 6.0, 9.0)]
+
+    # guards: empty halves and a cut at/after the end refuse loudly
+    for bad in ((" ", "gamma"), ("beta", "")):
+        try:
+            build_chunk_split_corrections("src-1", "a", 2.0, bad[0].strip(), bad[1],
+                                          6.0, "sess-1", "a")
+            assert False, "empty half must raise"
+        except ValueError:
+            pass
+    try:
+        build_chunk_split_corrections("src-1", "a", 6.0, "alpha", "beta", 6.0,
+                                      "sess-1", "a")
+        assert False, "split at the end must raise"
+    except ValueError:
+        pass
