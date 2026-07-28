@@ -218,9 +218,13 @@ def speaker_turn_proposals(
     cluster label across the (possibly overlapping) turns; the label with the
     most overlap wins. `coverage` = dominant overlap / segment duration — what
     the painter dims on and the accept op snapshots. Segments with no time
-    span or no overlapping turn get NO proposal (the lane shows ∅). Cluster
-    labels are result-scoped (never identities) — binding them to Entities is
-    the accept gesture's job (DEC 8a4df244 cluster-name-once)."""
+    span, no overlapping turn, or NO TEXT get NO proposal (the lane shows ∅):
+    text is the unit of attribution supervision, so empty chunks — silence,
+    inhale/bookend inserts — never propose (and never ride a bulk accept);
+    a text-bearing synthetic (a split half, an e-typed missed-speech insert)
+    proposes like any chunk (drive ask 2026-07-27). Cluster labels are
+    result-scoped (never identities) — binding them to Entities is the accept
+    gesture's job (DEC 8a4df244 cluster-name-once)."""
     out: Dict[str, Dict[str, Any]] = {}
     ts = sorted((float(t.get("start") or 0.0), float(t.get("end") or 0.0),
                  str(t.get("speaker") or "")) for t in (turns or []))
@@ -229,6 +233,8 @@ def speaker_turn_proposals(
     lo = 0
     for seg in segments:
         if seg.start_time is None or seg.end_time is None:
+            continue
+        if not (seg.text or "").strip():
             continue
         s, e = float(seg.start_time), float(seg.end_time)
         if e <= s:

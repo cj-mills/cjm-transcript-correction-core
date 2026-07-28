@@ -81,3 +81,10 @@ def test_speaker_turn_proposals_dominance_and_gaps():
     assert p["s1"]["overlap"] == 9.0  # 10-11 plus 12-20
     assert "s2" not in p and "s3" not in p
     assert speaker_turn_proposals(segs, []) == {}
+    # empty-text chunks NEVER propose (drive ask 2026-07-27): text is the unit
+    # of attribution supervision — silence chunks and inhale/bookend inserts
+    # stay ∅ even under full turn coverage; a text-bearing split half proposes
+    empty = SpineSegment(id="s4", index=4, text="  ", start_time=1.0, end_time=3.0)
+    texty = SpineSegment(id="s5", index=4, text="split tail", start_time=1.0, end_time=3.0)
+    p2 = speaker_turn_proposals([empty, texty], turns)
+    assert "s4" not in p2 and p2["s5"]["cluster"] == "SPEAKER_00"
