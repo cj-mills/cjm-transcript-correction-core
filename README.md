@@ -22,43 +22,67 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `main` _function_ — CLI entry point (console script: `cjm-transcript-correction-core`).
 - `review_command` _function_ — Execute the `review` subcommand: interactive text corrections over the flagged worklist.
 - `run_command` _function_ — Execute the `run` subcommand: correct a decomp manifest's committed spine.
+- `stats_command` _function_ — Execute the `stats` subcommand: flywheel accounting over the shared graph.
 
 ### `cjm_transcript_correction_core.graph`
 
 - `active_corrections` _function_ — Filter to the effective correction set (the layer's resolve_active over a read superseded set).
+- `active_speaker_assignments` _function_ — Project the ACTIVE speaker assignment per segment (latest-wins).
+- `aggregate_session_purposes` _function_ — Fold sessions into a per-source purpose mix (pure; d915d545 picker rung).
+- `apply_chunk_inserts` _function_ — Synthesize inserted chunks into the effective spine (DEC 3d3fa2a8).
+- `apply_time_nudges` _function_ — Apply timing corrections onto segment times (latest-wins per edge).
 - `build_boundary_shift_correction` _function_ — Build a grouping Correction that moves text across one segment boundary.
+- `build_chunk_insert_correction` _function_ — Build an insertion Correction that adds a chunk the skeleton never cut (DEC 3d3fa2a8).
+- `build_chunk_split_corrections` _function_ — Compose a chunk SPLIT from the EXISTING verbs (work item 99c1d2ba) — no
 - `build_correction_node` _function_ — Construct a Correction overlay node (pure; commit happens separately).
 - `build_mark_correction` _function_ — Build a NON-MUTATING mark Correction (DEC 2a231843: routed attention).
 - `build_prune_amendment` _function_ — Build a grouping Correction that supersedes a prune with a REDUCED set (unprune).
 - `build_prune_correction` _function_ — Build one batch grouping Correction that prunes empty segments (D14).
 - `build_reject_review` _function_ — Build a review Correction that REJECTS a prior correction (reject-as-supersede).
+- `build_speaker_assign_correction` _function_ — Build a speaker Correction — the assignment op envelope (DEC d6df3a8e).
 - `build_text_correction` _function_ — Build a text_content Correction + its CORRECTS (+ optional SUPERSEDES) edges.
+- `build_time_nudge_correction` _function_ — Build a timing Correction that nudges segment boundary TIMES (node + CORRECTS edges).
 - `commit_boundary_shift_correction` _function_ — Commit a boundary-shift correction (node + CORRECTS x2 [+ SUPERSEDES]) + REVIEWED markers on both segments.
+- `commit_chunk_insert_correction` _function_ — Commit a chunk insertion (node + CORRECTS per flank).
+- `commit_chunk_insert_removal` _function_ — Remove an inserted chunk WITHOUT touching layer-0 (reject-as-supersede).
+- `commit_chunk_split_correction` _function_ — Commit a chunk split: three composed nodes in ONE atomic batch + ONE journal op.
+- `commit_chunk_split_removal` _function_ — UNSPLIT: remove a split's right half AND its whole group (one review
 - `commit_mark_correction` _function_ — Commit a mark (node + CORRECTS per anchored segment [+ SUPERSEDES]).
 - `commit_mark_dismissal` _function_ — Dismiss an open mark WITHOUT a correction (reject-as-supersede).
 - `commit_nodes_edges` _function_ — Commit overlay nodes/edges through the layer's idempotent extend_graph.
 - `commit_prune_amendment` _function_ — Commit an unprune amendment (node + DERIVED_FROM edges + SUPERSEDES).
+- `commit_speaker_assign_correction` _function_ — Commit a speaker assignment (node + CORRECTS per segment + ASSIGNS).
+- `commit_speaker_entity` _function_ — Mint a source-spanning Entity into the shared registry (DEC 4ec6a49c).
 - `commit_text_correction` _function_ — Commit a text_content correction (node + CORRECTS [+ SUPERSEDES]) + a REVIEWED marker.
+- `commit_time_nudge_correction` _function_ — Commit a time-nudge correction (node + CORRECTS per touched segment).
+- `correction_stats` _function_ — Fold one Source's ACTIVE overlay into flywheel-accounting counts (pure).
 - `corrections_to_edits` _function_ — Map this core's Correction payloads onto the layer's spine-edit vocabulary.
-- `count_source_segments` _function_ — Count a Source's segments server-side under its chosen rendition (typed count mode).
+- `count_source_segments` _function_ — Count a Source's segments server-side under its chosen rendition + skeleton (typed count mode).
 - `find_active_text_correction` _function_ — Single-segment convenience over the batch read (cross-session; latest wins).
 - `find_active_text_corrections_batch` _function_ — Active text corrections for MANY segments in TWO round-trips (C17).
+- `find_chunk_split_group` _function_ — Resolve a split right-half's GROUP — the ac84360a group marker cashed in.
 - `find_corrections_for_session` _function_ — List corrections recorded in a session (typed property filter).
 - `find_prior_corrections_by_hash` _function_ — Cross-transcript correction-cache lookup (targeted; the graph IS the lexicon).
 - `get_session` _function_ — Fetch a CorrectionSession node by id (resume/reopen) — typed get, dict shape preserved.
+- `list_source_spines` _function_ — The SPINES coexisting under a Source's chosen rendition (DEC f1024568).
+- `list_speaker_entities` _function_ — Read the source-spanning entity registry (the picker's registry tier).
 - `load_empty_segments` _function_ — Load ONLY a Source's empty-text segments under its chosen rendition (D14 prune).
 - `load_review_markers` _function_ — Load a session's review markers (typed edge projection over REVIEWED edges).
 - `load_source_corrections` _function_ — Load every Correction targeting a Source (across sessions) + the superseded-id set.
-- `load_source_segments` _function_ — Load a Source's fine Segment spine under its chosen rendition (typed query surface).
+- `load_source_segments` _function_ — Load a Source's fine Segment spine under its chosen rendition + skeleton (typed query surface).
 - `load_variant_texts` _function_ — Resolve per-transcriber chunk texts from the segments' CharSlice refs.
 - `mark_anchor_segments` _function_ — Validate a mark anchor and list the Segment ids it touches.
 - `open_marks` _function_ — Filter to the OPEN marks — the pass-2 worklist ('query open marks, walk them').
 - `project_effective_spine` _function_ — Project the effective spine = layer-0 + applied corrections.
 - `reanchor_span` _function_ — Re-locate a span anchor in text that may have been edited since mark time.
 - `record_review_markers` _function_ — Persist per-(session, segment) review markers as REVIEWED edges.
+- `rename_speaker_entity` _function_ — Rename an Entity on its STABLE id — identification IS a rename (DEC 484e2d74).
 - `resolve_source_renditions` _function_ — Pick the AudioRendition set whose fine Segment spine correction operates on.
+- `session_purposes_by_source` _function_ — Read every CorrectionSession once and fold the per-source purpose mix.
+- `set_session_purpose` _function_ — Update a session's purpose + updated_at (the test-session hygiene tag, DEC c86714a4).
 - `set_session_status` _function_ — Update a session's status + updated_at.
 - `source_audio_segment_ids` _function_ — The Source's coarse spine (one small typed read; ordered by index).
+- `spine_where_for` _function_ — Resolve a skeleton selector against the observed spine set (pure).
 - `start_session` _function_ — Create + commit a new CorrectionSession node.
 - `submit_and_wait` _function_ — Submit one capability job, wait for it, return its result (raise on failure).
 
@@ -75,6 +99,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `CorrectionManifest` _class_ — Durable record of one correction run (proto-bundle; chainable, CR-20).
 - `CorrectionRelations` _class_ — Registry of edge types the correction overlay adds to the spine graph.
 - `CorrectionSession` _class_ — A resumable, reopen-able correction review over one or more sources.
+- `Entity` _class_ — A source-spanning identity in the shared entity substrate (DEC 4ec6a49c).
 - `SpineSegment` _class_ — A committed layer-0 Segment loaded from the graph (read view).
 - `WorklistItem` _class_ — One spine segment surfaced for review, with its deterministic Tier-1 flags.
 - `new_run_id` _function_ — Generate a unique, sortable correction run id.
@@ -100,9 +125,10 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `fa_coverage_flags` _function_ — Flag segments whose forced-alignment coverage looks suspect (Tier-1).
 - `levenshtein` _function_ — Levenshtein edit distance (pure, in-core; variant-clustering primitive).
 - `phonetic_key` _function_ — Compute a coarse phonetic key for a word (groups like-sounding variants).
+- `speaker_turn_proposals` _function_ — Dominant diarization cluster per segment — the assign lane's proposal paint.
 - `variant_divergence` _function_ — Within-segment cross-transcriber divergence (stage 5: intra-graph).
 
 ## Dependencies
 
 **Depends on:** `cjm-context-graph-layer`, `cjm-context-graph-primitives`, `cjm-substrate`, `cjm-transcript-graph-schema`
-**Used by:** `cjm-transcript-correction-tui`
+**Used by:** `cjm-transcript-correction-tui`, `cjm-workflow-hub-tui`
