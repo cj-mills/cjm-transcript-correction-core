@@ -188,6 +188,7 @@ def new_run_id() -> str:  # e.g. "correct_20260608_153000_1a2b3c4d"
 RECOMMENDED_MARK_CLASSES = (
     "hesitation-omission",     # single Um / 'you know' slots dropped (fill dominates)
     "repeat-omission",         # dropped repeated words/stutters — the omission-entangled boundary case
+    "false-start",             # speaker restarts mid-segment (self-correction; words often unpinnable — distinct from full repeats; user-minted 2026-07-28)
     "meta-speech-omission",    # spoken 'Quote' / 'End Quote' markers dropped
     "meta-speech-executed",    # meta-speech rendered AS punctuation instead
     "homophone-substitution",  # context-vs-acoustics substitution (where/were)

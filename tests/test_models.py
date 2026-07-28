@@ -87,5 +87,6 @@ def test_entity_and_speaker_vocabulary():
     assert n.properties["canonical_name"] == "HH montage narrator"
     assert "id" not in n.properties
     assert "ASSIGNS" in CorrectionRelations.all()
-    for mc in ("speaker-merge", "voiced-quote", "persona-shift", "speaker-unresolved"):
+    for mc in ("speaker-merge", "voiced-quote", "persona-shift", "speaker-unresolved",
+               "false-start"):
         assert mc in RECOMMENDED_MARK_CLASSES
