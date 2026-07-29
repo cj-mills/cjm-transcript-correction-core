@@ -44,7 +44,7 @@ def test_spine_segment_and_worklist_item():
 
 
 def test_correction_relations_registry():
-    assert set(CorrectionRelations.all()) == {"CORRECTS", "SUPERSEDES", "DERIVED_FROM", "REVIEWED", "ASSIGNS"}
+    assert set(CorrectionRelations.all()) == {"CORRECTS", "SUPERSEDES", "DERIVED_FROM", "REVIEWED", "ASSIGNS", "GATES"}
 
 
 def test_manifest_shape_and_run_id():

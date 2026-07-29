@@ -19,6 +19,7 @@ class CorrectionRelations:
     DERIVED_FROM = "DERIVED_FROM"  # grouping Correction -> the layer-0 Segments it regroups/prunes
     REVIEWED = "REVIEWED"          # CorrectionSession -> Segment (carries a `decision` property)
     ASSIGNS = "ASSIGNS"            # speaker Correction -> the Entity it assigns (DEC d6df3a8e)
+    GATES = "GATES"                # ExtractionGate assertion -> the Source whose spine it gates (DEC 8e05b87b)
 
     @classmethod
     def all(cls) -> list:  # All relation type strings
@@ -241,3 +242,39 @@ class Entity:
         """Map onto a generic GraphNode (None-valued fields excluded from properties)."""
         props = {k: v for k, v in asdict(self).items() if k != "id" and v is not None}
         return GraphNode(id=self.id, label="Entity", properties=props, sources=[])
+
+
+# The extraction-gate status vocabulary (DEC 8e05b87b): in_progress is the DEFAULT
+# for any spine with no assertion — a bare boolean would either poison frame-level
+# training with false-negative frames from the unvisited tail or exclude every
+# partially-annotated spine; the annotated_through watermark carries the real boundary.
+EXTRACTION_STATUSES = ("in_progress", "signed_off", "excluded")
+
+
+@dataclass
+class ExtractionGate:
+    """One per-spine extraction-gate ASSERTION (DEC 8e05b87b — flywheel build leg 1).
+
+    Spine-level state, not a correction: extraction_status gates whether a spine's
+    overlay feeds dataset extraction, and `annotated_through` is the LOAD-BEARING
+    watermark — label absence means true-negative only BELOW it (above = unvisited).
+    Append-only like every overlay verb: rescind/update = a NEW assertion; the read
+    is latest-wins per (source_id, skeleton_hash) and the chain is the full history.
+    The spine is named by (source_id, skeleton_hash) — None hash = the pre-split
+    legacy spine, matching the f1024568 spine-identity vocabulary."""
+    source_id: str                                         # Source whose spine is gated
+    skeleton_hash: Optional[str] = None                    # Which SKELETON spine (None = legacy pre-split)
+    extraction_status: str = "in_progress"                 # EXTRACTION_STATUSES member
+    annotated_through: Optional[float] = None              # Watermark (source-coordinate seconds); None = nothing visited
+    session_id: Optional[str] = None                       # CorrectionSession context (None = CLI assert)
+    actor: str = "human"                                   # Who asserted
+    created_at: float = field(default_factory=time.time)   # Unix timestamp (latest-wins key)
+    id: str = field(default_factory=lambda: str(uuid4()))  # Generated node id (assertion = event)
+
+    def to_graph_node(self) -> GraphNode:  # Generic graph node
+        """Map onto a generic GraphNode (None-valued fields excluded from properties,
+        EXCEPT skeleton_hash — spine identity must round-trip: absent-vs-None cannot
+        be ambiguous when the legacy spine is a real gate target)."""
+        props = {k: v for k, v in asdict(self).items() if k != "id" and v is not None}
+        props["skeleton_hash"] = self.skeleton_hash
+        return GraphNode(id=self.id, label="ExtractionGate", properties=props, sources=[])

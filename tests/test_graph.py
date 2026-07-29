@@ -699,3 +699,63 @@ def test_correction_stats_accounting():
     st2 = correction_stats(genuine, {"i4", "m3"})
     assert st2["insert_labels"] == {"inhale": 1, "(unlabeled)": 1}
     assert st2["mark_classes"] == {"inhale": 1}
+
+
+def test_extraction_gate_build_and_latest_wins():
+    """DEC 8e05b87b: gate assertions are append-only spine state — build shape
+    (node + GATES edge), status validation, and the latest-wins per-spine fold."""
+    from cjm_transcript_correction_core.graph import (build_extraction_gate_assertion,
+                                                      latest_extraction_gates)
+    import pytest
+
+    node, edges = build_extraction_gate_assertion(
+        "src1", "sha256:abc", "in_progress", 2016.2, session_id="sess1")
+    assert node["label"] == "ExtractionGate"
+    p = node["properties"]
+    assert p["source_id"] == "src1" and p["skeleton_hash"] == "sha256:abc"
+    assert p["extraction_status"] == "in_progress"
+    assert p["annotated_through"] == 2016.2
+    assert len(edges) == 1 and edges[0]["relation_type"] == "GATES"
+    assert edges[0]["target_id"] == "src1" and edges[0]["source_id"] == node["id"]
+
+    # the LEGACY spine (None hash) must round-trip explicitly, never be ambiguous
+    lnode, _ = build_extraction_gate_assertion("src1", None, "excluded", None)
+    assert lnode["properties"]["skeleton_hash"] is None
+    assert "annotated_through" not in lnode["properties"]
+
+    with pytest.raises(ValueError):
+        build_extraction_gate_assertion("src1", None, "done", 1.0)  # not a status
+    with pytest.raises(ValueError):
+        build_extraction_gate_assertion("src1", None, "signed_off", -3.0)
+
+    # latest-wins per (skeleton_hash): a rescind is just a newer assertion
+    a1 = {"id": "g1", "skeleton_hash": "sha256:abc", "extraction_status": "in_progress",
+          "annotated_through": 100.0, "created_at": 1.0}
+    a2 = {"id": "g2", "skeleton_hash": "sha256:abc", "extraction_status": "signed_off",
+          "annotated_through": 2500.0, "created_at": 2.0}
+    a3 = {"id": "g3", "skeleton_hash": None, "extraction_status": "excluded",
+          "created_at": 1.5}
+    live = latest_extraction_gates([a2, a3, a1])   # order-independent
+    assert live["sha256:abc"]["id"] == "g2"        # newest wins
+    assert live[None]["extraction_status"] == "excluded"
+    assert live.get("sha256:other") is None        # absent spine = caller's default
+
+
+def test_skeleton_hash_for_selector_semantics():
+    """The gate's spine-identity resolver mirrors spine_where_for: auto on a sole
+    spine, "legacy" = None, prefix match on hash, loud refusal when ambiguous."""
+    from cjm_transcript_correction_core.graph import skeleton_hash_for
+    import pytest
+
+    sole = [{"skeleton_hash": None, "split_policy": None, "segments": 10}]
+    assert skeleton_hash_for(sole, None) is None
+    assert skeleton_hash_for([], None) is None      # pre-decomposition: sole spine to come
+
+    h = "sha256:abcdef012345"
+    both = [{"skeleton_hash": None, "split_policy": None, "segments": 10},
+            {"skeleton_hash": h, "split_policy": "sentence-v1", "segments": 12}]
+    with pytest.raises(ValueError):
+        skeleton_hash_for(both, None)                # coexisting spines refuse auto
+    assert skeleton_hash_for(both, "legacy") is None
+    assert skeleton_hash_for(both, "abcdef") == h    # hex-tail prefix
+    assert skeleton_hash_for([both[1]], None) == h   # sole split spine auto-resolves

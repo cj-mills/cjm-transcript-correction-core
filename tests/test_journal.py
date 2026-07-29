@@ -40,7 +40,7 @@ def test_journal_correction_op_envelope(tmp_path):
                                                  "time-nudge", "chunk-insert", "chunk-insert-remove",
                                                  "chunk-split", "chunk-split-remove",
                                                  "speaker-entity", "speaker-assign",
-                                                 "entity-rename"}
+                                                 "entity-rename", "extraction-gate"}
 
 
 def test_replay_handlers_cover_mark_verbs():

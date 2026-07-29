@@ -16,7 +16,8 @@ from cjm_context_graph_primitives.query import (EdgeQuery, EdgeQueryResult, Node
 from cjm_substrate.core.queue import JobQueue, JobStatus
 from cjm_transcript_correction_core.journal import journal_correction_op, segment_anchor
 from cjm_transcript_correction_core.models import (Correction, CorrectionRelations,
-                                                   CorrectionSession, Entity, SpineSegment)
+                                                   CorrectionSession, Entity, EXTRACTION_STATUSES,
+                                                   ExtractionGate, SpineSegment)
 from cjm_transcript_graph_schema.schema import TranscriptGraphLabels
 
 # Stage 4: the typed query surface — importing the result classes IS the
@@ -1913,3 +1914,121 @@ def correction_stats(
     return {"active": len(active), "ops": ops, "insert_labels": insert_labels,
             "splits": splits, "open_marks": len(marks),
             "mark_classes": mark_classes}
+
+
+def skeleton_hash_for(
+    spines: List[Dict[str, Any]],    # _list_spines rows ({"skeleton_hash", "split_policy", "segments"})
+    selector: Optional[str] = None,  # "legacy" | a skeleton-hash (prefix ok) | None = auto
+) -> Optional[str]:  # The chosen spine's skeleton_hash (None = the legacy pre-split spine)
+    """Resolve a skeleton selector to the chosen spine's HASH (pure) — the gate's
+    spine-identity half of spine_where_for's predicate answer.
+
+    Same selector semantics (auto refuses when several coexist; "legacy" = None);
+    the extraction gate needs the spine NAMED, not filtered, so this maps the
+    resolved where-predicates back to the identity value. No spines = None (a
+    gate asserted before decomposition still names the sole spine to come)."""
+    preds = spine_where_for(spines, selector)
+    if not preds:
+        return spines[0]["skeleton_hash"] if spines else None
+    p = preds[0]
+    return None if p.op == "is_null" else p.value
+
+
+def build_extraction_gate_assertion(
+    source_id: str,                        # Source whose spine is gated
+    skeleton_hash: Optional[str],          # Which SKELETON spine (None = legacy pre-split)
+    extraction_status: str,                # EXTRACTION_STATUSES member
+    annotated_through: Optional[float],    # Watermark (source seconds); None = keep nothing-visited
+    session_id: Optional[str] = None,      # CorrectionSession context (None = CLI assert)
+    actor: str = "human",                  # Actor
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (assertion node dict, edge dicts)
+    """Build one extraction-gate ASSERTION (DEC 8e05b87b — flywheel build leg 1).
+
+    Append-only spine state, never a correction: the node records status +
+    watermark for ONE spine (source_id, skeleton_hash), and the read is
+    latest-wins per spine — rescind = a newer assertion, full history kept.
+    The watermark is set EXPLICITLY (on pause, or at end-of-source for
+    sign-off), never derived from op positions: derivation underestimates when
+    good models cause op-free paging. A GATES edge anchors the Source so gate
+    assertions surface in source-scoped graph reads."""
+    if extraction_status not in EXTRACTION_STATUSES:
+        raise ValueError(f"extraction_status must be one of {EXTRACTION_STATUSES}, "
+                         f"got {extraction_status!r}")
+    if annotated_through is not None and float(annotated_through) < 0.0:
+        raise ValueError(f"annotated_through must be >= 0, got {annotated_through}")
+    gate = ExtractionGate(
+        source_id=source_id, skeleton_hash=skeleton_hash,
+        extraction_status=extraction_status,
+        annotated_through=(float(annotated_through) if annotated_through is not None else None),
+        session_id=session_id, actor=actor)
+    node = gate.to_graph_node()
+    edges = [make_edge(node.id, source_id, CorrectionRelations.GATES)]
+    return node.to_dict(), edges
+
+
+async def commit_extraction_gate(
+    queue: JobQueue,                     # Started job queue
+    graph_id: str,                       # Graph-storage capability id
+    source_id: str,                      # Source whose spine is gated
+    skeleton_hash: Optional[str],        # Which SKELETON spine (None = legacy pre-split)
+    extraction_status: str,              # EXTRACTION_STATUSES member
+    annotated_through: Optional[float],  # Watermark (source seconds)
+    session_id: Optional[str] = None,    # CorrectionSession context (None = CLI assert)
+    actor: str = "human",                # Actor
+    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+) -> str:  # The new ExtractionGate assertion node id
+    """Commit one extraction-gate assertion (node + GATES edge) — the journaled
+    per-spine gate write (DEC 8e05b87b).
+
+    No segment anchor: the gate is SPINE-level state (the ccbab9f5 anchor scope
+    covers correction ops); the args carry the full spine identity + status +
+    watermark, so extraction (leg 2) reads its inputs straight off the journal
+    row as well as the graph."""
+    node, edges = build_extraction_gate_assertion(
+        source_id, skeleton_hash, extraction_status, annotated_through,
+        session_id=session_id, actor=actor)
+    await commit_nodes_edges(queue, graph_id, [node], edges)
+    if journal_path:
+        journal_correction_op(journal_path, "extraction-gate", actor=actor,
+                              session_id=session_id or "",
+                              args={"source_id": source_id,
+                                    "skeleton_hash": skeleton_hash,
+                                    "extraction_status": extraction_status,
+                                    "annotated_through": annotated_through},
+                              nodes=[node], edges=edges, op_id=node["id"])
+    return node["id"]
+
+
+def latest_extraction_gates(
+    assertions: List[Dict[str, Any]],  # ExtractionGate property dicts (id included), any order
+) -> Dict[Optional[str], Dict[str, Any]]:  # skeleton_hash -> the LATEST assertion (the live gate)
+    """Fold gate assertions into the live per-spine gate state (pure; latest-wins).
+
+    The DEC 8e05b87b projection: assertions are append-only events, the newest
+    created_at per (skeleton_hash) IS the gate — a rescind is just a newer
+    assertion, and the fold keeps the whole chain queryable behind it. Callers
+    holding one Source's assertions get one entry per coexisting spine; a spine
+    with NO entry defaults to in_progress with no watermark (nothing visited —
+    no negative region is valid)."""
+    out: Dict[Optional[str], Dict[str, Any]] = {}
+    for a in sorted(assertions, key=lambda a: float(a.get("created_at") or 0.0)):
+        out[a.get("skeleton_hash")] = a
+    return out
+
+
+async def load_extraction_gates(
+    queue: JobQueue,  # Started job queue
+    graph_id: str,    # Graph-storage capability id
+    source_id: str,   # Source whose gate assertions to read
+) -> Dict[Optional[str], Dict[str, Any]]:  # skeleton_hash -> the live gate assertion
+    """Read one Source's live per-spine extraction gates (typed property filter).
+
+    Gates are assertion-scale (a handful per source), so this reads the whole
+    chain and folds latest-wins client-side (latest_extraction_gates). Absent
+    spine entry = the in_progress default with no watermark — callers render
+    or extract against that default, never a stored one (DEC 8e05b87b)."""
+    q = NodeQuery(label="ExtractionGate",
+                  where=[PropertyPredicate("source_id", "eq", source_id)])
+    res = await graph_task(queue, graph_id, "query_nodes", query=q.to_dict())
+    return latest_extraction_gates(
+        [_node_to_correction_dict(n) for n in (res.nodes or [])])

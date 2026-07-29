@@ -35,3 +35,19 @@ def test_review_subcommand():
     assert ns.review_max == 5
     assert ns.session == "sess1" and ns.reopen is True
     assert ns.rendition == "raw"
+
+
+def test_gate_subcommand():
+    """The gate surface (DEC 8e05b87b): show mode needs no --source; assert mode
+    validates --status against the EXTRACTION_STATUSES vocabulary."""
+    p = build_parser()
+    ns = p.parse_args(["gate"])
+    assert ns.command == "gate" and ns.status is None and ns.source is None
+    ns = p.parse_args(["gate", "--source", "Chris", "--status", "in_progress",
+                       "--annotated-through", "2016.2"])
+    assert ns.status == "in_progress" and ns.annotated_through == "2016.2"
+    ns = p.parse_args(["gate", "--source", "x", "--status", "signed_off",
+                       "--annotated-through", "end"])
+    assert ns.annotated_through == "end"
+    with pytest.raises(SystemExit):
+        p.parse_args(["gate", "--status", "done"])   # not in the vocabulary
