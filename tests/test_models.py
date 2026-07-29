@@ -90,3 +90,39 @@ def test_entity_and_speaker_vocabulary():
     for mc in ("speaker-merge", "voiced-quote", "persona-shift", "speaker-unresolved",
                "false-start"):
         assert mc in RECOMMENDED_MARK_CLASSES
+
+
+def test_dataset_manifest_shape_and_save(tmp_path):
+    """DEC 16159e09: the DatasetManifest extends the chainable pattern — format
+    tag + version + consumed pointers + policies as DATA — and saves via the
+    same WS-token discipline as the run manifest."""
+    import json
+    from cjm_transcript_correction_core.models import DatasetManifest, new_dataset_id
+
+    did = new_dataset_id()
+    assert did.startswith("dataset_")
+
+    m = DatasetManifest(
+        dataset_id=did, created_at=1.0,
+        config={"graph_capability": "cjm-capability-graph-sqlite",
+                "include_purposes": ["genuine"]},
+        graph_db_path="/x/context_graph.db",
+        journals=["/x/context_graph.writes.jsonl"],
+        session_purpose_policy={"include": ["genuine"], "unset_means": "genuine"},
+        split_policy={"policy": "tail-reservation"},
+        augmentation_policy={"policy": "none"},
+        class_vocabulary={"inhale": 2},
+        spines=[{"source_id": "s1", "skeleton_hash": "sha256:abc",
+                 "extraction_status": "in_progress", "annotated_through": 2016.2,
+                 "eligible": True, "examples": 2}],
+        files={"events": "events.jsonl", "regions": "regions.jsonl"},
+        counts={"examples": 2, "negative_regions": 3})
+    d = m.to_dict()
+    assert d["format"] == "cjm-transcript-correction-core/dataset-manifest"
+    assert d["version"] == "0.1.0"
+    assert d["split_policy"]["policy"] == "tail-reservation"   # policy is DATA
+    assert d["spines"][0]["annotated_through"] == 2016.2       # gate @ extraction time
+
+    out = m.save(tmp_path / "ds" / "manifest.json")
+    loaded = json.loads(out.read_text())
+    assert loaded == json.loads(json.dumps(d))                  # round-trips losslessly

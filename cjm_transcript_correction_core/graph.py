@@ -2032,3 +2032,144 @@ async def load_extraction_gates(
     res = await graph_task(queue, graph_id, "query_nodes", query=q.to_dict())
     return latest_extraction_gates(
         [_node_to_correction_dict(n) for n in (res.nodes or [])])
+
+
+def labeled_insert_spans(
+    segments: List[SpineSegment],       # Ordered layer-0 spine (ONE skeleton's segments)
+    corrections: List[Dict[str, Any]],  # One Source's corrections (all sessions)
+    superseded_ids: set,                # SUPERSEDES targets (GLOBAL — supersession is spine state)
+) -> List[Dict[str, Any]]:  # Span records ordered by (start_time, end_time)
+    """Fold the ACTIVE chunk inserts into span records with op-chain provenance (pure).
+
+    The flywheel's positive-span fold (leg 2, DEC 16159e09; the spike 493b8b9e
+    schemas are the positive spec): each surviving insert is one span — final
+    times from the effective projection (nudges grow zero-width inserts), text
+    latest-wins (the e-edit lane), `speech` derived from text presence
+    (label = class, text = verbatim). Split right halves are boundary
+    decisions, never labeled spans (the correction_stats rule); unlabeled
+    inserts ride with label None so callers can occupy without exampling.
+    Provenance = the op CHAIN that touched the synthetic id (the insert, text
+    edits, nudges — superseded links included) so every span re-derives from
+    the journal record; `session_id` is the OWNING session (the purpose-policy
+    cut key), `session_ids` the chain's full set."""
+    actives = active_corrections(corrections, superseded_ids)
+    inserts = {c["id"]: c for c in actives
+               if c.get("correction_type") == "insertion"
+               and (c.get("payload") or {}).get("operation") == "chunk_insert"
+               and c.get("rationale") != "chunk-split"}
+    if not inserts:
+        return []
+    effective = {s.id: s for s in project_effective_spine(segments, actives)
+                 if s.id in inserts}
+    touches: Dict[str, List[Dict[str, Any]]] = {iid: [] for iid in inserts}
+    for c in corrections:  # ANY status: provenance is the chain, not the survivors
+        p = c.get("payload") or {}
+        if p.get("segment_id") in touches:
+            touches[p["segment_id"]].append(c)
+        elif c.get("correction_type") == "timing" and p.get("operation") == "time_nudge":
+            for e in p.get("edits") or []:
+                if e.get("segment_id") in touches:
+                    touches[e["segment_id"]].append(c)
+                    break
+    out: List[Dict[str, Any]] = []
+    for iid, c in inserts.items():
+        row = effective.get(iid)
+        if row is None or row.start_time is None or row.end_time is None:
+            continue  # another skeleton's anchors (spine-scoped drop) or untimed
+        chain = [c] + sorted(touches[iid], key=lambda t: float(t.get("created_at") or 0.0))
+        out.append({
+            "insert_id": iid,
+            "label": (c.get("payload") or {}).get("label"),
+            "text": row.text or "",
+            "speech": bool((row.text or "").strip()),
+            "start_time": float(row.start_time),
+            "end_time": float(row.end_time),
+            "session_id": str(c.get("session_id") or ""),
+            "session_ids": sorted({str(t.get("session_id")) for t in chain
+                                   if t.get("session_id")}),
+            "op_ids": list(dict.fromkeys(t["id"] for t in chain)),
+        })
+    out.sort(key=lambda r: (r["start_time"], r["end_time"]))
+    return out
+
+
+def negative_regions(
+    occupied: List[Tuple[float, float]],  # Accounted spans (speech + EVERY insert span, any purpose)
+    watermark: Optional[float],           # annotated_through (None = nothing visited)
+) -> List[Tuple[float, float]]:  # Maximal unaccounted gaps within [0, watermark]
+    """Complement the accounted spans below the watermark (pure; DEC 8e05b87b).
+
+    Label absence is a TRUE negative only BELOW annotated_through — above it
+    absence means unvisited, and emitting the tail would poison training with
+    false-negative frames from the reserved bench. Spans clip to
+    [0, watermark], overlaps merge, and the gaps between them are the negative
+    regions. The caller occupies with EVERY span whatever its session purpose:
+    an excluded-purpose span is UNKNOWN there, never a negative."""
+    if watermark is None or float(watermark) <= 0.0:
+        return []
+    wm = float(watermark)
+    spans = sorted((max(0.0, float(a)), min(wm, float(b)))
+                   for a, b in occupied if a is not None and b is not None)
+    spans = [(a, b) for a, b in spans if b > a]
+    out: List[Tuple[float, float]] = []
+    cursor = 0.0
+    for a, b in spans:
+        if a > cursor:
+            out.append((cursor, a))
+        cursor = max(cursor, b)
+    if cursor < wm:
+        out.append((cursor, wm))
+    return out
+
+
+def extract_spine_dataset(
+    segments: List[SpineSegment],       # Ordered layer-0 spine (ONE skeleton's segments)
+    corrections: List[Dict[str, Any]],  # One Source's corrections (all sessions)
+    superseded_ids: set,                # SUPERSEDES targets (GLOBAL)
+    gate: Optional[Dict[str, Any]],     # Live gate assertion (None = the in_progress default)
+    include_session_ids: Optional[set] = None,  # Sessions whose spans qualify as EXAMPLES (None = all; the purpose-policy cut)
+) -> Dict[str, Any]:  # {"eligible","status","watermark","examples","speech","negatives","skipped"}
+    """Fold ONE spine's overlay into its v1 insert-span dataset slice (pure).
+
+    The leg-2 extraction fold (DECs d02a38d4 + 16159e09 + 8e05b87b): the GATE
+    decides eligibility — excluded spines skip, and no watermark means nothing
+    visited, nothing extractable. EXAMPLES are the labeled active insert spans
+    from included-purpose sessions starting below the watermark (above it =
+    the reserved tail, DEC 8cf12c22 — never extracted). SPEECH regions derive
+    from text presence on the effective spine, clipped at the watermark.
+    NEGATIVES are the unaccounted gaps below the watermark — occupied by EVERY
+    span (any purpose, labeled or not) plus speech, so an excluded span's
+    region stays unknown rather than poisoning the negatives. Skips are
+    COUNTED, never silent: unlabeled / above_watermark / session_purpose."""
+    status = str((gate or {}).get("extraction_status") or "in_progress")
+    wm = (gate or {}).get("annotated_through")
+    base = {"status": status, "watermark": (float(wm) if wm is not None else None)}
+    if status == "excluded" or wm is None:
+        return {**base, "eligible": False, "examples": [], "speech": [],
+                "negatives": [], "skipped": {}}
+    wm = float(wm)
+    spans = labeled_insert_spans(segments, corrections, superseded_ids)
+    examples: List[Dict[str, Any]] = []
+    skipped: Dict[str, int] = {}
+    for r in spans:
+        if not r["label"]:
+            skipped["unlabeled"] = skipped.get("unlabeled", 0) + 1
+        elif r["start_time"] >= wm:
+            skipped["above_watermark"] = skipped.get("above_watermark", 0) + 1
+        elif include_session_ids is not None and r["session_id"] not in include_session_ids:
+            skipped["session_purpose"] = skipped.get("session_purpose", 0) + 1
+        else:
+            examples.append(r)
+    actives = active_corrections(corrections, superseded_ids)
+    speech = [{"segment_id": s.id, "start_time": float(s.start_time),
+               "end_time": min(float(s.end_time), wm)}
+              for s in project_effective_spine(segments, actives)
+              if (s.text or "").strip()
+              and s.start_time is not None and s.end_time is not None
+              and float(s.start_time) < wm and float(s.end_time) > float(s.start_time)]
+    occupied = ([(r["start_time"], r["end_time"]) for r in spans]
+                + [(s["start_time"], s["end_time"]) for s in speech])
+    return {**base, "eligible": True, "examples": examples, "speech": speech,
+            "negatives": [{"start_time": a, "end_time": b}
+                          for a, b in negative_regions(occupied, wm)],
+            "skipped": skipped}

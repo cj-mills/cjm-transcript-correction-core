@@ -759,3 +759,129 @@ def test_skeleton_hash_for_selector_semantics():
     assert skeleton_hash_for(both, "legacy") is None
     assert skeleton_hash_for(both, "abcdef") == h    # hex-tail prefix
     assert skeleton_hash_for([both[1]], None) == h   # sole split spine auto-resolves
+
+
+def test_labeled_insert_spans_fold():
+    """Leg-2 positive-span fold (DEC 16159e09): final times from the effective
+    projection (nudges grow zero-width inserts), text latest-wins, split right
+    halves and superseded inserts drop, unlabeled inserts ride with label None,
+    and provenance is the full op chain on the synthetic id."""
+    from cjm_transcript_correction_core.graph import labeled_insert_spans
+    from cjm_transcript_correction_core.models import SpineSegment
+
+    segments = [
+        SpineSegment(id="a", index=0, text="hello world", start_time=0.0, end_time=10.0),
+        SpineSegment(id="b", index=1, text="", start_time=10.0, end_time=20.0),
+        SpineSegment(id="c", index=2, text="more text", start_time=20.0, end_time=30.0),
+    ]
+
+    def corr(cid, ctype, payload, session="s1", rationale=None, created=1.0):
+        return {"id": cid, "correction_type": ctype, "payload": payload,
+                "session_id": session, "rationale": rationale, "created_at": created}
+
+    corrections = [
+        # zero-width inhale, grown by a later nudge (the isolation pattern)
+        corr("i1", "insertion", {"operation": "chunk_insert", "after_segment_id": "a",
+                                 "start_time": 10.0, "end_time": 10.0, "text": "",
+                                 "label": "inhale"}, session="g", created=1.0),
+        corr("n1", "timing", {"operation": "time_nudge",
+                              "edits": [{"segment_id": "i1", "edge": "end",
+                                         "old_time": 10.0, "new_time": 10.6}]},
+             session="g", created=2.0),
+        # hesitation-marker whose verbatim text arrives by e-edit
+        corr("i2", "insertion", {"operation": "chunk_insert", "after_segment_id": "b",
+                                 "start_time": 15.0, "end_time": 15.4, "text": "",
+                                 "label": "hesitation-marker"}, session="g", created=3.0),
+        corr("t2", "text_content", {"operation": "replace_text", "segment_id": "i2",
+                                    "new_text": "um"}, session="g", created=4.0),
+        # split right half: a boundary decision, never a labeled span
+        corr("sp", "insertion", {"operation": "chunk_insert", "after_segment_id": "a",
+                                 "start_time": 5.0, "end_time": 10.0, "text": "world"},
+             rationale="chunk-split", created=5.0),
+        # superseded insert drops from the effective view entirely
+        corr("i3", "insertion", {"operation": "chunk_insert", "after_segment_id": "c",
+                                 "start_time": 22.0, "end_time": 22.3,
+                                 "label": "inhale"}, created=6.0),
+        # unlabeled insert rides with label None (occupies, never examples)
+        corr("i4", "insertion", {"operation": "chunk_insert", "after_segment_id": "c",
+                                 "start_time": 25.0, "end_time": 25.2, "text": ""},
+             session="t", created=7.0),
+    ]
+    spans = labeled_insert_spans(segments, corrections, {"i3"})
+    assert [s["insert_id"] for s in spans] == ["i1", "i2", "i4"]
+
+    i1, i2, i4 = spans
+    assert i1["label"] == "inhale" and not i1["speech"]
+    assert i1["start_time"] == 10.0 and i1["end_time"] == 10.6   # nudge grew the edge
+    assert i1["op_ids"] == ["i1", "n1"] and i1["session_id"] == "g"
+    assert i2["label"] == "hesitation-marker"
+    assert i2["text"] == "um" and i2["speech"]                   # e-edit latest-wins
+    assert i2["op_ids"] == ["i2", "t2"]
+    assert i4["label"] is None and i4["session_id"] == "t"
+
+
+def test_negative_regions_watermark():
+    """DEC 8e05b87b: label absence is a true negative only BELOW the watermark —
+    no watermark yields NOTHING, spans clip/merge, the tail is never emitted."""
+    from cjm_transcript_correction_core.graph import negative_regions
+
+    assert negative_regions([], None) == []            # nothing visited
+    assert negative_regions([(2.0, 4.0)], 0.0) == []
+    assert negative_regions([], 10.0) == [(0.0, 10.0)]  # visited, all unaccounted
+    # overlap merge + clip at the watermark
+    assert negative_regions([(2.0, 4.0), (3.0, 6.0), (8.0, 12.0)], 10.0) \
+        == [(0.0, 2.0), (6.0, 8.0)]
+    # spans above the watermark and zero-width spans occupy nothing
+    assert negative_regions([(12.0, 15.0)], 10.0) == [(0.0, 10.0)]
+    assert negative_regions([(5.0, 5.0)], 10.0) == [(0.0, 10.0)]
+
+
+def test_extract_spine_dataset_gate_and_policy():
+    """The leg-2 orchestrating fold: the gate decides eligibility, the purpose
+    policy cuts EXAMPLES (skips counted, never silent), every span occupies for
+    the negative fold whatever its purpose, and speech clips at the watermark."""
+    from cjm_transcript_correction_core.graph import extract_spine_dataset
+    from cjm_transcript_correction_core.models import SpineSegment
+
+    segments = [
+        SpineSegment(id="a", index=0, text="hello", start_time=0.0, end_time=10.0),
+        SpineSegment(id="b", index=1, text="", start_time=10.0, end_time=20.0),
+        SpineSegment(id="c", index=2, text="tail speech", start_time=20.0, end_time=30.0),
+    ]
+
+    def ins(cid, start, end, label=None, session="g"):
+        p = {"operation": "chunk_insert", "after_segment_id": "b",
+             "start_time": start, "end_time": end, "text": ""}
+        if label:
+            p["label"] = label
+        return {"id": cid, "correction_type": "insertion", "payload": p,
+                "session_id": session, "created_at": start}
+
+    corrections = [
+        ins("i1", 10.0, 10.6, label="inhale", session="g"),
+        ins("i2", 12.0, 12.5, label="inhale", session="t"),   # excluded purpose
+        ins("i3", 13.0, 13.5),                                # unlabeled
+        ins("i4", 16.0, 16.5, label="inhale", session="g"),   # reserved tail
+    ]
+    gate = {"extraction_status": "in_progress", "annotated_through": 15.0}
+    r = extract_spine_dataset(segments, corrections, set(), gate,
+                              include_session_ids={"g"})
+    assert r["eligible"] and r["status"] == "in_progress" and r["watermark"] == 15.0
+    assert [e["insert_id"] for e in r["examples"]] == ["i1"]
+    assert r["skipped"] == {"session_purpose": 1, "unlabeled": 1, "above_watermark": 1}
+    # speech: 'a' rides, 'c' starts above the watermark, 'b' is empty
+    assert [(s["segment_id"], s["start_time"], s["end_time"]) for s in r["speech"]] \
+        == [("a", 0.0, 10.0)]
+    # negatives: EVERY span occupies (i2/i3 excluded from examples stay UNKNOWN,
+    # never negative); i4 sits in the reserved tail
+    assert [(g["start_time"], g["end_time"]) for g in r["negatives"]] \
+        == [(10.6, 12.0), (12.5, 13.0), (13.5, 15.0)]
+
+    # the gate decides eligibility: excluded spine / no watermark = nothing
+    assert extract_spine_dataset(segments, corrections, set(),
+                                 {"extraction_status": "excluded",
+                                  "annotated_through": 15.0})["eligible"] is False
+    assert extract_spine_dataset(segments, corrections, set(), None)["eligible"] is False
+    got = extract_spine_dataset(segments, corrections, set(),
+                                {"extraction_status": "signed_off"})
+    assert got["eligible"] is False and got["examples"] == []

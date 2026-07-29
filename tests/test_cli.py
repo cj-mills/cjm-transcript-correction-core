@@ -51,3 +51,20 @@ def test_gate_subcommand():
     assert ns.annotated_through == "end"
     with pytest.raises(SystemExit):
         p.parse_args(["gate", "--status", "done"])   # not in the vocabulary
+
+
+def test_extract_subcommand():
+    """The extract surface (flywheel leg 2): sibling of stats sharing the
+    workspace/graph plumbing; --include-purpose repeats (default None = the
+    genuine-only policy applied downstream)."""
+    p = build_parser()
+    ns = p.parse_args(["extract"])
+    assert ns.command == "extract"
+    assert ns.include_purpose is None and ns.source is None and ns.output_dir is None
+    assert ns.graph_capability == "cjm-capability-graph-sqlite"
+    ns = p.parse_args(["extract", "--source", "Chris",
+                       "--include-purpose", "genuine",
+                       "--include-purpose", "feature-test",
+                       "--output-dir", "/tmp/ds", "--rendition", "raw"])
+    assert ns.include_purpose == ["genuine", "feature-test"]
+    assert ns.source == "Chris" and ns.output_dir == "/tmp/ds"

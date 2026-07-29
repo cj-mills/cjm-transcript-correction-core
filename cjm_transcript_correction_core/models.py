@@ -278,3 +278,74 @@ class ExtractionGate:
         props = {k: v for k, v in asdict(self).items() if k != "id" and v is not None}
         props["skeleton_hash"] = self.skeleton_hash
         return GraphNode(id=self.id, label="ExtractionGate", properties=props, sources=[])
+
+
+@dataclass
+class DatasetManifest:
+    """Durable record of one dataset extraction (chainable; DEC 16159e09).
+
+    BORN WORKFLOW-LOCAL: format `cjm-transcript-correction-core/dataset-manifest`,
+    generalized to a substrate-generic seam only at n=2 dataset-producing
+    workflows. Extends the CorrectionManifest pattern (format tag + version +
+    consumed pointers + WS-token paths): records the extraction config, the
+    consumed graph db + write-journal family (the source of truth this dataset
+    is a regenerable projection of), the session-purpose policy (load-bearing
+    for ALL state-derived datasets — supersede-discipline does not self-clean,
+    finding 493b8b9e), the observed OPEN class vocabulary, AUGMENTATION and
+    SPLIT policy as per-dataset DATA (v1 split IS the tail reservation:
+    annotated head = train, reserved tail = live bench, DEC 8cf12c22), and
+    each consumed spine's extraction_status + annotated_through at extraction
+    time (rescind detection). The chain: source -> decomp manifest ->
+    correction journal -> THIS -> training-run manifest -> model (DEC e047beee)."""
+    dataset_id: str          # Unique dataset identifier (sortable, run-id pattern)
+    created_at: float        # Unix timestamp at extraction start
+    config: Dict[str, Any]   # Extraction config snapshot (capability, selectors, purpose args)
+    graph_db_path: str       # The shared graph DB the overlay was folded from
+    journals: List[str] = field(default_factory=list)  # Consumed write-journal family (the source of truth)
+    session_purpose_policy: Dict[str, Any] = field(default_factory=dict)  # Which session purposes feed EXAMPLES
+    split_policy: Dict[str, Any] = field(default_factory=dict)            # Per-dataset DATA (v1: tail-reservation)
+    augmentation_policy: Dict[str, Any] = field(default_factory=dict)     # Per-dataset DATA (v1: none; provenance tags real/augmented/spliced/synthetic)
+    class_vocabulary: Dict[str, int] = field(default_factory=dict)  # Observed OPEN vocabulary (label -> example count)
+    spines: List[Dict[str, Any]] = field(default_factory=list)      # Per consumed spine: gate state @ extraction + counts
+    files: Dict[str, str] = field(default_factory=dict)             # Dataset-relative data files (events/regions)
+    counts: Dict[str, int] = field(default_factory=dict)            # Grand totals (examples, regions, skipped)
+
+    FORMAT: str = field(default="cjm-transcript-correction-core/dataset-manifest", repr=False)  # Format tag
+    VERSION: str = field(default="0.1.0", repr=False)                                            # Schema version
+
+    def to_dict(self) -> Dict[str, Any]:  # Plain-dict form for JSON serialization
+        """Serialize to a plain dict."""
+        return {
+            "format": self.FORMAT,
+            "version": self.VERSION,
+            "dataset_id": self.dataset_id,
+            "created_at": self.created_at,
+            "config": self.config,
+            "graph_db_path": self.graph_db_path,
+            "journals": list(self.journals),
+            "session_purpose_policy": self.session_purpose_policy,
+            "split_policy": self.split_policy,
+            "augmentation_policy": self.augmentation_policy,
+            "class_vocabulary": dict(self.class_vocabulary),
+            "spines": list(self.spines),
+            "files": dict(self.files),
+            "counts": dict(self.counts),
+        }
+
+    def save(
+        self,
+        path: Union[str, Path],  # Destination JSON file (parent dirs created)
+        workspace=None,  # Active Workspace; owned paths record as ${WS}/<rel> (5daadfc4 rung f)
+    ) -> Path:  # The written path
+        """Write the manifest as pretty-printed JSON (WS-token recorded paths,
+        the CorrectionManifest.save discipline — datasets relocate with the
+        workspace, DEC a5883992)."""
+        out = Path(path)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(relativize_recorded(self.to_dict(), workspace), indent=2))
+        return out
+
+
+def new_dataset_id() -> str:  # e.g. "dataset_20260729_153000_1a2b3c4d"
+    """Generate a unique, sortable dataset id (the new_run_id pattern, dataset kind)."""
+    return f"dataset_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
