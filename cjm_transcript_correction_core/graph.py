@@ -2190,7 +2190,10 @@ def bench_event_proposals(
     no marking). Active inserts inside the window matching NO proposal are
     MISSED — events the model failed to propose (the human found them
     manually). Matching is one-to-one greedy by midpoint distance, same-label
-    only, within a half-window search radius of 2s."""
+    first, within a search radius of 2s; a SECOND any-label pass derives
+    RELABELED — the span materialized under a different class (the model
+    found a real acoustic event, the human reclassified it — drive find
+    2026-07-29: inhale proposals accepted as dead-air)."""
     w_start, w_end = float(window[0]), (float(window[1]) if window[1] is not None else None)
 
     def in_window(s: float) -> bool:
@@ -2200,25 +2203,42 @@ def bench_event_proposals(
                   if r.get("label") and r.get("start_time") is not None
                   and in_window(float(r["start_time"]))]
     unmatched = {id(r): r for r in candidates}
-    verdicts: List[Dict[str, Any]] = []
-    counts = {"accepted": 0, "edited": 0, "rejected": 0}
-    for p in sorted(proposal_spans or [], key=lambda d: float(d.get("start_time") or 0.0)):
-        ps, pe = float(p["start_time"]), float(p["end_time"])
-        mid = (ps + pe) / 2.0
-        best = None
-        best_d = 2.0  # search radius: beyond this a span is a different event
-        for key, r in unmatched.items():
-            if r["label"] != p.get("label"):
+    counts = {"accepted": 0, "edited": 0, "relabeled": 0, "rejected": 0}
+    ordered = sorted(proposal_spans or [], key=lambda d: float(d.get("start_time") or 0.0))
+    matches: Dict[int, Any] = {}
+
+    def match_pass(same_label: bool) -> None:
+        # Global nearest-pair-first (not greedy-in-time-order — an early
+        # proposal must not steal a later proposal's closer insert).
+        pairs: List[Tuple[float, int, int]] = []
+        for p in ordered:
+            if id(p) in matches:
                 continue
-            rmid = (float(r["start_time"]) + float(r["end_time"])) / 2.0
-            d = abs(rmid - mid)
-            if d < best_d:
-                best, best_d = key, d
-        if best is None:
+            mid = (float(p["start_time"]) + float(p["end_time"])) / 2.0
+            for key, r in unmatched.items():
+                if same_label and r["label"] != p.get("label"):
+                    continue
+                rmid = (float(r["start_time"]) + float(r["end_time"])) / 2.0
+                d = abs(rmid - mid)
+                if d < 2.0:  # search radius: beyond this a span is a different event
+                    pairs.append((d, id(p), key))
+        for _d, pid, key in sorted(pairs, key=lambda t: t[0]):
+            if pid in matches or key not in unmatched:
+                continue
+            matches[pid] = unmatched.pop(key)
+
+    match_pass(same_label=True)   # pass 1: accepted / edited
+    match_pass(same_label=False)  # pass 2: relabeled — reclassified, not rejected
+
+    verdicts: List[Dict[str, Any]] = []
+    for p in ordered:
+        ps, pe = float(p["start_time"]), float(p["end_time"])
+        match = matches.get(id(p))
+        if match is None:
             verdict = "rejected"
-            match = None
+        elif match["label"] != p.get("label"):
+            verdict = "relabeled"
         else:
-            match = unmatched.pop(best)
             ds = abs(float(match["start_time"]) - ps)
             de = abs(float(match["end_time"]) - pe)
             verdict = "accepted" if (ds <= tolerance and de <= tolerance) else "edited"
@@ -2227,6 +2247,7 @@ def bench_event_proposals(
                          "start_time": ps, "end_time": pe, "score": p.get("score"),
                          "verdict": verdict,
                          **({"insert_id": match["insert_id"],
+                             "insert_label": match["label"],
                              "insert_start": match["start_time"],
                              "insert_end": match["end_time"]} if match else {})})
     missed = [{"insert_id": r["insert_id"], "label": r["label"],

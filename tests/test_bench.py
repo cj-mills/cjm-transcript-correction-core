@@ -72,22 +72,37 @@ def test_bench_accept_edit_reject_missed():
     report = bench_event_proposals(proposals, inserts, (50.0, None), tolerance=0.15)
     verdicts = {v["proposal_id"]: v["verdict"] for v in report["verdicts"]}
     assert verdicts == {"pa": "accepted", "pe": "edited", "pr": "rejected"}
-    assert report["counts"] == {"accepted": 1, "edited": 1, "rejected": 1,
-                                "proposals": 3, "missed": 1}
+    assert report["counts"] == {"accepted": 1, "edited": 1, "relabeled": 0,
+                                "rejected": 1, "proposals": 3, "missed": 1}
     assert report["missed"][0]["insert_id"] == "im"
     assert report["rates"]["accepted"] == round(1 / 3, 4)
 
 
-def test_bench_matching_is_label_scoped_and_windowed():
+def test_bench_relabeled_and_windowed():
+    """A span materialized under a DIFFERENT class derives 'relabeled' — the
+    model found a real event, the human reclassified it (dead-air drive find);
+    out-of-window inserts stay out of scope entirely."""
     proposals = [_prop("p1", 100.0, 100.3)]
     inserts = [
-        _insert("wrong-label", 100.0, 100.3, label="hesitation-marker"),
+        _insert("reclassified", 100.0, 100.3, label="dead-air"),
         _insert("below-window", 10.0, 10.3),
     ]
     report = bench_event_proposals(proposals, inserts, (50.0, 200.0))
-    assert report["verdicts"][0]["verdict"] == "rejected"
-    # the below-window insert is out of scope entirely: not missed either
-    assert report["counts"]["missed"] == 1  # only the wrong-label one, in-window unmatched
+    v = report["verdicts"][0]
+    assert v["verdict"] == "relabeled" and v["insert_label"] == "dead-air"
+    assert report["counts"]["relabeled"] == 1 and report["counts"]["missed"] == 0
+
+
+def test_bench_same_label_wins_over_relabel():
+    """Pass 1 (same label) claims its insert before the any-label pass runs."""
+    proposals = [_prop("p1", 100.0, 100.3), _prop("p2", 100.5, 100.8)]
+    inserts = [
+        _insert("i-inhale", 100.5, 100.8),                     # same label, nearer p2
+        _insert("i-dead", 100.0, 100.3, label="dead-air"),     # p1's relabel target
+    ]
+    report = bench_event_proposals(proposals, inserts, (50.0, None))
+    verdicts = {v["proposal_id"]: v["verdict"] for v in report["verdicts"]}
+    assert verdicts == {"p1": "relabeled", "p2": "accepted"}
 
 
 def test_bench_one_to_one_greedy_match():
