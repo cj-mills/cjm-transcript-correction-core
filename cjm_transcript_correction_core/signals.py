@@ -1,6 +1,9 @@
-"""Pure deterministic Tier-1 signal functions (no capability calls): empty-segment detection, bidirectional boundary punctuation/capitalization heuristics, forced-alignment coverage flags, positional cross-transcriber diff, and phonetic + edit-distance variant clustering. The worklist is recomputed from these each session; revolution-1 builds ZERO new capabilities."""
+"""Pure deterministic Tier-1 signal functions (no capability calls): empty-segment detection, bidirectional boundary punctuation/capitalization heuristics, forced-alignment coverage flags, positional cross-transcriber diff, phonetic + edit-distance variant clustering, and the event-proposal overlay (leg 4: the finetuned detector's spans anchored onto the spine). The worklist is recomputed from these each session; revolution-1 builds ZERO new capabilities."""
 
+import json
 import re
+from bisect import bisect_right
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from cjm_transcript_correction_core.models import SpineSegment
@@ -256,4 +259,83 @@ def speaker_turn_proposals(
         cluster, dom = max(overlap.items(), key=lambda kv: kv[1])
         out[seg.id] = {"cluster": cluster, "overlap": round(dom, 3),
                        "coverage": round(min(1.0, dom / (e - s)), 3)}
+    return out
+
+
+# Format tag of a consumed proposal set (leg 4, DEC 8e05b87b): the manifest
+# chain's inference-run record — capability-owned today, read by the workflow
+# BY FORMAT TAG (generalized to a workflow-generic seam at n=2 proposal
+# producers, the 16159e09 rule).
+EVENT_PROPOSAL_SET_FORMAT = "cjm-capability-pyannote/proposal-set-manifest"
+
+
+def load_event_proposal_set(
+    ws_root: str,                         # Workspace root (proposal sets live under <root>/proposals/)
+    content_hash: Optional[str] = None,   # Source content hash to match (preferred join key)
+    source_id: Optional[str] = None,      # Source node id to match (fallback join key)
+) -> Optional[Dict[str, Any]]:  # {"manifest": ..., "proposals": [...]} for the LATEST match, or None
+    """Find the latest proposal set for a source (the turns-artifact discovery
+    pattern: workspace + source identity name the artifact; no artifact = no
+    proposals and the walk stays manual). Malformed sets are skipped, never
+    fatal — a broken artifact must not take down the TUI open."""
+    root = Path(ws_root) / "proposals"
+    if not root.is_dir():
+        return None
+    best: Optional[Dict[str, Any]] = None
+    for mp in sorted(root.glob("*/manifest.json")):
+        try:
+            m = json.loads(mp.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if m.get("format") != EVENT_PROPOSAL_SET_FORMAT:
+            continue
+        src = m.get("source") or {}
+        if content_hash and src.get("content_hash") == content_hash:
+            pass
+        elif source_id and src.get("source_id") == source_id:
+            pass
+        else:
+            continue
+        if best is None or float(m.get("created_at") or 0) > float(best["manifest"].get("created_at") or 0):
+            best = {"manifest": m, "path": str(mp)}
+    if best is None:
+        return None
+    data_file = Path(best["path"]).parent / str((best["manifest"].get("files") or {}).get("proposals") or "proposals.jsonl")
+    try:
+        proposals = [json.loads(line) for line in data_file.read_text().splitlines() if line.strip()]
+    except (OSError, json.JSONDecodeError):
+        return None
+    return {"manifest": best["manifest"], "proposals": proposals}
+
+
+def event_span_proposals(
+    segments: List[SpineSegment],        # Ordered spine segments (source-coordinate times)
+    proposals: List[Dict[str, Any]],     # Proposal spans [{proposal_id,label,start_time,end_time,score}]
+    occupied: Optional[List[Tuple[float, float]]] = None,  # Active insert spans (already-materialized time ranges)
+) -> Dict[str, List[Dict[str, Any]]]:  # anchor segment id -> pending proposals (time order)
+    """Anchor pending event proposals onto the spine — the propose lane's paint.
+
+    Each proposal anchors to the segment it would be inserted AFTER: the last
+    segment whose start_time <= the proposal's start (the chunk-insert
+    after-anchor convention, DEC 3d3fa2a8). Proposals overlapping an ALREADY
+    MATERIALIZED insert span are dropped — they were accepted in some session;
+    the verdict join (not this paint) is where accept/edit/reject derive
+    (DEC 8e05b87b). Proposals starting before the first timed segment anchor
+    to it."""
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    timed = [(float(s.start_time), s.id) for s in segments if s.start_time is not None]
+    if not timed:
+        return out
+    starts = [t for t, _ in timed]
+    occ = sorted(occupied or [])
+    occ_starts = [s for s, _ in occ]
+    for p in sorted(proposals or [], key=lambda d: float(d.get("start_time") or 0.0)):
+        ps, pe = float(p.get("start_time") or 0.0), float(p.get("end_time") or 0.0)
+        if pe <= ps:
+            continue
+        j = bisect_right(occ_starts, pe) - 1
+        if j >= 0 and occ[j][1] > ps:  # overlaps a materialized insert — already decided
+            continue
+        i = max(0, bisect_right(starts, ps) - 1)
+        out.setdefault(timed[i][1], []).append(p)
     return out

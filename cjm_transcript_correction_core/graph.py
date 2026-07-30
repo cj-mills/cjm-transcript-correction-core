@@ -2173,3 +2173,66 @@ def extract_spine_dataset(
             "negatives": [{"start_time": a, "end_time": b}
                           for a, b in negative_regions(occupied, wm)],
             "skipped": skipped}
+
+
+def bench_event_proposals(
+    proposal_spans: List[Dict[str, Any]],  # Proposal set spans [{proposal_id,label,start_time,end_time,score}]
+    insert_spans: List[Dict[str, Any]],    # labeled_insert_spans output (the spine's active inserts)
+    window: Tuple[float, Optional[float]], # (start, end) the proposals covered; end None = unbounded
+    tolerance: float = 0.15,               # Boundary tolerance in seconds (accepted vs edited)
+) -> Dict[str, Any]:  # {"counts", "rates", "verdicts", "missed"}
+    """The reserved-tail bench join (leg 4, DECs 8e05b87b + 8cf12c22) — pure.
+
+    Verdicts are DERIVED, never stored: a proposal that materialized as an
+    active same-label insert with BOTH boundaries within `tolerance` is
+    ACCEPTED; materialized but moved beyond tolerance is EDITED (the nudges
+    are the edit record); absent from spine state is REJECTED (rejects need
+    no marking). Active inserts inside the window matching NO proposal are
+    MISSED — events the model failed to propose (the human found them
+    manually). Matching is one-to-one greedy by midpoint distance, same-label
+    only, within a half-window search radius of 2s."""
+    w_start, w_end = float(window[0]), (float(window[1]) if window[1] is not None else None)
+
+    def in_window(s: float) -> bool:
+        return s >= w_start and (w_end is None or s < w_end)
+
+    candidates = [r for r in insert_spans
+                  if r.get("label") and r.get("start_time") is not None
+                  and in_window(float(r["start_time"]))]
+    unmatched = {id(r): r for r in candidates}
+    verdicts: List[Dict[str, Any]] = []
+    counts = {"accepted": 0, "edited": 0, "rejected": 0}
+    for p in sorted(proposal_spans or [], key=lambda d: float(d.get("start_time") or 0.0)):
+        ps, pe = float(p["start_time"]), float(p["end_time"])
+        mid = (ps + pe) / 2.0
+        best = None
+        best_d = 2.0  # search radius: beyond this a span is a different event
+        for key, r in unmatched.items():
+            if r["label"] != p.get("label"):
+                continue
+            rmid = (float(r["start_time"]) + float(r["end_time"])) / 2.0
+            d = abs(rmid - mid)
+            if d < best_d:
+                best, best_d = key, d
+        if best is None:
+            verdict = "rejected"
+            match = None
+        else:
+            match = unmatched.pop(best)
+            ds = abs(float(match["start_time"]) - ps)
+            de = abs(float(match["end_time"]) - pe)
+            verdict = "accepted" if (ds <= tolerance and de <= tolerance) else "edited"
+        counts[verdict] += 1
+        verdicts.append({"proposal_id": p.get("proposal_id"), "label": p.get("label"),
+                         "start_time": ps, "end_time": pe, "score": p.get("score"),
+                         "verdict": verdict,
+                         **({"insert_id": match["insert_id"],
+                             "insert_start": match["start_time"],
+                             "insert_end": match["end_time"]} if match else {})})
+    missed = [{"insert_id": r["insert_id"], "label": r["label"],
+               "start_time": r["start_time"], "end_time": r["end_time"]}
+              for r in unmatched.values()]
+    total = sum(counts.values())
+    rates = ({k: round(v / total, 4) for k, v in counts.items()} if total else {})
+    return {"counts": {**counts, "proposals": total, "missed": len(missed)},
+            "rates": rates, "verdicts": verdicts, "missed": missed}

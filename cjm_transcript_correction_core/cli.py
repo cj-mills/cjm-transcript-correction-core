@@ -15,13 +15,16 @@ from cjm_context_graph_primitives.query import NodeQuery
 from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
 from cjm_substrate.core.workspace import relativize_recorded, resolve_workspace
-from cjm_transcript_correction_core.graph import (commit_extraction_gate, correction_stats,
-                                                  extract_spine_dataset, list_source_spines,
+from cjm_transcript_correction_core.graph import (bench_event_proposals, commit_extraction_gate,
+                                                  correction_stats, extract_spine_dataset,
+                                                  labeled_insert_spans, list_source_spines,
                                                   load_extraction_gates, load_source_corrections,
                                                   load_source_segments, skeleton_hash_for)
 from cjm_transcript_correction_core.models import CorrectionConfig, DatasetManifest, new_dataset_id
 from cjm_transcript_correction_core.pipeline import (load_decomp_manifest, resolve_graph_db_path,
                                                      run_correction, run_review)
+from cjm_transcript_correction_core.signals import (EVENT_PROPOSAL_SET_FORMAT,
+                                                    load_event_proposal_set)
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +156,37 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                          help="Datasets root (default: <workspace>/datasets, else datasets/ "
                               "under the cwd); the dataset lands in <root>/<dataset_id>/")
     extract.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
+
+    bench = sub.add_parser(
+        "bench", help="Reserved-tail bench: derive accept/edit/reject verdicts by joining "
+                      "a proposal set against final spine state (leg 4, DECs 8e05b87b + "
+                      "8cf12c22 — verdicts are never stored)")
+    bench.add_argument("--manifests-dir", default=None,
+                       help="Capability manifests directory (default: the workspace's "
+                            ".cjm/manifests when one is active, else .cjm/manifests "
+                            "under the cwd)")
+    bench.add_argument("--workspace", default=None,
+                       help="Workspace root (default: CJM_WORKSPACE env, else upward walk from cwd)")
+    bench.add_argument("--graph-capability", default="cjm-capability-graph-sqlite",
+                       help="Graph-storage capability name")
+    bench.add_argument("--graph-db-path", default=None,
+                       help="Graph db path (default: the capability's persisted workspace config)")
+    bench.add_argument("--source", default=None,
+                       help="Source node id or title substring (default: the proposal set's "
+                            "recorded source_id)")
+    bench.add_argument("--rendition", default=None,
+                       help="Which AudioRendition spine when a source has more than one")
+    bench.add_argument("--proposals", default=None,
+                       help="Proposal-set directory or manifest.json (default: the latest set "
+                            "under <workspace>/proposals/ matching the source)")
+    bench.add_argument("--include-purpose", action="append", default=None,
+                       help="Session purposes whose inserts count as human verdicts "
+                            "(repeatable; default: genuine only)")
+    bench.add_argument("--tolerance", type=float, default=0.15,
+                       help="Boundary tolerance in seconds separating accepted from edited")
+    bench.add_argument("--output", default=None,
+                       help="Also write the full verdict report as JSON to this path")
+    bench.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
     return parser
 
 
@@ -310,6 +344,8 @@ def main(
         return asyncio.run(gate_command(args))
     if args.command == "extract":
         return asyncio.run(extract_command(args))
+    if args.command == "bench":
+        return asyncio.run(bench_command(args))
     raise SystemExit(f"unknown command: {args.command}")
 
 
@@ -692,5 +728,145 @@ async def extract_command(
         try:
             manager.unload_capability(args.graph_capability)
         except Exception as e:  # Best-effort teardown; never mask the extract outcome
+            logger.warning(f"unload {args.graph_capability} failed: {e}")
+    return 0
+
+
+async def bench_command(
+    args: argparse.Namespace,  # Parsed args for the `bench` subcommand
+) -> int:  # Process exit code
+    """Execute the `bench` subcommand: the reserved-tail verdict join.
+
+    Leg 4's measurement half (DECs 8e05b87b + 8cf12c22): verdicts are NEVER
+    stored — this derives them fresh by joining the proposal set (durable
+    inference-run output) against final spine state: materialized within
+    tolerance = accepted, moved = edited, absent = rejected, and active
+    inserts no proposal covered = the model's misses. Wall-clock derives from
+    the sidecar journal's op timestamps for the sessions that touched the
+    window."""
+    ws = resolve_workspace(explicit=getattr(args, "workspace", None))
+    if ws is not None:
+        os.environ["CJM_WORKSPACE"] = str(ws.root)
+    if args.manifests_dir is None:
+        args.manifests_dir = (str(ws.substrate_data_dir / "manifests")
+                              if ws is not None else ".cjm/manifests")
+
+    # Resolve the proposal set FIRST — it names the source/spine to bench.
+    pset = None
+    if args.proposals:
+        mp = Path(args.proposals)
+        if mp.is_dir():
+            mp = mp / "manifest.json"
+        m = json.loads(mp.read_text())
+        if m.get("format") != EVENT_PROPOSAL_SET_FORMAT:
+            print(f"not a proposal-set manifest: {mp} (format {m.get('format')!r})")
+            return 1
+        data_file = mp.parent / str((m.get("files") or {}).get("proposals") or "proposals.jsonl")
+        proposals = [json.loads(line) for line in data_file.read_text().splitlines() if line.strip()]
+        pset = {"manifest": m, "proposals": proposals}
+    elif ws is not None and args.source:
+        pset = load_event_proposal_set(str(ws.root), source_id=args.source)
+    if pset is None:
+        print("no proposal set: pass --proposals, or --source with a set under "
+              "<workspace>/proposals/ recording that source_id")
+        return 1
+    manifest = pset["manifest"]
+    window = (float((manifest.get("window") or {}).get("start") or 0.0),
+              (manifest.get("window") or {}).get("end"))
+    source_id = args.source or (manifest.get("source") or {}).get("source_id")
+    skeleton = (manifest.get("source") or {}).get("skeleton_hash")
+    if not source_id:
+        print("proposal set records no source_id — pass --source")
+        return 1
+
+    manager = CapabilityManager(search_paths=[Path(args.manifests_dir)])
+    configs = ({args.graph_capability: {"db_path": args.graph_db_path}}
+               if args.graph_db_path else None)
+    load_capabilities(manager, [args.graph_capability], configs=configs)
+    queue = JobQueue(deps=manager)
+    await queue.start()
+    try:
+        # --source may be a substring — resolve against Source nodes.
+        res = await graph_task(queue, args.graph_capability, "query_nodes",
+                               query=NodeQuery(label="Source", project=["title"]).to_dict())
+        sources = [(r["id"], str(r.get("title") or "")) for r in (res.rows or [])]
+        needle = source_id.lower()
+        picked = [(i, t) for i, t in sources if i == source_id or needle in t.lower()]
+        if len(picked) != 1:
+            print(f"need exactly one Source (matched {len(picked)}) for {source_id!r}")
+            return 1
+        source_id, title = picked[0]
+
+        purposes = list(args.include_purpose or ["genuine"])
+        sres = await graph_task(queue, args.graph_capability, "query_nodes",
+                                query=NodeQuery(label="CorrectionSession").to_dict())
+        include_ids = set()
+        for n in (sres.nodes or []):
+            d = n.to_dict() if hasattr(n, "to_dict") else n
+            purpose = str((d.get("properties") or {}).get("purpose") or "genuine")
+            if purpose in purposes:
+                include_ids.add(d["id"])
+
+        corrections, superseded = await load_source_corrections(
+            queue, args.graph_capability, source_id)
+        segments = await load_source_segments(
+            queue, args.graph_capability, source_id,
+            rendition_selector=args.rendition,
+            skeleton_selector=("legacy" if skeleton is None else skeleton))
+        spans = [r for r in labeled_insert_spans(segments, corrections, superseded)
+                 if r.get("session_id") in include_ids]
+        report = bench_event_proposals(pset["proposals"], spans, window,
+                                       tolerance=args.tolerance)
+
+        # Wall-clock: sidecar-journal op timestamps for the sessions whose
+        # inserts the join matched (the bench pass's real duration).
+        db = args.graph_db_path or (
+            (manager.instances[args.graph_capability].config or {}).get("db_path"))
+        bench_sessions = {r.get("session_id")
+                          for r in spans if r.get("session_id")} & include_ids
+        wall: Dict[str, Dict[str, float]] = {}
+        jp = Path(sidecar_journal_path(db)) if db else None
+        if jp is not None and jp.is_file():
+            for line in jp.read_text().splitlines():
+                try:
+                    op = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                sid = str(op.get("session_id") or "")
+                ts = op.get("ts")
+                if sid in bench_sessions and ts is not None:
+                    w = wall.setdefault(sid, {"first": float(ts), "last": float(ts), "ops": 0})
+                    w["first"] = min(w["first"], float(ts))
+                    w["last"] = max(w["last"], float(ts))
+                    w["ops"] += 1
+
+        c = report["counts"]
+        w_end = f"{window[1]:.1f}" if window[1] is not None else "end"
+        print(f"== BENCH {manifest.get('proposal_set_id')} · {title or source_id} ==")
+        print(f"  model: {manifest.get('training_run_id')} · window [{window[0]:.1f}, {w_end}]s "
+              f"· tolerance {args.tolerance}s")
+        print(f"  proposals {c['proposals']}: accepted {c['accepted']} · edited {c['edited']} "
+              f"· rejected {c['rejected']}  ·  missed (manual inserts) {c['missed']}")
+        if report["rates"]:
+            print("  rates: " + " · ".join(f"{k} {v:.1%}" for k, v in report["rates"].items()))
+        for sid, w in sorted(wall.items()):
+            print(f"  session {sid[:8]}: {w['ops']} ops over {w['last'] - w['first']:.0f}s wall-clock")
+        if not wall:
+            print("  wall-clock: no journaled bench-session ops yet")
+        if args.output:
+            out = Path(args.output)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(
+                {"proposal_set_id": manifest.get("proposal_set_id"),
+                 "training_run_id": manifest.get("training_run_id"),
+                 "source_id": source_id, "window": {"start": window[0], "end": window[1]},
+                 "tolerance": args.tolerance, "report": report,
+                 "wall_clock": wall}, indent=2))
+            print(f"  report: {out}")
+    finally:
+        await queue.stop()
+        try:
+            manager.unload_capability(args.graph_capability)
+        except Exception as e:  # Best-effort teardown; never mask the bench outcome
             logger.warning(f"unload {args.graph_capability} failed: {e}")
     return 0
