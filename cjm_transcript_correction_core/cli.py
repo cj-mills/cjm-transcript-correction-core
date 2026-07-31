@@ -176,6 +176,12 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                             "recorded source_id)")
     bench.add_argument("--rendition", default=None,
                        help="Which AudioRendition spine when a source has more than one")
+    bench.add_argument("--skeleton", default=None,
+                       help="Skeleton-spine selector (full skeleton hash). Default: the "
+                            "proposal set's recorded skeleton_hash; a respine propset "
+                            "predates its spine and records none, so the CONSUMING decomp "
+                            "manifest resolves it (event_propset_id chain, DEC 6cc10fb7); "
+                            "legacy spine as the last resort")
     bench.add_argument("--proposals", default=None,
                        help="Proposal-set directory or manifest.json (default: the latest set "
                             "under <workspace>/proposals/ matching the source)")
@@ -774,7 +780,26 @@ async def bench_command(
     window = (float((manifest.get("window") or {}).get("start") or 0.0),
               (manifest.get("window") or {}).get("end"))
     source_id = args.source or (manifest.get("source") or {}).get("source_id")
-    skeleton = (manifest.get("source") or {}).get("skeleton_hash")
+    skeleton = getattr(args, "skeleton", None) or (manifest.get("source") or {}).get("skeleton_hash")
+    if skeleton is None and ws is not None:
+        # Respine chain (DEC 6cc10fb7): a propset consumed as the CUT AUTHORITY
+        # predates its spine, so it cannot record a skeleton_hash — but the
+        # CONSUMING decomp manifest names this set (event_propset_id) and its
+        # skeleton_config_hash IS the spine the drive walked. Latest consumer
+        # wins (run ids sort by time). Without this, the join silently lands
+        # on the LEGACY spine and every proposal derives REJECTED.
+        set_id = manifest.get("proposal_set_id")
+        for rm in sorted((ws.root / "runs").glob("*.json")):
+            try:
+                d = json.loads(rm.read_text())
+            except (OSError, json.JSONDecodeError):
+                continue
+            if d.get("format") == "cjm-transcript-decomp-core/run-manifest" \
+                    and d.get("event_propset_id") == set_id \
+                    and d.get("skeleton_config_hash"):
+                skeleton = d["skeleton_config_hash"]
+        if skeleton:
+            print(f"  spine: {skeleton[:24]}… (resolved via the consuming decomp manifest)")
     if not source_id:
         print("proposal set records no source_id — pass --source")
         return 1

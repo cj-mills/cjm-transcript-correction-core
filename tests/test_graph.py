@@ -885,3 +885,55 @@ def test_extract_spine_dataset_gate_and_policy():
     got = extract_spine_dataset(segments, corrections, set(),
                                 {"extraction_status": "signed_off"})
     assert got["eligible"] is False and got["examples"] == []
+
+
+def test_gap_insert_run_resorts_by_effective_times():
+    """FINDING 2ba9e368 (the welded-carve inversion): a split's right half is
+    BORN at the pre-carve cut (payload start before the isolation insert),
+    then nudged PAST it — birth order must yield to effective times at
+    projection, while full ties (zero-width weld stacks) keep the rank/birth
+    order (131ba57a)."""
+    from cjm_transcript_correction_core.graph import reorder_gap_inserts
+    segs = [SpineSegment(id="a", index=0, text="head text",
+                         start_time=0.1, end_time=16.0),
+            SpineSegment(id="b", index=1, text="next", start_time=16.3, end_time=19.5)]
+
+    def _ins(cid, start, end, created, label=None, rank=None):
+        p = {"operation": "chunk_insert", "after_segment_id": "a",
+             "start_time": start, "end_time": end}
+        if label:
+            p["label"] = label
+        if rank is not None:
+            p["rank"] = rank
+        return {"id": cid, "correction_type": "insertion", "status": "applied",
+                "created_at": created, "payload": p}
+
+    corrections = [
+        _ins("half", 10.8, 15.95, 100.0),            # split right half, born at the cut
+        _ins("inh", 11.0, 11.0, 200.0, label="inhale"),  # isolation insert at the weld
+        {"id": "n1", "correction_type": "timing", "status": "applied",
+         "created_at": 300.0,
+         "payload": {"operation": "time_nudge", "segment_id": "inh",
+                     "edits": [{"segment_id": "inh", "edge": "end",
+                                "old_time": 11.0, "new_time": 11.3}]}},
+        {"id": "n2", "correction_type": "timing", "status": "applied",
+         "created_at": 301.0,
+         "payload": {"operation": "time_nudge", "segment_id": "half",
+                     "edits": [{"segment_id": "half", "edge": "start",
+                                "old_time": 10.8, "new_time": 11.3},
+                               {"segment_id": "a", "edge": "end",
+                                "old_time": 16.0, "new_time": 11.0}]}},
+    ]
+    projected = project_effective_spine(segs, corrections)
+    assert [s.id for s in projected] == ["a", "inh", "half", "b"]
+    assert (projected[1].start_time, projected[1].end_time) == (11.0, 11.3)
+    assert (projected[2].start_time, projected[2].end_time) == (11.3, 15.95)
+
+    # Full-tie weld stack: identical effective starts keep rank order (stable
+    # sort; lower rank first — the walked-order tie-break).
+    tied = [
+        _ins("t1", 12.0, 12.0, 100.0, rank=0.0),
+        _ins("t2", 12.0, 12.0, 200.0, rank=-1.0),
+    ]
+    out = reorder_gap_inserts(project_effective_spine(segs, tied), tied)
+    assert [s.id for s in out] == ["a", "t2", "t1", "b"]

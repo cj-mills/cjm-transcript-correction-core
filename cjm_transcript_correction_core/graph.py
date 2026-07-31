@@ -543,8 +543,13 @@ def project_effective_spine(
     # Structural + timing corrections compose AFTER the text projection
     # (core-side — the layer's edit vocabulary stays text-scoped): chunk
     # inserts synthesize first, so time nudges can grow a synthetic chunk's
-    # edges (the zero-width insert+nudge isolation pattern, DEC 3d3fa2a8).
-    return apply_time_nudges(apply_chunk_inserts(out, corrections), corrections)
+    # edges (the zero-width insert+nudge isolation pattern, DEC 3d3fa2a8);
+    # gap-insert runs then re-sort by EFFECTIVE times, because nudges can
+    # carry a sibling past another (FINDING 2ba9e368 — the welded-carve
+    # inversion, visible only across relaunch).
+    return reorder_gap_inserts(
+        apply_time_nudges(apply_chunk_inserts(out, corrections), corrections),
+        corrections)
 
 
 def build_text_correction(
@@ -2193,7 +2198,8 @@ def bench_event_proposals(
     first, within a search radius of 2s; a SECOND any-label pass derives
     RELABELED — the span materialized under a different class (the model
     found a real acoustic event, the human reclassified it — drive find
-    2026-07-29: inhale proposals accepted as dead-air)."""
+    2026-07-29: inhale proposals accepted as silence, relabeled 'empty';
+    'empty' is the sole silence term, finding 8c0aa0bf)."""
     w_start, w_end = float(window[0]), (float(window[1]) if window[1] is not None else None)
 
     def in_window(s: float) -> bool:
@@ -2257,3 +2263,50 @@ def bench_event_proposals(
     rates = ({k: round(v / total, 4) for k, v in counts.items()} if total else {})
     return {"counts": {**counts, "proposals": total, "missed": len(missed)},
             "rates": rates, "verdicts": verdicts, "missed": missed}
+
+
+def reorder_gap_inserts(
+    segments: List[SpineSegment],       # The projected spine AFTER inserts + nudges
+    corrections: List[Dict[str, Any]],  # ACTIVE correction property dicts
+) -> List[SpineSegment]:  # Spine with each gap's insert run re-sorted by EFFECTIVE times
+    """Restore TIME order among stacked inserts after the nudge stage
+    (FINDING 2ba9e368).
+
+    `apply_chunk_inserts` orders gap siblings by BIRTH payload (start_time,
+    rank, created_at), and `apply_time_nudges` composes AFTER — so nudges can
+    carry one sibling's effective times past another's (the welded-carve
+    flow: a split's right half is born at the pre-carve cut, then nudged past
+    the isolation insert grown beside it). Layer-0 order is structural and
+    never re-sorted; within each contiguous run of INSERTED segments the sort
+    key becomes the EFFECTIVE (start_time, rank, created_at) — zero-width
+    weld stacks still tie on start and fall through to rank, so the 131ba57a
+    walked-order intent survives (the sort is stable: full ties keep birth
+    order). The TUI's live splice already orders by current times; this makes
+    the relaunch projection agree with the session view by construction."""
+    meta = {c["id"]: (float((c.get("payload") or {}).get("rank") or 0.0),
+                      float(c.get("created_at") or 0.0))
+            for c in corrections
+            if c.get("correction_type") == "insertion"
+            and c.get("status") not in ("superseded", "proposed")
+            and (c.get("payload") or {}).get("operation") == "chunk_insert"}
+    if not meta:
+        return segments
+    out: List[SpineSegment] = []
+    run: List[SpineSegment] = []
+
+    def flush() -> None:
+        if len(run) > 1:
+            run.sort(key=lambda s: (
+                float(s.start_time) if s.start_time is not None else float("inf"),
+                *meta.get(s.id, (0.0, 0.0))))
+        out.extend(run)
+        run.clear()
+
+    for s in segments:
+        if s.id in meta:
+            run.append(s)
+        else:
+            flush()
+            out.append(s)
+    flush()
+    return out
