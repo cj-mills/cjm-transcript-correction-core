@@ -144,3 +144,35 @@ def test_load_event_proposal_set_latest_match_wins(tmp_path):
 
 def test_load_event_proposal_set_no_dir(tmp_path):
     assert load_event_proposal_set(str(tmp_path), content_hash="sha256:abc") is None
+
+
+def test_bench_dual_tier_join():
+    """Dual-tier sets (3a5cb858): tier-1 keeps the top-level operating-point
+    contract and joins FIRST; tier-2 joins the remainder — its catches leave
+    the miss channel, its unmatched rows are 'unaccepted', never 'rejected',
+    and a tier-2 span must not steal a tier-1 span's insert."""
+    proposals = [
+        _prop("t1a", 100.0, 100.3),                     # tier-1 accepted
+        {**_prop("t2near", 100.5, 100.8), "tier": 2},   # near t1a's insert but tier-1 won
+        {**_prop("t2c", 300.0, 300.4), "tier": 2},      # tier-2 catch of a "manual" insert
+        {**_prop("t2u", 500.0, 500.3), "tier": 2},      # never materialized -> unaccepted
+    ]
+    inserts = [
+        _insert("ia", 100.0, 100.3),
+        _insert("ic", 300.0, 300.4),
+        _insert("im", 700.0, 700.4),   # matched by NO tier -> still missed
+    ]
+    report = bench_event_proposals(proposals, inserts, (50.0, None), tolerance=0.15)
+    # Top level = tier-1 only: rates keep the operating-point denominator.
+    assert report["counts"] == {"accepted": 1, "edited": 0, "relabeled": 0,
+                                "rejected": 0, "proposals": 1, "missed": 1}
+    assert report["missed"][0]["insert_id"] == "im"
+    t2 = report["tier2"]
+    verdicts = {v["proposal_id"]: v["verdict"] for v in t2["verdicts"]}
+    assert verdicts == {"t2near": "unaccepted", "t2c": "accepted", "t2u": "unaccepted"}
+    assert t2["counts"] == {"accepted": 1, "edited": 0, "relabeled": 0,
+                            "unaccepted": 2, "proposals": 3}
+    # Single-tier (legacy tierless) report shape is unchanged: no tier2 key.
+    legacy = bench_event_proposals([_prop("pa", 100.0, 100.3)],
+                                   [_insert("ia", 100.0, 100.3)], (50.0, None))
+    assert "tier2" not in legacy

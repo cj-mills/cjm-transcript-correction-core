@@ -2209,60 +2209,81 @@ def bench_event_proposals(
                   if r.get("label") and r.get("start_time") is not None
                   and in_window(float(r["start_time"]))]
     unmatched = {id(r): r for r in candidates}
-    counts = {"accepted": 0, "edited": 0, "relabeled": 0, "rejected": 0}
-    ordered = sorted(proposal_spans or [], key=lambda d: float(d.get("start_time") or 0.0))
-    matches: Dict[int, Any] = {}
+    rows = sorted(proposal_spans or [], key=lambda d: float(d.get("start_time") or 0.0))
+    # Dual-tier sets (propset 0.2.0, 3a5cb858): the operating-point tier joins
+    # FIRST over the full insert pool — top-level counts/rates keep their
+    # tier-1 contract (tierless legacy rows are tier-1). The audition tier
+    # joins the REMAINDER: its unmatched rows are 'unaccepted', never
+    # 'rejected' (an unshown or skipped audition is not a driver verdict),
+    # and its catches leave the miss channel — a manual insert a tier-2 span
+    # matches is a below-threshold catch, not model blindness.
+    tier1 = [p for p in rows if int(p.get("tier", 1)) == 1]
+    tier2 = [p for p in rows if int(p.get("tier", 1)) == 2]
 
-    def match_pass(same_label: bool) -> None:
-        # Global nearest-pair-first (not greedy-in-time-order — an early
-        # proposal must not steal a later proposal's closer insert).
-        pairs: List[Tuple[float, int, int]] = []
-        for p in ordered:
-            if id(p) in matches:
-                continue
-            mid = (float(p["start_time"]) + float(p["end_time"])) / 2.0
-            for key, r in unmatched.items():
-                if same_label and r["label"] != p.get("label"):
+    def join(ordered: List[Dict[str, Any]],
+             no_match_verdict: str) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
+        matches: Dict[int, Any] = {}
+
+        def match_pass(same_label: bool) -> None:
+            # Global nearest-pair-first (not greedy-in-time-order — an early
+            # proposal must not steal a later proposal's closer insert).
+            pairs: List[Tuple[float, int, int]] = []
+            for p in ordered:
+                if id(p) in matches:
                     continue
-                rmid = (float(r["start_time"]) + float(r["end_time"])) / 2.0
-                d = abs(rmid - mid)
-                if d < 2.0:  # search radius: beyond this a span is a different event
-                    pairs.append((d, id(p), key))
-        for _d, pid, key in sorted(pairs, key=lambda t: t[0]):
-            if pid in matches or key not in unmatched:
-                continue
-            matches[pid] = unmatched.pop(key)
+                mid = (float(p["start_time"]) + float(p["end_time"])) / 2.0
+                for key, r in unmatched.items():
+                    if same_label and r["label"] != p.get("label"):
+                        continue
+                    rmid = (float(r["start_time"]) + float(r["end_time"])) / 2.0
+                    d = abs(rmid - mid)
+                    if d < 2.0:  # search radius: beyond this a span is a different event
+                        pairs.append((d, id(p), key))
+            for _d, pid, key in sorted(pairs, key=lambda t: t[0]):
+                if pid in matches or key not in unmatched:
+                    continue
+                matches[pid] = unmatched.pop(key)
 
-    match_pass(same_label=True)   # pass 1: accepted / edited
-    match_pass(same_label=False)  # pass 2: relabeled — reclassified, not rejected
+        match_pass(same_label=True)   # pass 1: accepted / edited
+        match_pass(same_label=False)  # pass 2: relabeled — reclassified, not rejected
 
-    verdicts: List[Dict[str, Any]] = []
-    for p in ordered:
-        ps, pe = float(p["start_time"]), float(p["end_time"])
-        match = matches.get(id(p))
-        if match is None:
-            verdict = "rejected"
-        elif match["label"] != p.get("label"):
-            verdict = "relabeled"
-        else:
-            ds = abs(float(match["start_time"]) - ps)
-            de = abs(float(match["end_time"]) - pe)
-            verdict = "accepted" if (ds <= tolerance and de <= tolerance) else "edited"
-        counts[verdict] += 1
-        verdicts.append({"proposal_id": p.get("proposal_id"), "label": p.get("label"),
-                         "start_time": ps, "end_time": pe, "score": p.get("score"),
-                         "verdict": verdict,
-                         **({"insert_id": match["insert_id"],
-                             "insert_label": match["label"],
-                             "insert_start": match["start_time"],
-                             "insert_end": match["end_time"]} if match else {})})
+        counts = {"accepted": 0, "edited": 0, "relabeled": 0, no_match_verdict: 0}
+        verdicts: List[Dict[str, Any]] = []
+        for p in ordered:
+            ps, pe = float(p["start_time"]), float(p["end_time"])
+            match = matches.get(id(p))
+            if match is None:
+                verdict = no_match_verdict
+            elif match["label"] != p.get("label"):
+                verdict = "relabeled"
+            else:
+                ds = abs(float(match["start_time"]) - ps)
+                de = abs(float(match["end_time"]) - pe)
+                verdict = "accepted" if (ds <= tolerance and de <= tolerance) else "edited"
+            counts[verdict] += 1
+            verdicts.append({"proposal_id": p.get("proposal_id"), "label": p.get("label"),
+                             "start_time": ps, "end_time": pe, "score": p.get("score"),
+                             "verdict": verdict,
+                             **({"insert_id": match["insert_id"],
+                                 "insert_label": match["label"],
+                                 "insert_start": match["start_time"],
+                                 "insert_end": match["end_time"]} if match else {})})
+        return counts, verdicts
+
+    counts, verdicts = join(tier1, "rejected")
+    tier2_result: Optional[Dict[str, Any]] = None
+    if tier2:
+        t2_counts, t2_verdicts = join(tier2, "unaccepted")
+        tier2_result = {"counts": {**t2_counts, "proposals": sum(t2_counts.values())},
+                        "verdicts": t2_verdicts}
     missed = [{"insert_id": r["insert_id"], "label": r["label"],
                "start_time": r["start_time"], "end_time": r["end_time"]}
               for r in unmatched.values()]
     total = sum(counts.values())
     rates = ({k: round(v / total, 4) for k, v in counts.items()} if total else {})
     return {"counts": {**counts, "proposals": total, "missed": len(missed)},
-            "rates": rates, "verdicts": verdicts, "missed": missed}
+            "rates": rates, "verdicts": verdicts, "missed": missed,
+            **({"tier2": tier2_result} if tier2_result else {})}
 
 
 def reorder_gap_inserts(
