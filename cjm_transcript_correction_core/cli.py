@@ -15,11 +15,14 @@ from cjm_context_graph_primitives.query import NodeQuery
 from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
 from cjm_substrate.core.workspace import relativize_recorded, resolve_workspace
-from cjm_transcript_correction_core.graph import (bench_event_proposals, commit_extraction_gate,
-                                                  correction_stats, extract_spine_dataset,
-                                                  labeled_insert_spans, list_source_spines,
-                                                  load_extraction_gates, load_source_corrections,
-                                                  load_source_segments, skeleton_hash_for)
+from cjm_transcript_correction_core.graph import (bench_event_proposals,
+                                                  commit_chunk_insert_correction,
+                                                  commit_extraction_gate, correction_stats,
+                                                  extract_spine_dataset, labeled_insert_spans,
+                                                  list_source_spines, load_extraction_gates,
+                                                  load_source_corrections, load_source_segments,
+                                                  project_effective_spine, set_session_status,
+                                                  skeleton_hash_for, start_session)
 from cjm_transcript_correction_core.models import CorrectionConfig, DatasetManifest, new_dataset_id
 from cjm_transcript_correction_core.pipeline import (load_decomp_manifest, resolve_graph_db_path,
                                                      run_correction, run_review)
@@ -193,6 +196,41 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
     bench.add_argument("--output", default=None,
                        help="Also write the full verdict report as JSON to this path")
     bench.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
+
+    transfer = sub.add_parser(
+        "transfer-wordless",
+        help="Replay one spine's ACTIVE wordless event inserts onto a sibling spine "
+             "anchored by source time (dea104ba: events = source layer, words = spine "
+             "layer — boundary shifts, text edits, and word-bearing inserts stay behind)")
+    transfer.add_argument("--manifests-dir", default=None,
+                          help="Capability manifests directory (default: the workspace's "
+                               ".cjm/manifests when one is active, else .cjm/manifests "
+                               "under the cwd)")
+    transfer.add_argument("--workspace", default=None,
+                          help="Workspace root (default: CJM_WORKSPACE env, else upward walk from cwd)")
+    transfer.add_argument("--graph-capability", default="cjm-capability-graph-sqlite",
+                          help="Graph-storage capability name")
+    transfer.add_argument("--graph-db-path", default=None,
+                          help="Graph db path (REQUIRED to commit — the journal sidecar "
+                               "hangs off it; --dry-run works without)")
+    transfer.add_argument("--source", required=True,
+                          help="Source node id or title substring (exactly one match)")
+    transfer.add_argument("--rendition", default=None,
+                          help="Which AudioRendition spine when a source has more than one")
+    transfer.add_argument("--from-skeleton", required=True,
+                          help="Donor spine (\"legacy\" or a skeleton-hash prefix)")
+    transfer.add_argument("--to-skeleton", required=True,
+                          help="Destination spine (\"legacy\" or a skeleton-hash prefix)")
+    transfer.add_argument("--labels", action="append", default=None,
+                          help="Restrict to these insert labels (repeatable; default: every "
+                               "labeled wordless insert)")
+    transfer.add_argument("--tolerance", type=float, default=0.05,
+                          help="Duplicate-guard window in seconds: a same-label destination "
+                               "insert this close counts as already transferred")
+    transfer.add_argument("--dry-run", action="store_true",
+                          help="Print the transfer plan; commit nothing")
+    transfer.add_argument("--actor", default="human", help="Actor recorded on the transferred inserts")
+    transfer.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
     return parser
 
 
@@ -352,6 +390,8 @@ def main(
         return asyncio.run(extract_command(args))
     if args.command == "bench":
         return asyncio.run(bench_command(args))
+    if args.command == "transfer-wordless":
+        return asyncio.run(transfer_command(args))
     raise SystemExit(f"unknown command: {args.command}")
 
 
@@ -893,5 +933,153 @@ async def bench_command(
         try:
             manager.unload_capability(args.graph_capability)
         except Exception as e:  # Best-effort teardown; never mask the bench outcome
+            logger.warning(f"unload {args.graph_capability} failed: {e}")
+    return 0
+
+
+async def transfer_command(
+    args: argparse.Namespace,  # Parsed args for the `transfer-wordless` subcommand
+) -> int:  # Process exit code
+    """Execute `transfer-wordless`: replay wordless event inserts across sibling spines.
+
+    dea104ba — the layering principle's first mechanical expression: accepted
+    wordless inserts are SOURCE-truth ((span, label) pairs with zero text
+    dependency), so a respine (re-transcription, FA/VAD upgrade) must not lose
+    the human event layer. Donor spans come from the FROM spine's EFFECTIVE
+    projection (time nudges applied — the heard span, not the born one) and
+    keep their walked rank; placement on the destination spine anchors by
+    source time between its layer-0 segments (the projection re-sorts by
+    effective times, so a span the new carve disagrees with stays honest).
+    What does NOT transfer, by design: boundary shifts, text edits, and any
+    insert that GAINED text (word-bearing = spine-truth — new transcript, new
+    FA). Idempotent: a destination insert with the same label within
+    --tolerance of a donor span counts as already present and is skipped.
+    Commits require --graph-db-path (the flywheel journal rides the db
+    sidecar — journaling stays default-on); --dry-run needs neither."""
+    ws = resolve_workspace(explicit=getattr(args, "workspace", None))
+    if ws is not None:
+        os.environ["CJM_WORKSPACE"] = str(ws.root)
+    if args.manifests_dir is None:
+        args.manifests_dir = (str(ws.substrate_data_dir / "manifests")
+                              if ws is not None else ".cjm/manifests")
+    if not args.dry_run and not args.graph_db_path:
+        raise SystemExit("committing needs --graph-db-path (the journal sidecar hangs off it); "
+                         "use --dry-run to plan without one")
+    manager = CapabilityManager(search_paths=[Path(args.manifests_dir)])
+    configs = ({args.graph_capability: {"db_path": args.graph_db_path}}
+               if args.graph_db_path else None)
+    load_capabilities(manager, [args.graph_capability], configs=configs)
+    queue = JobQueue(deps=manager)
+    await queue.start()
+    try:
+        res = await graph_task(queue, args.graph_capability, "query_nodes",
+                               query=NodeQuery(label="Source", project=["title"]).to_dict())
+        needle = args.source.lower()
+        matches = [(r["id"], str(r.get("title") or "")) for r in (res.rows or [])
+                   if r["id"] == args.source or needle in str(r.get("title") or "").lower()]
+        if len(matches) != 1:
+            raise SystemExit(f"--source matched {len(matches)} Source nodes "
+                             f"({[t for _, t in matches]}); need exactly one")
+        sid, title = matches[0]
+        print(f"source: {title or sid}  ({sid})")
+
+        segs_from = await load_source_segments(
+            queue, args.graph_capability, sid,
+            rendition_selector=args.rendition, skeleton_selector=args.from_skeleton)
+        segs_to = await load_source_segments(
+            queue, args.graph_capability, sid,
+            rendition_selector=args.rendition, skeleton_selector=args.to_skeleton)
+        if not segs_from or not segs_to:
+            raise SystemExit(f"empty spine (from={len(segs_from)} to={len(segs_to)} segments)")
+        if {s.id for s in segs_from} == {s.id for s in segs_to}:
+            raise SystemExit("--from-skeleton and --to-skeleton resolved to the SAME spine")
+        print(f"spines: from {len(segs_from)} segs -> to {len(segs_to)} segs")
+
+        corrections, superseded = await load_source_corrections(queue, args.graph_capability, sid)
+        active = [c for c in corrections
+                  if c["id"] not in superseded and c.get("status") != "proposed"]
+        insert_meta = {c["id"]: (c.get("payload") or {}) for c in active
+                       if c.get("correction_type") == "insertion"
+                       and (c.get("payload") or {}).get("operation") == "chunk_insert"}
+
+        # Donors: labeled + effectively wordless units of the FROM projection.
+        eff_from = project_effective_spine(segs_from, active)
+        donors, word_bearing = [], 0
+        for u in eff_from:
+            meta = insert_meta.get(u.id)
+            if meta is None:
+                continue
+            label = meta.get("label")
+            if not label or (args.labels and label not in args.labels):
+                continue
+            if (u.text or "").strip():
+                word_bearing += 1
+                continue
+            if u.start_time is None or u.end_time is None:
+                continue
+            donors.append({"start": float(u.start_time), "end": float(u.end_time),
+                           "label": str(label), "rank": float(meta.get("rank") or 0.0)})
+
+        # Existing destination events (idempotency guard) from the TO projection.
+        eff_to = project_effective_spine(segs_to, active)
+        existing = [(str(insert_meta[u.id].get("label")), float(u.start_time))
+                    for u in eff_to
+                    if u.id in insert_meta and insert_meta[u.id].get("label")
+                    and u.start_time is not None]
+
+        to_l0 = sorted((s for s in segs_to if s.start_time is not None),
+                       key=lambda s: s.index)
+        plan, dups, unanchored = [], 0, 0
+        for d in donors:
+            if any(lb == d["label"] and abs(st - d["start"]) <= args.tolerance
+                   for lb, st in existing):
+                dups += 1
+                continue
+            after = None
+            pos = -1
+            for i, s in enumerate(to_l0):
+                if float(s.start_time) <= d["start"]:
+                    after, pos = s, i
+                else:
+                    break
+            if after is None:
+                unanchored += 1
+                continue
+            before = to_l0[pos + 1] if pos + 1 < len(to_l0) else None
+            plan.append({**d, "after_id": after.id,
+                         "before_id": before.id if before else None})
+
+        by_label: Dict[str, int] = {}
+        for p in plan:
+            by_label[p["label"]] = by_label.get(p["label"], 0) + 1
+        print(f"donors: {len(donors)}  ->  transfer {len(plan)}  "
+              f"(dup-skip {dups} · word-bearing-skip {word_bearing} · unanchored {unanchored})")
+        print("by label: " + (" · ".join(f"{k}x{v}" for k, v in sorted(by_label.items())) or "none"))
+        if args.dry_run:
+            for p in plan[:10]:
+                print(f"  {p['label']:>16} {p['start']:9.3f}-{p['end']:9.3f}s "
+                      f"after {p['after_id'][:8]}")
+            if len(plan) > 10:
+                print(f"  … {len(plan) - 10} more")
+            print("dry run — nothing committed")
+            return 0
+
+        jp = sidecar_journal_path(args.graph_db_path)
+        sess = await start_session(queue, args.graph_capability, [sid],
+                                   journal_path=jp, purpose="wordless-transfer")
+        for p in plan:
+            await commit_chunk_insert_correction(
+                queue, args.graph_capability, sid, p["after_id"],
+                p["start"], p["end"], sess.id,
+                before_segment_id=p["before_id"], label=p["label"], rank=p["rank"],
+                actor=args.actor, journal_path=jp)
+        await set_session_status(queue, args.graph_capability, sess.id,
+                                 "completed", journal_path=jp)
+        print(f"transferred {len(plan)} event inserts (session {sess.id})")
+    finally:
+        await queue.stop()
+        try:
+            manager.unload_capability(args.graph_capability)
+        except Exception as e:  # Best-effort teardown; never mask the transfer outcome
             logger.warning(f"unload {args.graph_capability} failed: {e}")
     return 0
