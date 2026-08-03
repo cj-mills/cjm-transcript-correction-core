@@ -2,12 +2,15 @@
 
 import argparse
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import sqlite3
 import time
+import uuid
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from cjm_context_graph_layer.journal import sidecar_journal_path
 from cjm_context_graph_layer.ops import graph_task
@@ -231,6 +234,72 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                           help="Print the transfer plan; commit nothing")
     transfer.add_argument("--actor", default="human", help="Actor recorded on the transferred inserts")
     transfer.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
+
+    export = sub.add_parser(
+        "export-wordless-propset",
+        help="Export one spine's effective wordless layer (accepted + nudged + "
+             "manual — exactly the transfer-wordless donor set) as a proposal "
+             "set a respine consumes as carve authority (f5d080b9 direction a)")
+    export.add_argument("--manifests-dir", default=None,
+                        help="Capability manifests directory (default: the workspace's "
+                             ".cjm/manifests when one is active, else .cjm/manifests "
+                             "under the cwd)")
+    export.add_argument("--workspace", default=None,
+                        help="Workspace root (default: CJM_WORKSPACE env, else upward walk from cwd)")
+    export.add_argument("--graph-capability", default="cjm-capability-graph-sqlite",
+                        help="Graph-storage capability name")
+    export.add_argument("--graph-db-path", default=None,
+                        help="Graph db path (reads only — default: the workspace "
+                             "capability config)")
+    export.add_argument("--source", required=True,
+                        help="Source node id or title substring (exactly one match)")
+    export.add_argument("--rendition", default=None,
+                        help="Which AudioRendition spine when a source has more than one")
+    export.add_argument("--from-skeleton", required=True,
+                        help="The walked spine whose effective wordless layer exports "
+                             "(\"legacy\" or a skeleton-hash prefix)")
+    export.add_argument("--labels", action="append", default=None,
+                        help="Restrict to these insert labels (repeatable; default: every "
+                             "labeled wordless insert)")
+    export.add_argument("--out-dir", default=None,
+                        help="Proposal-set root directory (default: <workspace>/proposals)")
+    export.add_argument("--dry-run", action="store_true",
+                        help="Print the export plan; write nothing")
+    export.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
+
+    scan = sub.add_parser(
+        "scan-mishomed",
+        help="Flag authoritative FA words stranded outside every chunk of a spine "
+             "(96edc646: mis-homed text — carve-sliver + VAD-gap detector; the "
+             "standing spine QA gate, reads only)")
+    scan.add_argument("--manifests-dir", default=None,
+                      help="Capability manifests directory (default: the workspace's "
+                           ".cjm/manifests when one is active, else .cjm/manifests "
+                           "under the cwd)")
+    scan.add_argument("--workspace", default=None,
+                      help="Workspace root (default: CJM_WORKSPACE env, else upward walk from cwd)")
+    scan.add_argument("--graph-capability", default="cjm-capability-graph-sqlite",
+                      help="Graph-storage capability name")
+    scan.add_argument("--graph-db-path", default=None,
+                      help="Graph db path (reads only — default: the workspace "
+                           "capability config)")
+    scan.add_argument("--source", required=True,
+                      help="Source node id or title substring (exactly one match)")
+    scan.add_argument("--rendition", default=None,
+                      help="Which AudioRendition spine when a source has more than one")
+    scan.add_argument("--skeleton", required=True,
+                      help="Which spine to scan (\"legacy\" or a skeleton-hash prefix)")
+    scan.add_argument("--fa-cache-db", default=None,
+                      help="Forced-alignment cache db (default: the workspace's "
+                           "qwen3-forced-aligner data dir)")
+    scan.add_argument("--min-overlap", type=float, default=0.03,
+                      help="Seconds of word/assigned-chunk overlap below which the word "
+                           "counts as mis-homed (the fold's assignment is replicated; a "
+                           "boundary-clipped word with real overlap is precision, not "
+                           "mis-homing)")
+    scan.add_argument("--strict", action="store_true",
+                      help="Exit nonzero when any mis-homed word is found (CI/QA gate mode)")
+    scan.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
     return parser
 
 
@@ -392,6 +461,10 @@ def main(
         return asyncio.run(bench_command(args))
     if args.command == "transfer-wordless":
         return asyncio.run(transfer_command(args))
+    if args.command == "export-wordless-propset":
+        return asyncio.run(export_command(args))
+    if args.command == "scan-mishomed":
+        return asyncio.run(scan_command(args))
     raise SystemExit(f"unknown command: {args.command}")
 
 
@@ -1002,23 +1075,11 @@ async def transfer_command(
                        if c.get("correction_type") == "insertion"
                        and (c.get("payload") or {}).get("operation") == "chunk_insert"}
 
-        # Donors: labeled + effectively wordless units of the FROM projection.
+        # Donors: labeled + effectively wordless units of the FROM projection
+        # (the shared wordless_donors definition — export-wordless-propset
+        # writes this exact set, f5d080b9 direction a).
         eff_from = project_effective_spine(segs_from, active)
-        donors, word_bearing = [], 0
-        for u in eff_from:
-            meta = insert_meta.get(u.id)
-            if meta is None:
-                continue
-            label = meta.get("label")
-            if not label or (args.labels and label not in args.labels):
-                continue
-            if (u.text or "").strip():
-                word_bearing += 1
-                continue
-            if u.start_time is None or u.end_time is None:
-                continue
-            donors.append({"start": float(u.start_time), "end": float(u.end_time),
-                           "label": str(label), "rank": float(meta.get("rank") or 0.0)})
+        donors, word_bearing = wordless_donors(eff_from, insert_meta, args.labels)
 
         # Existing destination events (idempotency guard) from the TO projection.
         eff_to = project_effective_spine(segs_to, active)
@@ -1081,5 +1142,364 @@ async def transfer_command(
         try:
             manager.unload_capability(args.graph_capability)
         except Exception as e:  # Best-effort teardown; never mask the transfer outcome
+            logger.warning(f"unload {args.graph_capability} failed: {e}")
+    return 0
+
+
+def wordless_donors(
+    effective_units: List,                    # project_effective_spine output for the donor spine
+    insert_meta: Dict[str, Dict],             # chunk_insert payloads keyed by effective-unit id
+    labels: Optional[List[str]] = None,       # Restrict to these labels (None = every labeled insert)
+) -> Tuple[List[Dict], int]:  # (donor rows {start,end,label,rank}, word-bearing skip count)
+    """The EFFECTIVE wordless layer of a spine: labeled, effectively wordless
+    chunk-insert units of its projection (time nudges applied — the heard span,
+    not the born one), rank preserved. ONE definition, two consumers
+    (f5d080b9 direction a): `transfer-wordless` replays these donors onto a
+    sibling spine; `export-wordless-propset` writes them out as a proposal set
+    a respine consumes as carve authority — so the exported carve spans are the
+    transfer donor set BY CONSTRUCTION and transferred events land in exact
+    gaps. An insert that GAINED text stays behind (word-bearing = spine-truth)."""
+    donors: List[Dict] = []
+    word_bearing = 0
+    for u in effective_units:
+        meta = insert_meta.get(u.id)
+        if meta is None:
+            continue
+        label = meta.get("label")
+        if not label or (labels and label not in labels):
+            continue
+        if (u.text or "").strip():
+            word_bearing += 1
+            continue
+        if u.start_time is None or u.end_time is None:
+            continue
+        donors.append({"start": float(u.start_time), "end": float(u.end_time),
+                       "label": str(label), "rank": float(meta.get("rank") or 0.0)})
+    return donors, word_bearing
+
+
+async def export_command(
+    args: argparse.Namespace,  # Parsed args for the `export-wordless-propset` subcommand
+) -> int:  # Process exit code
+    """Execute `export-wordless-propset`: write one spine's effective wordless
+    layer out as a proposal set (f5d080b9 direction a — effective-layer-as-
+    carve-authority).
+
+    The exported spans are exactly the `transfer-wordless` donor set (shared
+    `wordless_donors`: accepted + nudged + manual, word-bearing stays behind),
+    serialized in the proposal-set-manifest format the decomp carve and the
+    propset picker already consume (EVENT_PROPOSAL_SET_FORMAT; all rows tier 1
+    — human-verified spans ARE the operating point). A respine consuming the
+    set cuts at the refined spans, so a subsequent transfer-wordless lands
+    every event in an EXACT gap — the straddle class (2ba9e368) dies at the
+    root. Provenance: model.kind='human-effective-layer' + the donor spine's
+    skeleton hash; score carries each insert's preserved rank. Reads only —
+    no graph writes, no journal."""
+    ws = resolve_workspace(explicit=getattr(args, "workspace", None))
+    if ws is not None:
+        os.environ["CJM_WORKSPACE"] = str(ws.root)
+    if args.manifests_dir is None:
+        args.manifests_dir = (str(ws.substrate_data_dir / "manifests")
+                              if ws is not None else ".cjm/manifests")
+    out_root = (Path(args.out_dir) if args.out_dir
+                else (ws.root / "proposals" if ws is not None else None))
+    if out_root is None and not args.dry_run:
+        raise SystemExit("proposal sets land workspace-local — pass --out-dir "
+                         "or run inside a workspace (CJM_WORKSPACE)")
+    manager = CapabilityManager(search_paths=[Path(args.manifests_dir)])
+    configs = ({args.graph_capability: {"db_path": args.graph_db_path}}
+               if args.graph_db_path else None)
+    load_capabilities(manager, [args.graph_capability], configs=configs)
+    queue = JobQueue(deps=manager)
+    await queue.start()
+    try:
+        res = await graph_task(queue, args.graph_capability, "query_nodes",
+                               query=NodeQuery(label="Source",
+                                               project=["title", "path"]).to_dict())
+        needle = args.source.lower()
+        matches = [(r["id"], str(r.get("title") or ""), r.get("path"))
+                   for r in (res.rows or [])
+                   if r["id"] == args.source or needle in str(r.get("title") or "").lower()]
+        if len(matches) != 1:
+            raise SystemExit(f"--source matched {len(matches)} Source nodes "
+                             f"({[t for _, t, _ in matches]}); need exactly one")
+        sid, title, media_path = matches[0]
+        print(f"source: {title or sid}  ({sid})")
+
+        segs = await load_source_segments(
+            queue, args.graph_capability, sid,
+            rendition_selector=args.rendition, skeleton_selector=args.from_skeleton)
+        if not segs:
+            raise SystemExit("empty spine (0 segments)")
+        spines = await list_source_spines(queue, args.graph_capability, sid,
+                                          rendition_selector=args.rendition)
+        from_hash = skeleton_hash_for(spines, args.from_skeleton)
+
+        corrections, superseded = await load_source_corrections(queue, args.graph_capability, sid)
+        active = [c for c in corrections
+                  if c["id"] not in superseded and c.get("status") != "proposed"]
+        insert_meta = {c["id"]: (c.get("payload") or {}) for c in active
+                       if c.get("correction_type") == "insertion"
+                       and (c.get("payload") or {}).get("operation") == "chunk_insert"}
+        eff = project_effective_spine(segs, active)
+        donors, word_bearing = wordless_donors(eff, insert_meta, args.labels)
+        if not donors:
+            raise SystemExit("no wordless donors on this spine — nothing to export")
+        donors.sort(key=lambda d: d["start"])
+
+        counts: Dict[str, int] = {}
+        for d in donors:
+            counts[d["label"]] = counts.get(d["label"], 0) + 1
+        window_end = max((float(s.end_time) for s in segs
+                          if s.end_time is not None), default=donors[-1]["end"])
+        print(f"donors: {len(donors)}  (word-bearing-skip {word_bearing})")
+        print("by label: " + " · ".join(f"{k}x{v}" for k, v in sorted(counts.items())))
+        if args.dry_run:
+            for d in donors[:10]:
+                print(f"  {d['label']:>16} {d['start']:9.3f}-{d['end']:9.3f}s")
+            if len(donors) > 10:
+                print(f"  … {len(donors) - 10} more")
+            print("dry run — nothing written")
+            return 0
+
+        content_hash = None
+        if media_path and Path(media_path).is_file():
+            h = hashlib.sha256()
+            with open(media_path, "rb") as f:
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    h.update(block)
+            content_hash = f"sha256:{h.hexdigest()}"
+
+        started = time.time()
+        set_id = (f"propset_{time.strftime('%Y%m%d_%H%M%S', time.localtime(started))}"
+                  f"_{uuid.uuid4().hex[:8]}")
+        set_dir = out_root / set_id
+        set_dir.mkdir(parents=True)
+        with open(set_dir / "proposals.jsonl", "w") as f:
+            for d in donors:
+                f.write(json.dumps({
+                    "proposal_id": str(uuid.uuid4()),
+                    "label": d["label"],
+                    "start_time": round(d["start"], 4),
+                    "end_time": round(d["end"], 4),
+                    "score": round(d["rank"], 4),
+                    "tier": 1,
+                }) + "\n")
+        manifest = {
+            "format": EVENT_PROPOSAL_SET_FORMAT,
+            "version": "0.2.0",
+            "proposal_set_id": set_id,
+            "created_at": started,
+            "config": {
+                "exporter": "cjm-transcript-correction-core/export-wordless-propset",
+                "from_skeleton": args.from_skeleton,
+                "rendition": args.rendition,
+                "labels": sorted(args.labels) if args.labels else None,
+            },
+            "training_run_manifest": "",
+            "training_run_id": "",
+            "model": {"kind": "human-effective-layer",
+                      "from_skeleton_hash": from_hash},
+            "source": {"path": media_path, "content_hash": content_hash,
+                       "source_id": sid,
+                       **({"skeleton_hash": from_hash} if from_hash else {})},
+            "window": {"start": 0.0, "end": window_end},
+            "classes": sorted(counts),
+            "files": {"proposals": "proposals.jsonl"},
+            "counts": counts,
+        }
+        (set_dir / "manifest.json").write_text(
+            json.dumps(relativize_recorded(manifest, ws), indent=2))
+        print(f"proposal set {set_id} -> {set_dir}")
+        print("consume: decomp --respine --event-split "
+              f"--event-propset {set_dir / 'manifest.json'} "
+              + " ".join(f"--event-classes {c}" for c in sorted(counts)))
+    finally:
+        await queue.stop()
+        try:
+            manager.unload_capability(args.graph_capability)
+        except Exception as e:  # Best-effort teardown; never mask the export outcome
+            logger.warning(f"unload {args.graph_capability} failed: {e}")
+    return 0
+
+
+async def scan_command(
+    args: argparse.Namespace,  # Parsed args for the `scan-mishomed` subcommand
+) -> int:  # Process exit code (0 clean; 1 when mis-homed words found and --strict)
+    """Execute `scan-mishomed`: flag authoritative FA words stranded outside
+    every chunk of a spine (96edc646 verdict bc7ece7b — the mis-homed-text
+    detector, productized as the standing QA gate).
+
+    Two mechanisms strand real speech outside chunks — the carve's sliver
+    guard (M1) and VAD-missed speech in inter-chunk gaps (M2) — and the fold
+    then homes those words into the NEAREST chunk, whose audio does not
+    contain them. The pipeline computed the incriminating word times and
+    discarded them; this verb recovers them from the forced-alignment
+    capability's CACHE (word-level items keyed by sha256 of the aligned text
+    — a pragmatic read of a local durable artifact; if the cache schema ever
+    moves, the v2 path is an align call through the capability seam, which
+    cache-hits to the same rows). Join chain, fully typed: chunk.text_from ->
+    Transcript(text, rendition_id) -> AudioRendition(audio_segment_id) ->
+    AudioSegment(start offset). Classification against the source's LATEST
+    proposal set (auto-discovered): a gap whose unexplained stretch >= 0.5s =
+    vad-gap, else carve-sliver; no set = unclassified. Reads only."""
+    ws = resolve_workspace(explicit=getattr(args, "workspace", None))
+    if ws is not None:
+        os.environ["CJM_WORKSPACE"] = str(ws.root)
+    if args.manifests_dir is None:
+        args.manifests_dir = (str(ws.substrate_data_dir / "manifests")
+                              if ws is not None else ".cjm/manifests")
+    fa_cache = (Path(args.fa_cache_db) if args.fa_cache_db
+                else (ws.substrate_data_dir / "data" / "cjm-capability-qwen3-forced-aligner"
+                      / "forced_alignments.db" if ws is not None else None))
+    if fa_cache is None or not fa_cache.is_file():
+        raise SystemExit(f"forced-alignment cache not found ({fa_cache}) — "
+                         "pass --fa-cache-db")
+    manager = CapabilityManager(search_paths=[Path(args.manifests_dir)])
+    configs = ({args.graph_capability: {"db_path": args.graph_db_path}}
+               if args.graph_db_path else None)
+    load_capabilities(manager, [args.graph_capability], configs=configs)
+    queue = JobQueue(deps=manager)
+    await queue.start()
+    try:
+        res = await graph_task(queue, args.graph_capability, "query_nodes",
+                               query=NodeQuery(label="Source", project=["title"]).to_dict())
+        needle = args.source.lower()
+        matches = [(r["id"], str(r.get("title") or "")) for r in (res.rows or [])
+                   if r["id"] == args.source or needle in str(r.get("title") or "").lower()]
+        if len(matches) != 1:
+            raise SystemExit(f"--source matched {len(matches)} Source nodes "
+                             f"({[t for _, t in matches]}); need exactly one")
+        sid, title = matches[0]
+        print(f"source: {title or sid}  ({sid})")
+
+        segs = await load_source_segments(
+            queue, args.graph_capability, sid,
+            rendition_selector=args.rendition, skeleton_selector=args.skeleton)
+        chunks = sorted((s for s in segs if s.start_time is not None),
+                        key=lambda s: float(s.start_time))
+        if not chunks:
+            raise SystemExit("empty spine (0 timed segments)")
+
+        async def _props(node_id: str) -> Dict:
+            node = await graph_task(queue, args.graph_capability, "get_node",
+                                    node_id=node_id)
+            if node is None:
+                return {}
+            d = node if isinstance(node, dict) else node.to_dict()
+            return d.get("properties") or {}
+
+        words: List[Dict] = []  # {"s","e","text"} in source seconds
+        unmatched = 0
+        fa = sqlite3.connect(f"file:{fa_cache}?mode=ro", uri=True)
+        try:
+            for tid in sorted({s.text_from for s in chunks if s.text_from}):
+                tp = await _props(tid)
+                text, rid = str(tp.get("text") or ""), tp.get("rendition_id")
+                if not text or not rid:
+                    unmatched += 1
+                    continue
+                base = None
+                aseg_id = (await _props(rid)).get("audio_segment_id")
+                if aseg_id:
+                    base = (await _props(aseg_id)).get("start")
+                if base is None:
+                    unmatched += 1
+                    continue
+                th = "sha256:" + hashlib.sha256(text.encode()).hexdigest()
+                row = fa.execute("SELECT items FROM forced_alignments WHERE text_hash=? "
+                                 "ORDER BY created_at DESC LIMIT 1", (th,)).fetchone()
+                if not row:
+                    unmatched += 1
+                    continue
+                for w in json.loads(row[0]):
+                    words.append({"s": float(base) + float(w["start_time"]),
+                                  "e": float(base) + float(w["end_time"]),
+                                  "text": str(w.get("text") or "")})
+        finally:
+            fa.close()
+        words.sort(key=lambda w: w["s"])
+
+        # Mis-homed = the chunk the FOLD assigns the word to contains
+        # (essentially) none of the word's audio. Assignment replicates the
+        # CURRENT assign_words_to_chunks (word-rescue/v4 fold rule): argmax
+        # overlap, with start-containment/nearest-edge only as the
+        # zero-overlap fallback — so a word merely clipped by a boundary is
+        # precision, not mis-homing. On spines folded before v4 the scan
+        # mildly under-reports (older folds mis-homed MORE). The residue this
+        # flags on a v4 spine = words FA placed FULLY inside verified event
+        # spans — correction-lane material, structurally unfixable without
+        # re-embedding the event.
+        bounds = [(float(c.start_time), float(c.end_time)) for c in chunks]
+        flagged = []
+        for w in words:
+            if w["e"] <= w["s"]:
+                continue
+            home = None
+            best_ov = 0.0
+            for s, e in bounds:
+                ov = min(w["e"], e) - max(w["s"], s)
+                if ov > best_ov:
+                    best_ov, home = ov, (s, e)
+            if best_ov <= 0.0:
+                best_d = float("inf")
+                for s, e in bounds:
+                    if s <= w["s"] < e:
+                        home = (s, e)
+                        break
+                    d = min(abs(w["s"] - s), abs(w["s"] - e))
+                    if d < best_d:
+                        best_d, home = d, (s, e)
+            overlap = (min(w["e"], home[1]) - max(w["s"], home[0])) if home else 0.0
+            if overlap < args.min_overlap:
+                flagged.append(w)
+
+        ps = load_event_proposal_set(str(ws.root), source_id=sid) if ws else None
+        spans = sorted((float(r["start_time"]), float(r["end_time"]))
+                       for r in (ps["proposals"] if ps else []))
+
+        instances: List[Dict] = []
+        for w in flagged:
+            prev_c = max((c for c in chunks if float(c.end_time) <= w["s"] + 0.02),
+                         key=lambda c: float(c.end_time), default=None)
+            next_c = min((c for c in chunks if float(c.start_time) >= w["e"] - 0.02),
+                         key=lambda c: float(c.start_time), default=None)
+            key = (prev_c.index if prev_c else -1, next_c.index if next_c else -1)
+            if instances and instances[-1]["key"] == key:
+                instances[-1]["words"].append(w)
+            else:
+                instances.append({"key": key, "words": [w],
+                                  "gap": (float(prev_c.end_time) if prev_c else 0.0,
+                                          float(next_c.start_time) if next_c else float("inf"))})
+        for inst in instances:
+            g0, g1 = inst["gap"]
+            cursor, unexplained = g0, 0.0
+            for s, e in ((max(s, g0), min(e, g1)) for s, e in spans if s < g1 and e > g0):
+                unexplained = max(unexplained, s - cursor)
+                cursor = max(cursor, e)
+            unexplained = max(unexplained, g1 - cursor)
+            inst["mech"] = (("vad-gap" if unexplained >= 0.5 else "carve-sliver")
+                            if ps else "unclassified")
+
+        by: Dict[str, int] = {}
+        for inst in instances:
+            by[inst["mech"]] = by.get(inst["mech"], 0) + 1
+        print(f"chunks {len(chunks)} · FA words {len(words)} · "
+              f"transcripts without FA/aseg match {unmatched}")
+        print(f"mis-homed words {len(flagged)} -> instances {len(instances)}"
+              + (f"  ({' · '.join(f'{k} {v}' for k, v in sorted(by.items()))})"
+                 if instances else ""))
+        for inst in instances:
+            txt = " ".join(w["text"] for w in inst["words"])
+            print(f"  between #{inst['key'][0]} and #{inst['key'][1]} "
+                  f"[{inst['mech']}] {txt!r} "
+                  f"@ {inst['words'][0]['s']:.3f}-{inst['words'][-1]['e']:.3f}s")
+        if instances and args.strict:
+            return 1
+    finally:
+        await queue.stop()
+        try:
+            manager.unload_capability(args.graph_capability)
+        except Exception as e:  # Best-effort teardown; never mask the scan outcome
             logger.warning(f"unload {args.graph_capability} failed: {e}")
     return 0

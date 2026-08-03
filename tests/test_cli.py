@@ -68,3 +68,37 @@ def test_extract_subcommand():
                        "--output-dir", "/tmp/ds", "--rendition", "raw"])
     assert ns.include_purpose == ["genuine", "feature-test"]
     assert ns.source == "Chris" and ns.output_dir == "/tmp/ds"
+
+
+def test_export_wordless_propset_subcommand():
+    """The export surface (f5d080b9 direction a): sibling of transfer-wordless
+    sharing its source/spine selectors; the exported set is the transfer donor
+    set, so the flags mirror transfer minus the destination/commit half."""
+    p = build_parser()
+    ns = p.parse_args(["export-wordless-propset", "--source", "Chris",
+                       "--from-skeleton", "1223b0ab"])
+    assert ns.command == "export-wordless-propset"
+    assert ns.source == "Chris" and ns.from_skeleton == "1223b0ab"
+    assert ns.labels is None and ns.out_dir is None and ns.dry_run is False
+    assert ns.graph_capability == "cjm-capability-graph-sqlite"
+    ns = p.parse_args(["export-wordless-propset", "--source", "x",
+                       "--from-skeleton", "legacy", "--labels", "inhale",
+                       "--labels", "click", "--out-dir", "/tmp/ps", "--dry-run"])
+    assert ns.labels == ["inhale", "click"] and ns.out_dir == "/tmp/ps" and ns.dry_run
+    with pytest.raises(SystemExit):
+        p.parse_args(["export-wordless-propset", "--source", "x"])  # --from-skeleton required
+
+
+def test_scan_mishomed_subcommand():
+    """The scan surface (96edc646 verdict bc7ece7b): read-only QA gate sharing
+    the source/spine selectors; --strict flips it into a nonzero-exit gate."""
+    p = build_parser()
+    ns = p.parse_args(["scan-mishomed", "--source", "Chris", "--skeleton", "ffdfd489"])
+    assert ns.command == "scan-mishomed"
+    assert ns.source == "Chris" and ns.skeleton == "ffdfd489"
+    assert ns.fa_cache_db is None and ns.min_overlap == 0.03 and ns.strict is False
+    ns = p.parse_args(["scan-mishomed", "--source", "x", "--skeleton", "legacy",
+                       "--fa-cache-db", "/tmp/fa.db", "--min-overlap", "0.05", "--strict"])
+    assert ns.fa_cache_db == "/tmp/fa.db" and ns.min_overlap == 0.05 and ns.strict
+    with pytest.raises(SystemExit):
+        p.parse_args(["scan-mishomed", "--source", "x"])  # --skeleton required
