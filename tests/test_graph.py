@@ -937,3 +937,116 @@ def test_gap_insert_run_resorts_by_effective_times():
     ]
     out = reorder_gap_inserts(project_effective_spine(segs, tied), tied)
     assert [s.id for s in out] == ["a", "t2", "t1", "b"]
+
+
+def test_build_speech_overlay_correction_shape_and_validation():
+    from cjm_transcript_correction_core.graph import build_speech_overlay_correction
+    anchor = {"kind": "span", "segment_id": "c", "char_start": 0, "char_end": 5,
+              "text_snapshot": "world"}
+    node, edges = build_speech_overlay_correction(
+        "src1", anchor, "hesitation-marker", 10.0, 10.6, "world", session_id="s1",
+        words=[{"s": 10.0, "e": 10.6, "text": "world"}], snap="fa-word",
+        note="drive sample")
+    props = node["properties"]
+    assert props["correction_type"] == "annotation"
+    assert props["payload"]["operation"] == "speech_overlay"
+    assert props["payload"]["label"] == "hesitation-marker"
+    assert props["payload"]["snap"] == "fa-word"
+    assert props["payload"]["anchor"]["text_snapshot"] == "world"
+    assert props["payload"]["words"][0]["e"] == 10.6
+    assert [(e["relation_type"], e["target_id"]) for e in edges] == [("CORRECTS", "c")]
+    # supersession is an edge (re-annotate / relabel)
+    _, edges = build_speech_overlay_correction(
+        "src1", anchor, "false-start", 10.0, 10.6, "world", session_id="s1",
+        supersedes_id="o0")
+    assert ("SUPERSEDES", "o0") in [(e["relation_type"], e["target_id"]) for e in edges]
+
+    def rejects(**kw):
+        args = dict(source_id="src1", anchor=anchor, label="word-repeat",
+                    start_time=10.0, end_time=10.6, text="world", session_id="s1")
+        args.update(kw)
+        try:
+            build_speech_overlay_correction(**args)
+        except ValueError:
+            return True
+        return False
+    assert rejects(label="  ")
+    assert rejects(label="-x")           # punctuation-led labels reserved for gestures
+    assert rejects(anchor={"kind": "segment", "segment_id": "c"})  # span-only identity
+    assert rejects(text="   ")           # a sample without its words is no sample
+    assert rejects(end_time=10.0)        # zero/negative duration
+
+
+def test_speech_overlay_never_touches_projection():
+    """The fc42614d invariant: overlays are spans OVER words — they never cut
+    the spine; corrections_to_edits has no arm for correction_type "annotation"."""
+    from cjm_transcript_correction_core.graph import build_speech_overlay_correction
+    node, _ = build_speech_overlay_correction(
+        "src1", {"kind": "span", "segment_id": "a", "char_start": 0, "char_end": 5,
+                 "text_snapshot": "hello"},
+        "hesitation-marker", 1.0, 1.4, "hello", session_id="s1")
+    props = dict(node["properties"])
+    props["id"] = node["id"]
+    assert corrections_to_edits([props]) == []
+    out = project_effective_spine(SEGS, [props])
+    assert [(s.id, s.text) for s in out] == [(s.id, s.text) for s in SEGS]
+
+
+def test_speech_overlay_lifecycle_and_spans_fold():
+    from cjm_transcript_correction_core.graph import (active_speech_overlays,
+                                                      build_speech_overlay_correction,
+                                                      speech_overlay_spans)
+    o1, _ = build_speech_overlay_correction(
+        "src1", {"kind": "span", "segment_id": "a", "char_start": 0, "char_end": 5,
+                 "text_snapshot": "hello"},
+        "hesitation-marker", 5.0, 5.4, "hello", session_id="s1", snap="fa-word")
+    o2, _ = build_speech_overlay_correction(
+        "src1", {"kind": "span", "segment_id": "c", "char_start": 0, "char_end": 5,
+                 "text_snapshot": "world"},
+        "word-repeat", 2.0, 2.5, "world", session_id="s2", snap="estimated")
+    rows = []
+    for n in (o1, o2):
+        p = dict(n["properties"])
+        p["id"] = n["id"]
+        rows.append(p)
+    assert [c["id"] for c in active_speech_overlays(rows, set())] == [o1["id"], o2["id"]]
+    # removal = reject-as-supersede (the mark-dismiss shape)
+    rej, _ = build_reject_review("src1", o1["id"], session_id="s1")
+    rp = dict(rej["properties"])
+    rp["id"] = rej["id"]
+    assert [c["id"] for c in active_speech_overlays(rows + [rp], {o1["id"]})] == [o2["id"]]
+    # the extraction fold: time-ordered records carrying span + label + text + anchor
+    spans = speech_overlay_spans(rows, set())
+    assert [r["overlay_id"] for r in spans] == [o2["id"], o1["id"]]  # (start_time) order
+    r = spans[1]
+    assert r["label"] == "hesitation-marker" and r["text"] == "hello"
+    assert r["segment_id"] == "a" and r["char_end"] == 5 and r["snap"] == "fa-word"
+    assert r["session_id"] == "s1" and r["op_ids"] == [o1["id"]]
+
+
+def test_extract_spine_dataset_overlay_cuts():
+    """Overlays ride the same watermark + purpose cuts as insert examples and
+    never occupy negative regions (they live INSIDE speech)."""
+    from cjm_transcript_correction_core.graph import (build_speech_overlay_correction,
+                                                      extract_spine_dataset)
+    from cjm_transcript_correction_core.models import SpineSegment
+    segs = [SpineSegment(id="a", index=0, text="hello there", start_time=0.0, end_time=2.0),
+            SpineSegment(id="b", index=1, text="again", start_time=6.0, end_time=7.0)]
+    rows = []
+    for label, seg, s, e, sess in (("hesitation-marker", "a", 0.5, 0.9, "s1"),
+                                   ("word-repeat", "a", 1.2, 1.6, "s2"),
+                                   ("false-start", "b", 6.2, 6.6, "s1")):
+        n, _ = build_speech_overlay_correction(
+            "src1", {"kind": "span", "segment_id": seg, "char_start": 0, "char_end": 5,
+                     "text_snapshot": "hello"}, label, s, e, "hello", session_id=sess)
+        p = dict(n["properties"])
+        p["id"] = n["id"]
+        rows.append(p)
+    gate = {"extraction_status": "in_progress", "annotated_through": 5.0}
+    out = extract_spine_dataset(segs, rows, set(), gate, include_session_ids={"s1"})
+    assert [r["label"] for r in out["overlays"]] == ["hesitation-marker"]
+    assert out["skipped"]["overlay_session_purpose"] == 1     # s2 cut by purpose policy
+    assert out["skipped"]["overlay_above_watermark"] == 1     # 6.2 > watermark 5.0
+    # negatives derive from speech + insert spans only — the overlay at
+    # 0.5-0.9 sits inside speech [0,2] and must not re-shape the gaps
+    assert out["negatives"] == [{"start_time": 2.0, "end_time": 5.0}]

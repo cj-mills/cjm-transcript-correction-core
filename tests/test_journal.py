@@ -39,6 +39,7 @@ def test_journal_correction_op_envelope(tmp_path):
                                                  "review-markers", "session-status", "session-purpose",
                                                  "time-nudge", "chunk-insert", "chunk-insert-remove",
                                                  "chunk-split", "chunk-split-remove",
+                                                 "speech-overlay", "speech-overlay-remove",
                                                  "speaker-entity", "speaker-assign",
                                                  "entity-rename", "extraction-gate"}
 

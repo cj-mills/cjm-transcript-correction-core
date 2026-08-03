@@ -216,6 +216,18 @@ RECOMMENDED_INSERT_LABELS = (
     "missed-speech",       # a chunk VAD never cut (the de994164 dispatch class)
 )
 
+# The RECOMMENDED speech-overlay label slate (check fc42614d, DEC 4e05a066) — the
+# same OPEN-vocabulary regime as mark classes and insert labels: labels are DATA,
+# not schema. Speech overlays are word-span samples OVER spoken words (a second
+# sample layer beside the wordless insert layer — they never cut the spine); this
+# tuple seeds the annotate lane's digit menu, and a new label typed mid-drive is
+# a journal entry, never a core release.
+RECOMMENDED_OVERLAY_LABELS = (
+    "hesitation-marker",   # um / uh / you-know spans (the e713a9ce detector's primary class)
+    "false-start",         # speaker restarts mid-utterance (self-correction span)
+    "word-repeat",         # repeated words / stutters
+)
+
 
 @dataclass
 class Entity:

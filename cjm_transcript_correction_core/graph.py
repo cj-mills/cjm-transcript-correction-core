@@ -1,7 +1,11 @@
 """The correction overlay's graph I/O: targeted (scale-shaped) reads of a committed spine via the graph-storage query action, construction of Correction / CorrectionSession nodes + CORRECTS / SUPERSEDES / DERIVED_FROM / REVIEWED edges, the in-core effective-spine projection (layer-0 + applied corrections), and commit through the job queue. Hand-rolled (revolution-1) = direct CR-18 spec material; append-only on layer-0 (never update/delete a Segment)."""
 
+import hashlib
+import json
+import sqlite3
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 from uuid import uuid4
 
 from cjm_context_graph_layer.edits import (project_effective_spine as layer_project_effective_spine,
@@ -2133,7 +2137,7 @@ def extract_spine_dataset(
     superseded_ids: set,                # SUPERSEDES targets (GLOBAL)
     gate: Optional[Dict[str, Any]],     # Live gate assertion (None = the in_progress default)
     include_session_ids: Optional[set] = None,  # Sessions whose spans qualify as EXAMPLES (None = all; the purpose-policy cut)
-) -> Dict[str, Any]:  # {"eligible","status","watermark","examples","speech","negatives","skipped"}
+) -> Dict[str, Any]:  # {"eligible","status","watermark","examples","overlays","speech","negatives","skipped"}
     """Fold ONE spine's overlay into its v1 insert-span dataset slice (pure).
 
     The leg-2 extraction fold (DECs d02a38d4 + 16159e09 + 8e05b87b): the GATE
@@ -2150,8 +2154,8 @@ def extract_spine_dataset(
     wm = (gate or {}).get("annotated_through")
     base = {"status": status, "watermark": (float(wm) if wm is not None else None)}
     if status == "excluded" or wm is None:
-        return {**base, "eligible": False, "examples": [], "speech": [],
-                "negatives": [], "skipped": {}}
+        return {**base, "eligible": False, "examples": [], "overlays": [],
+                "speech": [], "negatives": [], "skipped": {}}
     wm = float(wm)
     spans = labeled_insert_spans(segments, corrections, superseded_ids)
     examples: List[Dict[str, Any]] = []
@@ -2165,6 +2169,17 @@ def extract_spine_dataset(
             skipped["session_purpose"] = skipped.get("session_purpose", 0) + 1
         else:
             examples.append(r)
+    # Speech overlays: the SECOND sample source (check fc42614d, DEC 4e05a066)
+    # — word-span samples over speech, same watermark + purpose cuts. They do
+    # NOT occupy negative regions: they live INSIDE speech, which already does.
+    overlays: List[Dict[str, Any]] = []
+    for r in speech_overlay_spans(corrections, superseded_ids):
+        if r["start_time"] >= wm:
+            skipped["overlay_above_watermark"] = skipped.get("overlay_above_watermark", 0) + 1
+        elif include_session_ids is not None and r["session_id"] not in include_session_ids:
+            skipped["overlay_session_purpose"] = skipped.get("overlay_session_purpose", 0) + 1
+        else:
+            overlays.append(r)
     actives = active_corrections(corrections, superseded_ids)
     speech = [{"segment_id": s.id, "start_time": float(s.start_time),
                "end_time": min(float(s.end_time), wm)}
@@ -2174,7 +2189,8 @@ def extract_spine_dataset(
               and float(s.start_time) < wm and float(s.end_time) > float(s.start_time)]
     occupied = ([(r["start_time"], r["end_time"]) for r in spans]
                 + [(s["start_time"], s["end_time"]) for s in speech])
-    return {**base, "eligible": True, "examples": examples, "speech": speech,
+    return {**base, "eligible": True, "examples": examples, "overlays": overlays,
+            "speech": speech,
             "negatives": [{"start_time": a, "end_time": b}
                           for a, b in negative_regions(occupied, wm)],
             "skipped": skipped}
@@ -2331,3 +2347,220 @@ def reorder_gap_inserts(
             out.append(s)
     flush()
     return out
+
+
+def build_speech_overlay_correction(
+    source_id: str,                       # Source the annotated segment belongs to
+    anchor: Dict[str, Any],               # SPAN anchor: {kind:"span", segment_id, char_start, char_end, text_snapshot}
+    label: str,                           # Open-vocabulary class (RECOMMENDED_OVERLAY_LABELS is the slate)
+    start_time: float,                    # Span start (source-coordinate seconds, FA-snapped)
+    end_time: float,                      # Span end (source-coordinate seconds, FA-snapped)
+    text: str,                            # The selected words, verbatim (= the anchor's text_snapshot)
+    session_id: str,                      # Owning session id
+    words: Optional[List[Dict[str, Any]]] = None,  # Matched FA words [{"s","e","text"}] the span derived from
+    snap: Optional[str] = None,           # Time provenance: "fa-word" | "estimated"
+    supersedes_id: Optional[str] = None,  # Prior overlay this one replaces (re-annotate)
+    actor: str = "human",                 # Actor ("human" | "capability:<name>" for detector propsets)
+    note: Optional[str] = None,           # Optional free-text note
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (correction node dict, edge dicts)
+    """Build a NON-MUTATING speech-overlay Correction (check fc42614d, DEC 4e05a066).
+
+    A speech overlay is a word-span SAMPLE over spoken words — the second
+    sample layer beside the wordless insert layer: text-indexed identity (the
+    mark span-anchor shape, so `reanchor_span` machinery applies) plus the
+    FA-snapped time span, label, and verbatim text. `corrections_to_edits`
+    has no arm for it, so it can never touch the effective view — overlays
+    never cut the spine. Removal/relabel = supersession (append-only). Shaped
+    for the flywheel from day one: a detector's propsets ride this same
+    record propose-style (status/actor distinguish them)."""
+    lab = (label or "").strip()
+    if not lab:
+        raise ValueError("overlay label must be a non-empty string")
+    if not lab[:1].isalnum():
+        raise ValueError(f"overlay label must start with a letter or digit, got {label!r}")
+    if anchor.get("kind") != "span":
+        raise ValueError(f"speech overlay anchor must be kind 'span', got {anchor.get('kind')!r}")
+    seg_ids = mark_anchor_segments(anchor)
+    if not (text or "").strip():
+        raise ValueError("speech overlay needs the selected words' verbatim text")
+    s, e = float(start_time), float(end_time)
+    if e <= s:
+        raise ValueError(f"overlay span must have positive duration ({s} .. {e})")
+    payload = {"operation": "speech_overlay", "source_id": source_id,
+               "anchor": dict(anchor), "label": lab,
+               "start_time": s, "end_time": e, "text": text,
+               "words": [dict(w) for w in (words or [])],
+               "snap": snap or "estimated"}
+    node = build_correction_node("annotation", session_id, payload, actor=actor,
+                                 rationale=note).to_graph_node()
+    edges = [make_edge(node.id, sid, CorrectionRelations.CORRECTS) for sid in seg_ids]
+    if supersedes_id:
+        edges.append(make_edge(node.id, supersedes_id, CorrectionRelations.SUPERSEDES))
+    return node.to_dict(), edges
+
+
+async def commit_speech_overlay_correction(
+    queue: JobQueue,                      # Started job queue
+    graph_id: str,                        # Graph-storage capability id
+    source_id: str,                       # Source the annotated segment belongs to
+    anchor: Dict[str, Any],               # SPAN anchor (see build_speech_overlay_correction)
+    label: str,                           # Open-vocabulary class
+    start_time: float,                    # Span start (source seconds)
+    end_time: float,                      # Span end (source seconds)
+    text: str,                            # Selected words, verbatim
+    session_id: str,                      # Owning session id
+    words: Optional[List[Dict[str, Any]]] = None,  # Matched FA words
+    snap: Optional[str] = None,           # "fa-word" | "estimated"
+    supersedes_id: Optional[str] = None,  # Prior overlay to supersede
+    actor: str = "human",                 # Actor
+    note: Optional[str] = None,           # Optional note
+    journal_path: Optional[str] = None,   # Sidecar journal — append the op on success (None = unjournaled)
+) -> str:  # The new overlay Correction node id
+    """Commit a speech overlay (node + CORRECTS [+ SUPERSEDES]).
+
+    NO review marker: like a mark, an overlay is annotation, not a review
+    decision — the walked-past state stays exactly as the operator left it."""
+    node, edges = build_speech_overlay_correction(
+        source_id, anchor, label, start_time, end_time, text, session_id,
+        words=words, snap=snap, supersedes_id=supersedes_id, actor=actor, note=note)
+    await commit_nodes_edges(queue, graph_id, [node], edges)
+    if journal_path:
+        journal_correction_op(journal_path, "speech-overlay", actor=actor,
+                              session_id=session_id,
+                              args={"source_id": source_id, "anchor": dict(anchor),
+                                    "label": label, "start_time": float(start_time),
+                                    "end_time": float(end_time), "text": text,
+                                    "words": [dict(w) for w in (words or [])],
+                                    "snap": snap or "estimated", "note": note,
+                                    "supersedes_id": supersedes_id},
+                              anchor=await segment_anchor(queue, graph_id,
+                                                          mark_anchor_segments(anchor)),
+                              nodes=[node], edges=edges, op_id=node["id"])
+    return node["id"]
+
+
+async def commit_speech_overlay_removal(
+    queue: JobQueue,                     # Started job queue
+    graph_id: str,                       # Graph-storage capability id
+    source_id: str,                      # Source the overlay belongs to
+    overlay_id: str,                     # The active overlay being removed
+    session_id: str,                     # Owning session id
+    actor: str = "human",                # Actor (the remover)
+    note: Optional[str] = None,          # Optional note (why removed)
+    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+) -> str:  # The review node id that superseded the overlay
+    """Remove a speech overlay WITHOUT a replacement (reject-as-supersede).
+
+    Rides the review verdict shape (`build_reject_review`), exactly the
+    mark-dismissal pattern: a SUPERSEDES edge from a small review node;
+    `active_speech_overlays` then excludes it. No anchor on the journal op —
+    removal is derivative session state (the ccbab9f5 anchor scope)."""
+    node, edges = build_reject_review(source_id, overlay_id, session_id,
+                                      actor=actor, rationale=note)
+    await commit_nodes_edges(queue, graph_id, [node], edges)
+    if journal_path:
+        journal_correction_op(journal_path, "speech-overlay-remove", actor=actor,
+                              session_id=session_id,
+                              args={"source_id": source_id, "overlay_id": overlay_id,
+                                    "note": note},
+                              nodes=[node], edges=edges, op_id=node["id"])
+    return node["id"]
+
+
+def active_speech_overlays(
+    corrections: List[Dict[str, Any]],  # Corrections (e.g. from load_source_corrections)
+    superseded_ids: set,                # Ids that are SUPERSEDES targets
+) -> List[Dict[str, Any]]:  # The ACTIVE speech overlays, oldest first
+    """The surviving speech-overlay corrections (supersession applied; pure)."""
+    out = [c for c in active_corrections(corrections, superseded_ids)
+           if c.get("correction_type") == "annotation"
+           and (c.get("payload") or {}).get("operation") == "speech_overlay"]
+    out.sort(key=lambda c: float(c.get("created_at") or 0.0))
+    return out
+
+
+def speech_overlay_spans(
+    corrections: List[Dict[str, Any]],  # One Source's corrections (all sessions)
+    superseded_ids: set,                # SUPERSEDES targets (GLOBAL)
+) -> List[Dict[str, Any]]:  # Span records ordered by (start_time, end_time)
+    """Fold the ACTIVE speech overlays into extraction-facing span records (pure).
+
+    The flywheel's SECOND sample source (check fc42614d, DEC 4e05a066), the
+    `labeled_insert_spans` dual for spans OVER words: each active overlay is
+    one record — label + verbatim text + FA-snapped span + the text-indexed
+    anchor + the matched word times; `session_id` is the owning session (the
+    purpose-policy cut key). Times come straight from the payload (overlays
+    are not nudge targets; refinement supersedes)."""
+    out: List[Dict[str, Any]] = []
+    for c in active_speech_overlays(corrections, superseded_ids):
+        p = c.get("payload") or {}
+        if p.get("start_time") is None or p.get("end_time") is None:
+            continue
+        anchor = p.get("anchor") or {}
+        out.append({
+            "overlay_id": c["id"],
+            "label": p.get("label"),
+            "text": str(p.get("text") or ""),
+            "start_time": float(p["start_time"]),
+            "end_time": float(p["end_time"]),
+            "segment_id": anchor.get("segment_id"),
+            "char_start": anchor.get("char_start"),
+            "char_end": anchor.get("char_end"),
+            "words": list(p.get("words") or []),
+            "snap": p.get("snap"),
+            "session_id": str(c.get("session_id") or ""),
+            "op_ids": [c["id"]],
+        })
+    out.sort(key=lambda r: (r["start_time"], r["end_time"]))
+    return out
+
+
+async def fa_words_for_transcript(
+    queue: JobQueue,                    # Started job queue
+    graph_id: str,                      # Graph-storage capability id
+    transcript_id: str,                 # The Transcript node a chunk's text_from designates
+    fa_cache_db: Union[str, Path],      # The forced-alignment capability's cache db
+) -> Optional[List[Dict[str, Any]]]:  # [{"s","e","text"}] in SOURCE seconds; None = join miss
+    """One transcript's FA words in source coordinates (the scan-mishomed join,
+    productized at its second consumer — DEC 4e05a066).
+
+    Join chain, fully typed: Transcript(text, rendition_id) ->
+    AudioRendition(audio_segment_id) -> AudioSegment(start offset), then the
+    forced-alignment CACHE keyed by sha256 of the aligned text (a pragmatic
+    read of a local durable artifact; if the cache schema ever moves, the v2
+    path is an align call through the capability seam, which cache-hits to
+    the same rows). None on any missing link — callers degrade (the TUI falls
+    back to char-fraction estimation), never crash."""
+    async def _props(node_id: str) -> Dict[str, Any]:
+        node = await graph_task(queue, graph_id, "get_node", node_id=node_id)
+        if node is None:
+            return {}
+        d = node if isinstance(node, dict) else node.to_dict()
+        return d.get("properties") or {}
+
+    tp = await _props(str(transcript_id))
+    text, rid = str(tp.get("text") or ""), tp.get("rendition_id")
+    if not text or not rid:
+        return None
+    aseg_id = (await _props(str(rid))).get("audio_segment_id")
+    if not aseg_id:
+        return None
+    base = (await _props(str(aseg_id))).get("start")
+    if base is None:
+        return None
+    path = Path(fa_cache_db)
+    if not path.is_file():
+        return None
+    th = "sha256:" + hashlib.sha256(text.encode()).hexdigest()
+    fa = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        row = fa.execute("SELECT items FROM forced_alignments WHERE text_hash=? "
+                         "ORDER BY created_at DESC LIMIT 1", (th,)).fetchone()
+    finally:
+        fa.close()
+    if not row:
+        return None
+    return [{"s": float(base) + float(w["start_time"]),
+             "e": float(base) + float(w["end_time"]),
+             "text": str(w.get("text") or "")}
+            for w in json.loads(row[0])]
