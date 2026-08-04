@@ -10,7 +10,7 @@ import sqlite3
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from cjm_context_graph_layer.journal import sidecar_journal_path
 from cjm_context_graph_layer.ops import graph_task
@@ -677,6 +677,43 @@ def _gate_line(
             f" by {gate.get('actor')}")
 
 
+def overlay_event_rows(
+    src: Dict[str, Any],                 # Source record ({"id","title","path","content_hash"})
+    skeleton_hash: Optional[str],        # The emitting spine's skeleton hash
+    overlays: List[Dict[str, Any]],      # speech_overlay_spans records (source-scoped)
+    spine_segment_ids: set,              # This spine's segment-id set (the anchoring cut)
+) -> Tuple[List[Dict[str, Any]], int]:   # (event rows, foreign-spine skip count)
+    """Overlay span records -> dataset event rows for ONE spine (pure).
+
+    The second sample source's WRITER half (check fc42614d, DEC 4e05a066 —
+    the fold computed overlays but extract never emitted them; caught at the
+    first real overlay extraction 2026-08-04). Overlays are SOURCE-scoped in
+    the fold, so the anchoring-spine cut here is what prevents double
+    emission when a source carries more than one eligible gated spine: an
+    overlay emits only under the spine whose segment set contains its anchor.
+    `snap` rides along — human-refined (nudged) vs machine (fa-word/
+    fa-partial) vs estimated is provenance the bench splits on."""
+    rows: List[Dict[str, Any]] = []
+    foreign = 0
+    for o in overlays:
+        if str(o.get("segment_id")) not in spine_segment_ids:
+            foreign += 1
+            continue
+        rows.append({
+            "kind": "speech_overlay", "source_id": src["id"],
+            "source_title": src["title"], "source_path": src["path"],
+            "source_content_hash": src["content_hash"],
+            "skeleton_hash": skeleton_hash, "overlay_id": o["overlay_id"],
+            "segment_id": o.get("segment_id"),
+            "label": o["label"], "text": o["text"],
+            "start_time": o["start_time"], "end_time": o["end_time"],
+            "snap": o.get("snap"), "words": list(o.get("words") or []),
+            "split": "train",
+            "provenance": {"tag": "real", "sessions": [o["session_id"]],
+                           "op_ids": list(o.get("op_ids") or [])}})
+    return rows, foreign
+
+
 async def extract_command(
     args: argparse.Namespace,  # Parsed args for the `extract` subcommand
 ) -> int:  # Process exit code
@@ -776,10 +813,19 @@ async def extract_command(
                     print(f"  spine {_spine_tag(h)}: {r['status']} · annotated_through "
                           f"{wm_txt} — not extractable")
                     continue
+                o_rows, o_foreign = overlay_event_rows(
+                    src, h, r["overlays"], {s.id for s in segs})
+                rec["overlays"] = len(o_rows)
+                if o_foreign:
+                    skipped_totals["overlay_foreign_spine"] = (
+                        skipped_totals.get("overlay_foreign_spine", 0) + o_foreign)
                 print(f"  spine {_spine_tag(h)}: {r['status']} @ {wm_txt} — "
-                      f"examples {len(r['examples'])} · speech {len(r['speech'])} · "
-                      f"negatives {len(r['negatives'])}"
+                      f"examples {len(r['examples'])} · overlays {len(o_rows)} · "
+                      f"speech {len(r['speech'])} · negatives {len(r['negatives'])}"
                       + (f" · skipped {r['skipped']}" if r["skipped"] else ""))
+                for row in o_rows:
+                    vocab[row["label"]] = vocab.get(row["label"], 0) + 1
+                    events.append(row)
                 for e in r["examples"]:
                     vocab[e["label"]] = vocab.get(e["label"], 0) + 1
                     events.append({

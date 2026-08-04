@@ -70,6 +70,34 @@ def test_extract_subcommand():
     assert ns.source == "Chris" and ns.output_dir == "/tmp/ds"
 
 
+def test_overlay_event_rows_writer():
+    """The overlay WRITER half (the fold computed overlays; extract never
+    emitted them — caught 2026-08-04): rows carry kind=speech_overlay with
+    snap/words/provenance, and the anchoring-spine cut drops overlays whose
+    anchor segment belongs to another spine (no double emission across
+    multiple eligible gated spines)."""
+    from cjm_transcript_correction_core.cli import overlay_event_rows
+    src = {"id": "src1", "title": "T", "path": "/a.mp3", "content_hash": "sha256:x"}
+    overlays = [
+        {"overlay_id": "o1", "segment_id": "seg1", "label": "hesitation-marker",
+         "text": "uh", "start_time": 1.0, "end_time": 1.2, "snap": "nudged",
+         "words": [{"s": 1.0, "e": 1.2, "text": "uh"}],
+         "session_id": "s1", "op_ids": ["o1"]},
+        {"overlay_id": "o2", "segment_id": "OTHER-SPINE", "label": "word-repeat",
+         "text": "so so", "start_time": 2.0, "end_time": 2.4, "snap": "fa-word",
+         "words": [], "session_id": "s1", "op_ids": ["o2"]},
+    ]
+    rows, foreign = overlay_event_rows(src, "sha256:skel", overlays, {"seg1", "seg2"})
+    assert foreign == 1 and len(rows) == 1
+    row = rows[0]
+    assert row["kind"] == "speech_overlay" and row["overlay_id"] == "o1"
+    assert row["skeleton_hash"] == "sha256:skel" and row["segment_id"] == "seg1"
+    assert row["label"] == "hesitation-marker" and row["snap"] == "nudged"
+    assert row["split"] == "train"
+    assert row["provenance"] == {"tag": "real", "sessions": ["s1"], "op_ids": ["o1"]}
+    assert row["words"] == [{"s": 1.0, "e": 1.2, "text": "uh"}]
+
+
 def test_export_wordless_propset_subcommand():
     """The export surface (f5d080b9 direction a): sibling of transfer-wordless
     sharing its source/spine selectors; the exported set is the transfer donor
