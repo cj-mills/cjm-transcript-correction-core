@@ -719,15 +719,10 @@ async def extract_command(
 ) -> int:  # Process exit code
     """Execute the `extract` subcommand: fold the gated overlay into a manifested dataset.
 
-    Flywheel build leg 2 (DECs d02a38d4 + 16159e09 + a5883992 + 8e05b87b): a
-    deterministic core-side fold, sibling of stats — per gated spine, labeled
-    insert spans become examples (genuine-purpose sessions by default), speech
-    + negative regions derive below the annotated_through watermark, and the
-    dataset lands WORKSPACE-LOCAL under datasets/<dataset_id>/ (a regenerable
-    projection of the correction journal) with a DatasetManifest recording the
-    config, the consumed journal family, split/augmentation policy as DATA,
-    the observed open class vocabulary, and every spine's gate state at
-    extraction time."""
+    Thin stack wrapper since DEC 82c463fe: resolves the workspace, opens the
+    graph seat, and hands off to `run_extract` — the fold itself is seat-
+    agnostic so the correction TUI's flywheel page runs it on the stack it
+    already holds."""
     ws = resolve_workspace(explicit=getattr(args, "workspace", None))
     if ws is not None:
         os.environ["CJM_WORKSPACE"] = str(ws.root)
@@ -741,153 +736,13 @@ async def extract_command(
     queue = JobQueue(deps=manager)
     await queue.start()
     try:
-        res = await graph_task(queue, args.graph_capability, "query_nodes",
-                               query=NodeQuery(label="Source").to_dict())
-        sources = []
-        for n in (res.nodes or []):
-            d = n.to_dict() if hasattr(n, "to_dict") else n
-            props = d.get("properties") or {}
-            hashes = [r.get("content_hash") for r in (d.get("sources") or [])
-                      if isinstance(r, dict) and r.get("content_hash")]
-            sources.append({"id": d["id"], "title": str(props.get("title") or ""),
-                            "path": props.get("path"),
-                            "content_hash": (hashes[0] if hashes else None)})
-        if args.source:
-            needle = args.source.lower()
-            sources = [s for s in sources
-                       if s["id"] == args.source or needle in s["title"].lower()]
-        if not sources:
-            print("no matching Source nodes")
+        manifest = await run_extract(
+            queue, args.graph_capability, ws=ws, manager=manager,
+            source=args.source, rendition=args.rendition,
+            include_purposes=args.include_purpose,
+            output_dir=args.output_dir, graph_db_path=args.graph_db_path)
+        if manifest is None:
             return 1
-        purposes = list(args.include_purpose or ["genuine"])
-        sres = await graph_task(queue, args.graph_capability, "query_nodes",
-                                query=NodeQuery(label="CorrectionSession").to_dict())
-        include_ids = set()
-        for n in (sres.nodes or []):
-            d = n.to_dict() if hasattr(n, "to_dict") else n
-            purpose = str((d.get("properties") or {}).get("purpose") or "genuine")
-            if purpose in purposes:
-                include_ids.add(d["id"])
-
-        dataset_id = new_dataset_id()
-        created_at = time.time()
-        out_root = (Path(args.output_dir) if args.output_dir
-                    else (ws.root / "datasets" if ws is not None else Path("datasets")))
-        ddir = out_root / dataset_id
-        events: List[Dict] = []
-        regions: List[Dict] = []
-        spine_records: List[Dict] = []
-        vocab: Dict[str, int] = {}
-        skipped_totals: Dict[str, int] = {}
-        for src in sources:
-            corrections, superseded = await load_source_corrections(
-                queue, args.graph_capability, src["id"])
-            spines = await list_source_spines(queue, args.graph_capability, src["id"],
-                                              rendition_selector=args.rendition)
-            gates = await load_extraction_gates(queue, args.graph_capability, src["id"])
-            print(f"== {src['title'] or src['id']}  ({src['id']}) ==")
-            if not spines:
-                print("  (no decomposed spine)")
-            for sp in spines:
-                h = sp.get("skeleton_hash")
-                gate = gates.get(h)
-                status = str((gate or {}).get("extraction_status") or "in_progress")
-                extractable = (status != "excluded"
-                               and (gate or {}).get("annotated_through") is not None)
-                # Gate first: an ineligible spine never pays the full-spine read.
-                segs = (await load_source_segments(
-                    queue, args.graph_capability, src["id"],
-                    rendition_selector=args.rendition,
-                    skeleton_selector=("legacy" if h is None else h))
-                    if extractable else [])
-                r = extract_spine_dataset(segs, corrections, superseded, gate,
-                                          include_session_ids=include_ids)
-                wm_txt = (f"{r['watermark']:.1f}s" if r["watermark"] is not None else "none")
-                rec = {"source_id": src["id"], "source_title": src["title"],
-                       "skeleton_hash": h, "extraction_status": r["status"],
-                       "annotated_through": r["watermark"], "eligible": r["eligible"],
-                       "examples": len(r["examples"]), "speech_regions": len(r["speech"]),
-                       "negative_regions": len(r["negatives"]), "skipped": r["skipped"]}
-                spine_records.append(rec)
-                if not r["eligible"]:
-                    print(f"  spine {_spine_tag(h)}: {r['status']} · annotated_through "
-                          f"{wm_txt} — not extractable")
-                    continue
-                o_rows, o_foreign = overlay_event_rows(
-                    src, h, r["overlays"], {s.id for s in segs})
-                rec["overlays"] = len(o_rows)
-                if o_foreign:
-                    skipped_totals["overlay_foreign_spine"] = (
-                        skipped_totals.get("overlay_foreign_spine", 0) + o_foreign)
-                print(f"  spine {_spine_tag(h)}: {r['status']} @ {wm_txt} — "
-                      f"examples {len(r['examples'])} · overlays {len(o_rows)} · "
-                      f"speech {len(r['speech'])} · negatives {len(r['negatives'])}"
-                      + (f" · skipped {r['skipped']}" if r["skipped"] else ""))
-                for row in o_rows:
-                    vocab[row["label"]] = vocab.get(row["label"], 0) + 1
-                    events.append(row)
-                for e in r["examples"]:
-                    vocab[e["label"]] = vocab.get(e["label"], 0) + 1
-                    events.append({
-                        "kind": "labeled_span", "source_id": src["id"],
-                        "source_title": src["title"], "source_path": src["path"],
-                        "source_content_hash": src["content_hash"],
-                        "skeleton_hash": h, "insert_id": e["insert_id"],
-                        "label": e["label"], "text": e["text"], "speech": e["speech"],
-                        "start_time": e["start_time"], "end_time": e["end_time"],
-                        "split": "train",
-                        "provenance": {"tag": "real", "sessions": e["session_ids"],
-                                       "op_ids": e["op_ids"]}})
-                for s in r["speech"]:
-                    regions.append({"kind": "speech", "source_id": src["id"],
-                                    "skeleton_hash": h, **s})
-                for g in r["negatives"]:
-                    regions.append({"kind": "negative", "source_id": src["id"],
-                                    "skeleton_hash": h, **g})
-                for k, v in r["skipped"].items():
-                    skipped_totals[k] = skipped_totals.get(k, 0) + v
-
-        ddir.mkdir(parents=True, exist_ok=True)
-        (ddir / "events.jsonl").write_text(
-            "".join(json.dumps(relativize_recorded(row, ws)) + "\n" for row in events))
-        (ddir / "regions.jsonl").write_text(
-            "".join(json.dumps(relativize_recorded(row, ws)) + "\n" for row in regions))
-        db = args.graph_db_path or (
-            (manager.instances[args.graph_capability].config or {}).get("db_path"))
-        stem = sidecar_journal_path(db)[: -len(".jsonl")] if db else None
-        journals = (sorted(str(p) for p in Path(db).parent.glob(Path(stem).name + "*.jsonl"))
-                    if db else [])
-        manifest = DatasetManifest(
-            dataset_id=dataset_id, created_at=created_at,
-            config={"graph_capability": args.graph_capability,
-                    "source": args.source, "rendition": args.rendition,
-                    "include_purposes": purposes},
-            graph_db_path=str(db or ""), journals=journals,
-            session_purpose_policy={"include": purposes, "unset_means": "genuine"},
-            split_policy={"policy": "tail-reservation",
-                          "train": "annotated head — spans starting below each spine's "
-                                   "annotated_through watermark",
-                          "bench": "reserved tail above the watermark — NEVER extracted; "
-                                   "the live-bench half of DEC 8cf12c22"},
-            augmentation_policy={"policy": "none",
-                                 "provenance_tags": ["real", "augmented", "spliced",
-                                                     "synthetic"],
-                                 "note": "rungs unpulled unless a finetune is "
-                                         "data-gated (DEC 03d207cf)"},
-            class_vocabulary=vocab, spines=spine_records,
-            files={"events": "events.jsonl", "regions": "regions.jsonl"},
-            counts={"examples": len(events),
-                    "speech_regions": sum(1 for r in regions if r["kind"] == "speech"),
-                    "negative_regions": sum(1 for r in regions if r["kind"] == "negative"),
-                    **{f"skipped_{k}": v for k, v in sorted(skipped_totals.items())}})
-        out = manifest.save(ddir / "manifest.json", workspace=ws)
-        print(f"== DATASET {dataset_id} ==")
-        print("  classes: "
-              + (" · ".join(f"{k}x{v}" for k, v in sorted(vocab.items())) or "none"))
-        print(f"  examples: {len(events)}  regions: {len(regions)}  "
-              f"spines: {sum(1 for r in spine_records if r['eligible'])} extractable "
-              f"of {len(spine_records)}")
-        print(f"  manifest: {out}")
     finally:
         await queue.stop()
         try:
@@ -1549,3 +1404,178 @@ async def scan_command(
         except Exception as e:  # Best-effort teardown; never mask the scan outcome
             logger.warning(f"unload {args.graph_capability} failed: {e}")
     return 0
+
+
+async def run_extract(
+    queue: Any,                 # Started JobQueue over a manager holding the graph seat
+    graph_capability: str,      # Graph capability instance id
+    *,
+    ws: Any = None,             # Resolved Workspace (None = cwd-relative datasets/)
+    source: Optional[str] = None,        # Source node id / title substring filter
+    rendition: Optional[str] = None,     # AudioRendition selector for multi-rendition sources
+    include_purposes: Optional[List[str]] = None,  # Session purposes whose spans qualify as EXAMPLES
+    output_dir: Optional[str] = None,    # Datasets root override
+    graph_db_path: Optional[str] = None, # Journal-family provenance (else the seat's persisted config)
+    manager: Any = None,        # Manager owning the seat (db-path fallback lookup)
+    log: Any = print,           # Line sink (the flywheel page passes a collector)
+) -> Optional[Dict[str, Any]]:  # Saved DatasetManifest dict (+ "_path"), or None when no Source matches
+    """The extract fold on an ALREADY-OPEN graph seat (flywheel build leg 2,
+    DECs d02a38d4 + 16159e09 + a5883992 + 8e05b87b; lifted out of the CLI for
+    the correction TUI's cross-source flywheel page, DEC 82c463fe): per gated
+    spine, labeled insert spans become examples (genuine-purpose sessions by
+    default), speech + negative regions derive below the annotated_through
+    watermark, and the dataset lands workspace-local under
+    datasets/<dataset_id>/ with a DatasetManifest recording config, consumed
+    journal family, split/augmentation policy as DATA, the observed open class
+    vocabulary, and every spine's gate state at extraction time."""
+    res = await graph_task(queue, graph_capability, "query_nodes",
+                           query=NodeQuery(label="Source").to_dict())
+    sources = []
+    for n in (res.nodes or []):
+        d = n.to_dict() if hasattr(n, "to_dict") else n
+        props = d.get("properties") or {}
+        hashes = [r.get("content_hash") for r in (d.get("sources") or [])
+                  if isinstance(r, dict) and r.get("content_hash")]
+        sources.append({"id": d["id"], "title": str(props.get("title") or ""),
+                        "path": props.get("path"),
+                        "content_hash": (hashes[0] if hashes else None)})
+    if source:
+        needle = source.lower()
+        sources = [s for s in sources
+                   if s["id"] == source or needle in s["title"].lower()]
+    if not sources:
+        log("no matching Source nodes")
+        return None
+    purposes = list(include_purposes or ["genuine"])
+    sres = await graph_task(queue, graph_capability, "query_nodes",
+                            query=NodeQuery(label="CorrectionSession").to_dict())
+    include_ids = set()
+    for n in (sres.nodes or []):
+        d = n.to_dict() if hasattr(n, "to_dict") else n
+        purpose = str((d.get("properties") or {}).get("purpose") or "genuine")
+        if purpose in purposes:
+            include_ids.add(d["id"])
+
+    dataset_id = new_dataset_id()
+    created_at = time.time()
+    out_root = (Path(output_dir) if output_dir
+                else (ws.root / "datasets" if ws is not None else Path("datasets")))
+    ddir = out_root / dataset_id
+    events: List[Dict] = []
+    regions: List[Dict] = []
+    spine_records: List[Dict] = []
+    vocab: Dict[str, int] = {}
+    skipped_totals: Dict[str, int] = {}
+    for src in sources:
+        corrections, superseded = await load_source_corrections(
+            queue, graph_capability, src["id"])
+        spines = await list_source_spines(queue, graph_capability, src["id"],
+                                          rendition_selector=rendition)
+        gates = await load_extraction_gates(queue, graph_capability, src["id"])
+        log(f"== {src['title'] or src['id']}  ({src['id']}) ==")
+        if not spines:
+            log("  (no decomposed spine)")
+        for sp in spines:
+            h = sp.get("skeleton_hash")
+            gate = gates.get(h)
+            status = str((gate or {}).get("extraction_status") or "in_progress")
+            extractable = (status != "excluded"
+                           and (gate or {}).get("annotated_through") is not None)
+            # Gate first: an ineligible spine never pays the full-spine read.
+            segs = (await load_source_segments(
+                queue, graph_capability, src["id"],
+                rendition_selector=rendition,
+                skeleton_selector=("legacy" if h is None else h))
+                if extractable else [])
+            r = extract_spine_dataset(segs, corrections, superseded, gate,
+                                      include_session_ids=include_ids)
+            wm_txt = (f"{r['watermark']:.1f}s" if r["watermark"] is not None else "none")
+            rec = {"source_id": src["id"], "source_title": src["title"],
+                   "skeleton_hash": h, "extraction_status": r["status"],
+                   "annotated_through": r["watermark"], "eligible": r["eligible"],
+                   "examples": len(r["examples"]), "speech_regions": len(r["speech"]),
+                   "negative_regions": len(r["negatives"]), "skipped": r["skipped"]}
+            spine_records.append(rec)
+            if not r["eligible"]:
+                log(f"  spine {_spine_tag(h)}: {r['status']} · annotated_through "
+                    f"{wm_txt} — not extractable")
+                continue
+            o_rows, o_foreign = overlay_event_rows(
+                src, h, r["overlays"], {s.id for s in segs})
+            rec["overlays"] = len(o_rows)
+            if o_foreign:
+                skipped_totals["overlay_foreign_spine"] = (
+                    skipped_totals.get("overlay_foreign_spine", 0) + o_foreign)
+            log(f"  spine {_spine_tag(h)}: {r['status']} @ {wm_txt} — "
+                f"examples {len(r['examples'])} · overlays {len(o_rows)} · "
+                f"speech {len(r['speech'])} · negatives {len(r['negatives'])}"
+                + (f" · skipped {r['skipped']}" if r["skipped"] else ""))
+            for row in o_rows:
+                vocab[row["label"]] = vocab.get(row["label"], 0) + 1
+                events.append(row)
+            for e in r["examples"]:
+                vocab[e["label"]] = vocab.get(e["label"], 0) + 1
+                events.append({
+                    "kind": "labeled_span", "source_id": src["id"],
+                    "source_title": src["title"], "source_path": src["path"],
+                    "source_content_hash": src["content_hash"],
+                    "skeleton_hash": h, "insert_id": e["insert_id"],
+                    "label": e["label"], "text": e["text"], "speech": e["speech"],
+                    "start_time": e["start_time"], "end_time": e["end_time"],
+                    "split": "train",
+                    "provenance": {"tag": "real", "sessions": e["session_ids"],
+                                   "op_ids": e["op_ids"]}})
+            for s in r["speech"]:
+                regions.append({"kind": "speech", "source_id": src["id"],
+                                "skeleton_hash": h, **s})
+            for g in r["negatives"]:
+                regions.append({"kind": "negative", "source_id": src["id"],
+                                "skeleton_hash": h, **g})
+            for k, v in r["skipped"].items():
+                skipped_totals[k] = skipped_totals.get(k, 0) + v
+
+    ddir.mkdir(parents=True, exist_ok=True)
+    (ddir / "events.jsonl").write_text(
+        "".join(json.dumps(relativize_recorded(row, ws)) + "\n" for row in events))
+    (ddir / "regions.jsonl").write_text(
+        "".join(json.dumps(relativize_recorded(row, ws)) + "\n" for row in regions))
+    db = graph_db_path or (
+        (manager.instances[graph_capability].config or {}).get("db_path")
+        if manager is not None else None)
+    stem = sidecar_journal_path(db)[: -len(".jsonl")] if db else None
+    journals = (sorted(str(p) for p in Path(db).parent.glob(Path(stem).name + "*.jsonl"))
+                if db else [])
+    manifest = DatasetManifest(
+        dataset_id=dataset_id, created_at=created_at,
+        config={"graph_capability": graph_capability,
+                "source": source, "rendition": rendition,
+                "include_purposes": purposes},
+        graph_db_path=str(db or ""), journals=journals,
+        session_purpose_policy={"include": purposes, "unset_means": "genuine"},
+        split_policy={"policy": "tail-reservation",
+                      "train": "annotated head — spans starting below each spine's "
+                               "annotated_through watermark",
+                      "bench": "reserved tail above the watermark — NEVER extracted; "
+                               "the live-bench half of DEC 8cf12c22"},
+        augmentation_policy={"policy": "none",
+                             "provenance_tags": ["real", "augmented", "spliced",
+                                                 "synthetic"],
+                             "note": "rungs unpulled unless a finetune is "
+                                     "data-gated (DEC 03d207cf)"},
+        class_vocabulary=vocab, spines=spine_records,
+        files={"events": "events.jsonl", "regions": "regions.jsonl"},
+        counts={"examples": len(events),
+                "speech_regions": sum(1 for r in regions if r["kind"] == "speech"),
+                "negative_regions": sum(1 for r in regions if r["kind"] == "negative"),
+                **{f"skipped_{k}": v for k, v in sorted(skipped_totals.items())}})
+    out = manifest.save(ddir / "manifest.json", workspace=ws)
+    log(f"== DATASET {dataset_id} ==")
+    log("  classes: "
+        + (" · ".join(f"{k}x{v}" for k, v in sorted(vocab.items())) or "none"))
+    log(f"  examples: {len(events)}  regions: {len(regions)}  "
+        f"spines: {sum(1 for r in spine_records if r['eligible'])} extractable "
+        f"of {len(spine_records)}")
+    log(f"  manifest: {out}")
+    d = manifest.to_dict()
+    d["_path"] = str(out)
+    return d
