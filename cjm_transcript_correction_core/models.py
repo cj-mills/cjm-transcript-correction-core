@@ -228,6 +228,57 @@ RECOMMENDED_OVERLAY_LABELS = (
     "word-repeat",         # repeated words / stutters
 )
 
+# The shell-shared gesture vocabulary (1052ce38 wart 2 re-homed, spine
+# absorption follow-through): these were stranded as Textual App CLASS
+# ATTRIBUTES, so the Qt shell carried COPIES (importing them would have
+# dragged Textual into the Qt process). They are correction-workflow DATA —
+# every shell reads the same ladders and lane gates from here.
+
+# Insert labels whose samples carry NO spoken words (the wordless fold's
+# membership test — the annotate lane's toggle_wordless_fold reads it).
+WORDLESS_INSERT_LABELS = frozenset({
+    "inhale", "empty", "throat-clear", "background-noise", "click",
+    "background-music", "background-voices", "echo", "wheeze", "chuckle"})
+
+# Playback-speed bracket ladder ([ / ] steps; pitch-preserving via the
+# player backend's rate scaling).
+SPEEDS = (0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0)
+
+# Boundary time-nudge step ladder, milliseconds ({ } cycles it; the choice
+# persists in the shell's sidecar) — and the audition tail replayed after an
+# end-nudge (the last NUDGE_TAIL_S seconds, not the whole chunk).
+NUDGE_STEPS_MS = (1.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0)
+NUDGE_TAIL_S = 2.0
+
+# Lane gating (the one check_action gate, DEC cc55a7b5): each lane exposes
+# ONLY its vocabulary; the *_ONLY sets are inert outside their lane.
+ASSIGN_LANE_ACTIONS = frozenset({
+    "next", "prev", "replay", "seam_next", "seam_prev", "speed_down", "speed_up",
+    "yank", "assign_pick", "assign_same", "assign_new", "assign_accept",
+    "cycle_lane", "cycle_lane_prev", "cancel", "quit_app"})
+ASSIGN_ONLY_ACTIONS = frozenset({"assign_pick", "assign_same", "assign_new",
+                                 "assign_accept"})
+PROPOSE_LANE_ACTIONS = frozenset({
+    "next", "prev", "replay", "seam_next", "seam_prev", "speed_down", "speed_up",
+    "yank", "nudge_end_earlier", "nudge_end_later", "nudge_start_earlier",
+    "nudge_start_later", "nudge_step_down", "nudge_step_up",
+    "insert_chunk", "insert_labeled", "relabel_insert", "remove_insert", "edit",
+    "propose_accept", "propose_next", "propose_prev", "propose_audition",
+    "toggle_tier2", "cycle_lane", "cycle_lane_prev", "cancel", "quit_app"})
+PROPOSE_ONLY_ACTIONS = frozenset({"propose_accept", "propose_next", "propose_prev",
+                                  "propose_audition", "toggle_tier2"})
+ANNOTATE_LANE_ACTIONS = frozenset({
+    "next", "prev", "replay", "seam_next", "seam_prev", "speed_down", "speed_up",
+    "yank", "word_left", "word_right", "word_select", "annotate_quick",
+    "annotate_pick", "annotate_editor", "annotate_audition", "overlay_remove",
+    "overlay_nudge", "overlay_cycle", "nudge_step_down", "nudge_step_up",
+    "next_overlay", "prev_overlay", "toggle_wordless_fold",
+    "cycle_lane", "cycle_lane_prev", "cancel", "quit_app"})
+ANNOTATE_ONLY_ACTIONS = frozenset({
+    "word_left", "word_right", "word_select", "annotate_quick", "annotate_pick",
+    "annotate_editor", "annotate_audition", "overlay_remove", "overlay_nudge",
+    "overlay_cycle", "next_overlay", "prev_overlay"})
+
 
 @dataclass
 class Entity:
