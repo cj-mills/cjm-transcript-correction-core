@@ -23,6 +23,7 @@ def save_tui_state(
     fold_wordless: Optional[bool] = None,  # z fold preference (db-wide `_fold_wordless`; None = leave as-is)
     skeleton: Optional[str] = None,  # Chosen skeleton-spine selector (per-source; None = leave as-is)
     spines: Optional[int] = None,    # Spine-set size the choice was made against (re-prompt key)
+    hint_pins: Optional[Dict[str, Any]] = None,  # Per-lane pinned hint verbs (db-wide `_hint_pins`; None = leave as-is)
 ) -> None:
     """Merge one source's view state into the sidecar state file.
 
@@ -57,6 +58,8 @@ def save_tui_state(
         state["_lane"] = str(lane)
     if fold_wordless is not None:
         state["_fold_wordless"] = bool(fold_wordless)
+    if hint_pins is not None:
+        state["_hint_pins"] = dict(hint_pins)
     store.write(state)
 
 
