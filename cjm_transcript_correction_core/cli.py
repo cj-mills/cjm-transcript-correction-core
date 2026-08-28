@@ -20,6 +20,7 @@ from cjm_substrate.core.queue import JobQueue
 from cjm_substrate.core.workspace import relativize_recorded, resolve_workspace
 from cjm_transcript_correction_core.graph import (bench_event_proposals,
                                                   commit_chunk_insert_correction,
+                                                  commit_chunk_split_correction,
                                                   commit_extraction_gate, correction_stats,
                                                   extract_spine_dataset, labeled_insert_spans,
                                                   list_source_spines, load_extraction_gates,
@@ -230,6 +231,10 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
     transfer.add_argument("--tolerance", type=float, default=0.05,
                           help="Duplicate-guard window in seconds: a same-label destination "
                                "insert this close counts as already transferred")
+    transfer.add_argument("--no-splits", action="store_true",
+                          help="Leave speaker-split boundaries behind (default: a split's "
+                               "cut time transfers and the destination re-cuts its own "
+                               "words there — 54aac7d3)")
     transfer.add_argument("--dry-run", action="store_true",
                           help="Print the transfer plan; commit nothing")
     transfer.add_argument("--actor", default="human", help="Actor recorded on the transferred inserts")
@@ -920,19 +925,20 @@ async def bench_command(
 async def transfer_command(
     args: argparse.Namespace,  # Parsed args for the `transfer-wordless` subcommand
 ) -> int:  # Process exit code
-    """Execute `transfer-wordless`: replay wordless event inserts across sibling spines.
+    """Execute `transfer-wordless`: replay wordless event inserts (and speaker-
+    split boundaries) across sibling spines.
 
-    dea104ba — the layering principle's first mechanical expression: accepted
-    wordless inserts are SOURCE-truth ((span, label) pairs with zero text
-    dependency), so a respine (re-transcription, FA/VAD upgrade) must not lose
-    the human event layer. Donor spans come from the FROM spine's EFFECTIVE
-    projection (time nudges applied — the heard span, not the born one) and
-    keep their walked rank; placement on the destination spine anchors by
-    source time between its layer-0 segments (the projection re-sorts by
-    effective times, so a span the new carve disagrees with stays honest).
-    What does NOT transfer, by design: boundary shifts, text edits, and any
-    insert that GAINED text (word-bearing = spine-truth — new transcript, new
-    FA). Idempotent: a destination insert with the same label within
+    A thin driver over the shared engine (plan_wordless_transfer +
+    commit_wordless_transfer — the correction shell's spine-picker verb
+    drives the same two calls in-process with the plan rendered before
+    commit, 9af9793a). dea104ba — the layering principle's first mechanical
+    expression: accepted wordless inserts are SOURCE-truth ((span, label)
+    pairs with zero text dependency), so a respine (re-transcription, FA/VAD
+    upgrade) must not lose the human event layer. Speaker splits ride as
+    boundaries at source time (54aac7d3; --no-splits leaves them). What does
+    NOT transfer, by design: boundary shifts, text edits, and any labeled
+    insert that GAINED text (word-bearing = spine-truth — new transcript,
+    new FA). Idempotent: a destination insert with the same label within
     --tolerance of a donor span counts as already present and is skipped.
     Commits require --graph-db-path (the flywheel journal rides the db
     sidecar — journaling stays default-on); --dry-run needs neither."""
@@ -952,98 +958,43 @@ async def transfer_command(
     queue = JobQueue(deps=manager)
     await queue.start()
     try:
-        res = await graph_task(queue, args.graph_capability, "query_nodes",
-                               query=NodeQuery(label="Source", project=["title"]).to_dict())
-        needle = args.source.lower()
-        matches = [(r["id"], str(r.get("title") or "")) for r in (res.rows or [])
-                   if r["id"] == args.source or needle in str(r.get("title") or "").lower()]
-        if len(matches) != 1:
-            raise SystemExit(f"--source matched {len(matches)} Source nodes "
-                             f"({[t for _, t in matches]}); need exactly one")
-        sid, title = matches[0]
+        sid, title, _path = await resolve_source_node(
+            queue, args.graph_capability, args.source)
         print(f"source: {title or sid}  ({sid})")
-
-        segs_from = await load_source_segments(
+        plan = await plan_wordless_transfer(
             queue, args.graph_capability, sid,
-            rendition_selector=args.rendition, skeleton_selector=args.from_skeleton)
-        segs_to = await load_source_segments(
-            queue, args.graph_capability, sid,
-            rendition_selector=args.rendition, skeleton_selector=args.to_skeleton)
-        if not segs_from or not segs_to:
-            raise SystemExit(f"empty spine (from={len(segs_from)} to={len(segs_to)} segments)")
-        if {s.id for s in segs_from} == {s.id for s in segs_to}:
-            raise SystemExit("--from-skeleton and --to-skeleton resolved to the SAME spine")
-        print(f"spines: from {len(segs_from)} segs -> to {len(segs_to)} segs")
-
-        corrections, superseded = await load_source_corrections(queue, args.graph_capability, sid)
-        active = [c for c in corrections
-                  if c["id"] not in superseded and c.get("status") != "proposed"]
-        insert_meta = {c["id"]: (c.get("payload") or {}) for c in active
-                       if c.get("correction_type") == "insertion"
-                       and (c.get("payload") or {}).get("operation") == "chunk_insert"}
-
-        # Donors: labeled + effectively wordless units of the FROM projection
-        # (the shared wordless_donors definition — export-wordless-propset
-        # writes this exact set, f5d080b9 direction a).
-        eff_from = project_effective_spine(segs_from, active)
-        donors, word_bearing = wordless_donors(eff_from, insert_meta, args.labels)
-
-        # Existing destination events (idempotency guard) from the TO projection.
-        eff_to = project_effective_spine(segs_to, active)
-        existing = [(str(insert_meta[u.id].get("label")), float(u.start_time))
-                    for u in eff_to
-                    if u.id in insert_meta and insert_meta[u.id].get("label")
-                    and u.start_time is not None]
-
-        to_l0 = sorted((s for s in segs_to if s.start_time is not None),
-                       key=lambda s: s.index)
-        plan, dups, unanchored = [], 0, 0
-        for d in donors:
-            if any(lb == d["label"] and abs(st - d["start"]) <= args.tolerance
-                   for lb, st in existing):
-                dups += 1
-                continue
-            after = None
-            pos = -1
-            for i, s in enumerate(to_l0):
-                if float(s.start_time) <= d["start"]:
-                    after, pos = s, i
-                else:
-                    break
-            if after is None:
-                unanchored += 1
-                continue
-            before = to_l0[pos + 1] if pos + 1 < len(to_l0) else None
-            plan.append({**d, "after_id": after.id,
-                         "before_id": before.id if before else None})
-
-        by_label: Dict[str, int] = {}
-        for p in plan:
-            by_label[p["label"]] = by_label.get(p["label"], 0) + 1
-        print(f"donors: {len(donors)}  ->  transfer {len(plan)}  "
-              f"(dup-skip {dups} · word-bearing-skip {word_bearing} · unanchored {unanchored})")
-        print("by label: " + (" · ".join(f"{k}x{v}" for k, v in sorted(by_label.items())) or "none"))
+            from_skeleton=args.from_skeleton, to_skeleton=args.to_skeleton,
+            rendition=args.rendition, labels=args.labels,
+            tolerance=args.tolerance, splits=not args.no_splits)
+        print(f"spines: from {plan['from_segments']} segs -> to {plan['to_segments']} segs")
+        rows = plan["plan"]
+        print(f"donors: {plan['donors']}  ->  transfer {len(rows)}  "
+              f"(dup-skip {plan['dups']} · word-bearing-skip {plan['word_bearing']} · "
+              f"unanchored {plan['unanchored']})")
+        print("by label: " + (" · ".join(f"{k}x{v}" for k, v in sorted(plan["by_label"].items()))
+                              or "none"))
+        if plan["split_donors"]:
+            print(f"speaker splits: {plan['split_donors']}  ->  transfer {len(plan['splits'])}  "
+                  f"(dup-skip {plan['split_dups']} · unanchored {plan['split_unanchored']} · "
+                  f"same-segment conflicts {plan['split_conflicts']})")
         if args.dry_run:
-            for p in plan[:10]:
+            for p in rows[:10]:
                 print(f"  {p['label']:>16} {p['start']:9.3f}-{p['end']:9.3f}s "
                       f"after {p['after_id'][:8]}")
-            if len(plan) > 10:
-                print(f"  … {len(plan) - 10} more")
+            if len(rows) > 10:
+                print(f"  … {len(rows) - 10} more")
+            for s in plan["splits"][:10]:
+                print(f"  {'split':>16} {s['time']:9.3f}s  "
+                      f"{s['left_text'][-24:]!r} | {s['right_text'][:24]!r}")
+            if len(plan["splits"]) > 10:
+                print(f"  … {len(plan['splits']) - 10} more splits")
             print("dry run — nothing committed")
             return 0
-
-        jp = sidecar_journal_path(args.graph_db_path)
-        sess = await start_session(queue, args.graph_capability, [sid],
-                                   journal_path=jp, purpose="wordless-transfer")
-        for p in plan:
-            await commit_chunk_insert_correction(
-                queue, args.graph_capability, sid, p["after_id"],
-                p["start"], p["end"], sess.id,
-                before_segment_id=p["before_id"], label=p["label"], rank=p["rank"],
-                actor=args.actor, journal_path=jp)
-        await set_session_status(queue, args.graph_capability, sess.id,
-                                 "completed", journal_path=jp)
-        print(f"transferred {len(plan)} event inserts (session {sess.id})")
+        res = await commit_wordless_transfer(
+            queue, args.graph_capability, sid, plan,
+            journal_path=sidecar_journal_path(args.graph_db_path), actor=args.actor)
+        print(f"transferred {res['transferred']} event inserts + {res['splits']} "
+              f"speaker splits (session {res['session_id']})")
     finally:
         await queue.stop()
         try:
@@ -1085,6 +1036,310 @@ def wordless_donors(
     return donors, word_bearing
 
 
+async def resolve_source_node(
+    queue: JobQueue,   # Started job queue
+    graph_id: str,     # Graph-storage capability id
+    source: str,       # Source node id, or a case-insensitive title substring
+) -> Tuple[str, str, Optional[str]]:  # (source id, title, media path)
+    """Resolve the --source selector the respine verbs share: exactly ONE
+    Source node by id or title substring (loud on 0 or many — the contract
+    every spine verb inherits). The media path rides along because the
+    export's content-hash binding wants it and the shell holds only an id."""
+    res = await graph_task(queue, graph_id, "query_nodes",
+                           query=NodeQuery(label="Source",
+                                           project=["title", "path"]).to_dict())
+    needle = source.lower()
+    matches = [(r["id"], str(r.get("title") or ""), r.get("path"))
+               for r in (res.rows or [])
+               if r["id"] == source or needle in str(r.get("title") or "").lower()]
+    if len(matches) != 1:
+        raise SystemExit(f"--source matched {len(matches)} Source nodes "
+                         f"({[t for _, t, _ in matches]}); need exactly one")
+    return matches[0]
+
+
+def plan_transfer_rows(
+    donors: List[Dict],                  # wordless_donors rows for the FROM spine ({start,end,label,rank})
+    existing: List[Tuple[str, float]],   # (label, start) of the TO spine's ACTIVE labeled inserts (dup guard)
+    to_l0: List,                         # The TO spine's LAYER-0 segments in index order (start_time set)
+    tolerance: float = 0.05,             # Dup window (s): a same-label insert this close is already there
+) -> Tuple[List[Dict], int, int]:  # (placed rows = donor + {after_id, before_id}, dup-skips, unanchored)
+    """Place wordless donors on the destination (pure) — the event half of
+    the transfer plan. Source-time anchoring: each donor lands after the
+    last layer-0 segment starting at or before its start (the flank pair the
+    chunk_insert projection needs); a donor before the first segment is
+    `unanchored`; a same-label destination insert within `tolerance` of the
+    donor's start is a dup (the idempotency guard — a rerun transfers 0)."""
+    plan: List[Dict] = []
+    dups = unanchored = 0
+    for d in donors:
+        if any(lb == d["label"] and abs(st - d["start"]) <= tolerance
+               for lb, st in existing):
+            dups += 1
+            continue
+        after = None
+        pos = -1
+        for i, s in enumerate(to_l0):
+            if float(s.start_time) <= d["start"]:
+                after, pos = s, i
+            else:
+                break
+        if after is None:
+            unanchored += 1
+            continue
+        before = to_l0[pos + 1] if pos + 1 < len(to_l0) else None
+        plan.append({**d, "after_id": after.id,
+                     "before_id": before.id if before else None})
+    return plan, dups, unanchored
+
+
+async def plan_wordless_transfer(
+    queue: JobQueue,                      # Started job queue (an open stack — CLI or shell)
+    graph_id: str,                        # Graph-storage capability id
+    source_id: str,                       # The resolved Source node id
+    *,
+    from_skeleton: str,                   # Donor spine selector ("legacy" or a skeleton-hash prefix / full hash)
+    to_skeleton: str,                     # Destination spine selector
+    rendition: Optional[str] = None,      # Which AudioRendition spine (None = auto)
+    labels: Optional[List[str]] = None,   # Restrict to these insert labels (None = every labeled wordless insert)
+    tolerance: float = 0.05,              # Dup-guard window (s)
+    splits: bool = True,                  # Also plan speaker-split boundaries (54aac7d3 rider)
+) -> Dict[str, Any]:  # The plan: counts + placed rows (see below); reads only
+    """PLAN a wordless transfer (reads only) — the `transfer-wordless`
+    engine's first half, shared by the CLI verb and the correction shell's
+    spine-picker verb (9af9793a: the dry-run plan renders in-app before
+    commit, so one function must produce what both surfaces show).
+
+    dea104ba's layering: accepted wordless inserts are SOURCE-truth ((span,
+    label) pairs, zero text dependency), so a respine must not lose the
+    human event layer. Donors come from the FROM spine's EFFECTIVE
+    projection (time nudges applied) and keep their walked rank; placement
+    anchors by source time between the TO spine's layer-0 segments
+    (plan_transfer_rows). Speaker splits ride as BOUNDARIES (split_donors +
+    plan_split_rows — the destination re-cuts its own words at the donor's
+    time). What stays behind by design: boundary shifts, text edits, and
+    labeled inserts that GAINED text (word-bearing = spine-truth).
+    Idempotent by construction: dup-skips on both halves.
+
+    Returns {"from_segments","to_segments","donors","plan","by_label","dups",
+    "word_bearing","unanchored","split_donors","splits","split_dups",
+    "split_unanchored","split_conflicts"}; refusals (empty spine, the same
+    spine twice) raise SystemExit with the CLI's wording."""
+    segs_from = await load_source_segments(
+        queue, graph_id, source_id,
+        rendition_selector=rendition, skeleton_selector=from_skeleton)
+    segs_to = await load_source_segments(
+        queue, graph_id, source_id,
+        rendition_selector=rendition, skeleton_selector=to_skeleton)
+    if not segs_from or not segs_to:
+        raise SystemExit(f"empty spine (from={len(segs_from)} to={len(segs_to)} segments)")
+    if {s.id for s in segs_from} == {s.id for s in segs_to}:
+        raise SystemExit("--from-skeleton and --to-skeleton resolved to the SAME spine")
+
+    corrections, superseded = await load_source_corrections(queue, graph_id, source_id)
+    active = [c for c in corrections
+              if c["id"] not in superseded and c.get("status") != "proposed"]
+    insert_meta = {c["id"]: (c.get("payload") or {}) for c in active
+                   if c.get("correction_type") == "insertion"
+                   and (c.get("payload") or {}).get("operation") == "chunk_insert"}
+    # Donors: labeled + effectively wordless units of the FROM projection
+    # (the shared wordless_donors definition — export-wordless-propset
+    # writes this exact set, f5d080b9 direction a).
+    eff_from = project_effective_spine(segs_from, active)
+    donors, word_bearing = wordless_donors(eff_from, insert_meta, labels)
+    # Existing destination events (idempotency guard) from the TO projection.
+    eff_to = project_effective_spine(segs_to, active)
+    existing = [(str(insert_meta[u.id].get("label")), float(u.start_time))
+                for u in eff_to
+                if u.id in insert_meta and insert_meta[u.id].get("label")
+                and u.start_time is not None]
+    to_l0 = sorted((s for s in segs_to if s.start_time is not None),
+                   key=lambda s: s.index)
+    plan, dups, unanchored = plan_transfer_rows(donors, existing, to_l0, tolerance)
+    by_label: Dict[str, int] = {}
+    for p in plan:
+        by_label[p["label"]] = by_label.get(p["label"], 0) + 1
+    out: Dict[str, Any] = {
+        "from_segments": len(segs_from), "to_segments": len(segs_to),
+        "donors": len(donors), "plan": plan, "by_label": by_label,
+        "dups": dups, "word_bearing": word_bearing, "unanchored": unanchored,
+        "split_donors": 0, "splits": [], "split_dups": 0,
+        "split_unanchored": 0, "split_conflicts": 0}
+    if splits:
+        # Local import: spine.py imports this module's load_capabilities at
+        # its top, so the planners cannot be a top-level import here.
+        from cjm_transcript_correction_core.spine import plan_split_rows, split_donors
+        split_ids = {c["id"] for c in active
+                     if c["id"] in insert_meta and c.get("rationale") == "chunk-split"}
+        sd = split_donors(eff_from, insert_meta, split_ids)
+        existing_splits = [float(u.start_time) for u in eff_to
+                           if u.id in split_ids and u.start_time is not None]
+        synthetic = {u.id for u in eff_to if u.id in insert_meta}
+        srows, sdups, sun, sconf = plan_split_rows(sd, eff_to, synthetic,
+                                                   existing_splits, tolerance)
+        out.update(split_donors=len(sd), splits=srows, split_dups=sdups,
+                   split_unanchored=sun, split_conflicts=sconf)
+    return out
+
+
+async def commit_wordless_transfer(
+    queue: JobQueue,                      # Started job queue (an open stack — CLI or shell)
+    graph_id: str,                        # Graph-storage capability id
+    source_id: str,                       # The resolved Source node id
+    plan: Dict[str, Any],                 # A plan_wordless_transfer result
+    *,
+    journal_path: Optional[str],          # Sidecar journal (the flywheel journal rides the db sidecar)
+    actor: str = "human",                 # Actor recorded on the transferred corrections
+    purpose: str = "wordless-transfer",   # CorrectionSession purpose tag
+) -> Dict[str, Any]:  # {"session_id","transferred","splits"}
+    """COMMIT a planned transfer — the engine's second half. One
+    CorrectionSession stamps everything: the event rows land as labeled
+    chunk inserts (rank preserved, layer-0 flank anchors from the plan), the
+    split rows as composed chunk splits (insert + left text + end nudge —
+    build_chunk_split_corrections, the donor's cut time), and the session
+    completes. Every commit journals through the sidecar exactly as the
+    walk's own gestures do — a replay reproduces the transfer."""
+    sess = await start_session(queue, graph_id, [source_id],
+                               journal_path=journal_path, purpose=purpose)
+    for p in plan.get("plan") or []:
+        await commit_chunk_insert_correction(
+            queue, graph_id, source_id, p["after_id"],
+            p["start"], p["end"], sess.id,
+            before_segment_id=p["before_id"], label=p["label"], rank=p["rank"],
+            actor=actor, journal_path=journal_path)
+    for s in plan.get("splits") or []:
+        await commit_chunk_split_correction(
+            queue, graph_id, source_id, s["segment_id"], s["time"],
+            s["left_text"], s["right_text"], s["end_s"], sess.id, s["after_id"],
+            before_segment_id=s["before_id"], old_text=s["old_text"],
+            boundary_words=s["boundary_words"], actor=actor,
+            journal_path=journal_path)
+    await set_session_status(queue, graph_id, sess.id, "completed",
+                             journal_path=journal_path)
+    return {"session_id": sess.id, "transferred": len(plan.get("plan") or []),
+            "splits": len(plan.get("splits") or [])}
+
+
+async def plan_wordless_export(
+    queue: JobQueue,                      # Started job queue (an open stack — CLI or shell)
+    graph_id: str,                        # Graph-storage capability id
+    source_id: str,                       # The resolved Source node id
+    *,
+    from_skeleton: str,                   # The walked spine whose effective wordless layer exports
+    rendition: Optional[str] = None,      # Which AudioRendition spine (None = auto)
+    labels: Optional[List[str]] = None,   # Restrict to these insert labels (None = every labeled wordless insert)
+) -> Dict[str, Any]:  # {"donors","word_bearing","counts","from_hash","window_end"}; reads only
+    """PLAN an export (reads only) — the `export-wordless-propset` engine's
+    read half, shared by the CLI verb and the shell's spine-picker verb
+    (9af9793a). The donor set is exactly `transfer-wordless`'s (shared
+    wordless_donors: accepted + nudged + manual, word-bearing stays behind),
+    source-time ordered, with the per-label census and the donor spine's
+    skeleton hash the manifest's provenance records. Refusals (empty spine,
+    no donors) raise SystemExit with the CLI's wording."""
+    segs = await load_source_segments(
+        queue, graph_id, source_id,
+        rendition_selector=rendition, skeleton_selector=from_skeleton)
+    if not segs:
+        raise SystemExit("empty spine (0 segments)")
+    spines = await list_source_spines(queue, graph_id, source_id,
+                                      rendition_selector=rendition)
+    from_hash = skeleton_hash_for(spines, from_skeleton)
+    corrections, superseded = await load_source_corrections(queue, graph_id, source_id)
+    active = [c for c in corrections
+              if c["id"] not in superseded and c.get("status") != "proposed"]
+    insert_meta = {c["id"]: (c.get("payload") or {}) for c in active
+                   if c.get("correction_type") == "insertion"
+                   and (c.get("payload") or {}).get("operation") == "chunk_insert"}
+    eff = project_effective_spine(segs, active)
+    donors, word_bearing = wordless_donors(eff, insert_meta, labels)
+    if not donors:
+        raise SystemExit("no wordless donors on this spine — nothing to export")
+    donors.sort(key=lambda d: d["start"])
+    counts: Dict[str, int] = {}
+    for d in donors:
+        counts[d["label"]] = counts.get(d["label"], 0) + 1
+    window_end = max((float(s.end_time) for s in segs
+                      if s.end_time is not None), default=donors[-1]["end"])
+    return {"donors": donors, "word_bearing": word_bearing, "counts": counts,
+            "from_hash": from_hash, "window_end": window_end}
+
+
+def write_wordless_propset(
+    plan: Dict[str, Any],                 # A plan_wordless_export result
+    *,
+    out_root: Path,                       # Proposal-set root (<workspace>/proposals)
+    source_id: str,                       # The Source node id
+    media_path: Optional[str],            # The source media (content-hash binding; None = path-only binding)
+    from_skeleton: str,                   # The selector the export was asked for (config provenance)
+    rendition: Optional[str] = None,      # Rendition selector (config provenance)
+    labels: Optional[List[str]] = None,   # Label restriction (config provenance)
+    ws: Any = None,                       # Resolved workspace (relativize_recorded) or None
+) -> Dict[str, Any]:  # {"set_id","set_dir","manifest_path","classes","counts"}
+    """WRITE a planned export as a proposal set — the engine's write half.
+
+    Serialized in the proposal-set-manifest format the decomp carve and the
+    propset pickers already consume (EVENT_PROPOSAL_SET_FORMAT; every row
+    tier 1 — human-verified spans ARE the operating point), so the decomp
+    app's Shift+E ring lists it beside model sets and a respine consuming it
+    cuts at the refined spans (the straddle class 2ba9e368 dies at the
+    root). Provenance: model.kind='human-effective-layer' + the donor
+    spine's skeleton hash; the source binding is the media content hash
+    (else path) — the join key PropsetIndex.for_source uses."""
+    donors = plan["donors"]
+    counts = plan["counts"]
+    content_hash = None
+    if media_path and Path(media_path).is_file():
+        h = hashlib.sha256()
+        with open(media_path, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+        content_hash = f"sha256:{h.hexdigest()}"
+    started = time.time()
+    set_id = (f"propset_{time.strftime('%Y%m%d_%H%M%S', time.localtime(started))}"
+              f"_{uuid.uuid4().hex[:8]}")
+    set_dir = Path(out_root) / set_id
+    set_dir.mkdir(parents=True)
+    with open(set_dir / "proposals.jsonl", "w") as f:
+        for d in donors:
+            f.write(json.dumps({
+                "proposal_id": str(uuid.uuid4()),
+                "label": d["label"],
+                "start_time": round(d["start"], 4),
+                "end_time": round(d["end"], 4),
+                "score": round(d["rank"], 4),
+                "tier": 1,
+            }) + "\n")
+    from_hash = plan.get("from_hash")
+    manifest = {
+        "format": EVENT_PROPOSAL_SET_FORMAT,
+        "version": "0.2.0",
+        "proposal_set_id": set_id,
+        "created_at": started,
+        "config": {
+            "exporter": "cjm-transcript-correction-core/export-wordless-propset",
+            "from_skeleton": from_skeleton,
+            "rendition": rendition,
+            "labels": sorted(labels) if labels else None,
+        },
+        "training_run_manifest": "",
+        "training_run_id": "",
+        "model": {"kind": "human-effective-layer",
+                  "from_skeleton_hash": from_hash},
+        "source": {"path": media_path, "content_hash": content_hash,
+                   "source_id": source_id,
+                   **({"skeleton_hash": from_hash} if from_hash else {})},
+        "window": {"start": 0.0, "end": plan["window_end"]},
+        "classes": sorted(counts),
+        "files": {"proposals": "proposals.jsonl"},
+        "counts": counts,
+    }
+    manifest_path = set_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(relativize_recorded(manifest, ws), indent=2))
+    return {"set_id": set_id, "set_dir": str(set_dir),
+            "manifest_path": str(manifest_path),
+            "classes": sorted(counts), "counts": dict(counts)}
+
+
 async def export_command(
     args: argparse.Namespace,  # Parsed args for the `export-wordless-propset` subcommand
 ) -> int:  # Process exit code
@@ -1092,16 +1347,16 @@ async def export_command(
     layer out as a proposal set (f5d080b9 direction a — effective-layer-as-
     carve-authority).
 
-    The exported spans are exactly the `transfer-wordless` donor set (shared
-    `wordless_donors`: accepted + nudged + manual, word-bearing stays behind),
-    serialized in the proposal-set-manifest format the decomp carve and the
-    propset picker already consume (EVENT_PROPOSAL_SET_FORMAT; all rows tier 1
-    — human-verified spans ARE the operating point). A respine consuming the
-    set cuts at the refined spans, so a subsequent transfer-wordless lands
-    every event in an EXACT gap — the straddle class (2ba9e368) dies at the
-    root. Provenance: model.kind='human-effective-layer' + the donor spine's
-    skeleton hash; score carries each insert's preserved rank. Reads only —
-    no graph writes, no journal."""
+    A thin driver over the shared engine (plan_wordless_export +
+    write_wordless_propset — the correction shell's spine-picker verb drives
+    the same two calls in-process, 9af9793a): the exported spans are exactly
+    the `transfer-wordless` donor set (shared `wordless_donors`: accepted +
+    nudged + manual, word-bearing stays behind), serialized in the
+    proposal-set-manifest format the decomp carve and the propset pickers
+    already consume. A respine consuming the set cuts at the refined spans,
+    so a subsequent transfer-wordless lands every event in an EXACT gap — the
+    straddle class (2ba9e368) dies at the root. Reads only — no graph
+    writes, no journal."""
     ws = resolve_workspace(explicit=getattr(args, "workspace", None))
     if ws is not None:
         os.environ["CJM_WORKSPACE"] = str(ws.root)
@@ -1120,46 +1375,15 @@ async def export_command(
     queue = JobQueue(deps=manager)
     await queue.start()
     try:
-        res = await graph_task(queue, args.graph_capability, "query_nodes",
-                               query=NodeQuery(label="Source",
-                                               project=["title", "path"]).to_dict())
-        needle = args.source.lower()
-        matches = [(r["id"], str(r.get("title") or ""), r.get("path"))
-                   for r in (res.rows or [])
-                   if r["id"] == args.source or needle in str(r.get("title") or "").lower()]
-        if len(matches) != 1:
-            raise SystemExit(f"--source matched {len(matches)} Source nodes "
-                             f"({[t for _, t, _ in matches]}); need exactly one")
-        sid, title, media_path = matches[0]
+        sid, title, media_path = await resolve_source_node(
+            queue, args.graph_capability, args.source)
         print(f"source: {title or sid}  ({sid})")
-
-        segs = await load_source_segments(
+        plan = await plan_wordless_export(
             queue, args.graph_capability, sid,
-            rendition_selector=args.rendition, skeleton_selector=args.from_skeleton)
-        if not segs:
-            raise SystemExit("empty spine (0 segments)")
-        spines = await list_source_spines(queue, args.graph_capability, sid,
-                                          rendition_selector=args.rendition)
-        from_hash = skeleton_hash_for(spines, args.from_skeleton)
-
-        corrections, superseded = await load_source_corrections(queue, args.graph_capability, sid)
-        active = [c for c in corrections
-                  if c["id"] not in superseded and c.get("status") != "proposed"]
-        insert_meta = {c["id"]: (c.get("payload") or {}) for c in active
-                       if c.get("correction_type") == "insertion"
-                       and (c.get("payload") or {}).get("operation") == "chunk_insert"}
-        eff = project_effective_spine(segs, active)
-        donors, word_bearing = wordless_donors(eff, insert_meta, args.labels)
-        if not donors:
-            raise SystemExit("no wordless donors on this spine — nothing to export")
-        donors.sort(key=lambda d: d["start"])
-
-        counts: Dict[str, int] = {}
-        for d in donors:
-            counts[d["label"]] = counts.get(d["label"], 0) + 1
-        window_end = max((float(s.end_time) for s in segs
-                          if s.end_time is not None), default=donors[-1]["end"])
-        print(f"donors: {len(donors)}  (word-bearing-skip {word_bearing})")
+            from_skeleton=args.from_skeleton, rendition=args.rendition,
+            labels=args.labels)
+        donors, counts = plan["donors"], plan["counts"]
+        print(f"donors: {len(donors)}  (word-bearing-skip {plan['word_bearing']})")
         print("by label: " + " · ".join(f"{k}x{v}" for k, v in sorted(counts.items())))
         if args.dry_run:
             for d in donors[:10]:
@@ -1168,59 +1392,14 @@ async def export_command(
                 print(f"  … {len(donors) - 10} more")
             print("dry run — nothing written")
             return 0
-
-        content_hash = None
-        if media_path and Path(media_path).is_file():
-            h = hashlib.sha256()
-            with open(media_path, "rb") as f:
-                for block in iter(lambda: f.read(1 << 20), b""):
-                    h.update(block)
-            content_hash = f"sha256:{h.hexdigest()}"
-
-        started = time.time()
-        set_id = (f"propset_{time.strftime('%Y%m%d_%H%M%S', time.localtime(started))}"
-                  f"_{uuid.uuid4().hex[:8]}")
-        set_dir = out_root / set_id
-        set_dir.mkdir(parents=True)
-        with open(set_dir / "proposals.jsonl", "w") as f:
-            for d in donors:
-                f.write(json.dumps({
-                    "proposal_id": str(uuid.uuid4()),
-                    "label": d["label"],
-                    "start_time": round(d["start"], 4),
-                    "end_time": round(d["end"], 4),
-                    "score": round(d["rank"], 4),
-                    "tier": 1,
-                }) + "\n")
-        manifest = {
-            "format": EVENT_PROPOSAL_SET_FORMAT,
-            "version": "0.2.0",
-            "proposal_set_id": set_id,
-            "created_at": started,
-            "config": {
-                "exporter": "cjm-transcript-correction-core/export-wordless-propset",
-                "from_skeleton": args.from_skeleton,
-                "rendition": args.rendition,
-                "labels": sorted(args.labels) if args.labels else None,
-            },
-            "training_run_manifest": "",
-            "training_run_id": "",
-            "model": {"kind": "human-effective-layer",
-                      "from_skeleton_hash": from_hash},
-            "source": {"path": media_path, "content_hash": content_hash,
-                       "source_id": sid,
-                       **({"skeleton_hash": from_hash} if from_hash else {})},
-            "window": {"start": 0.0, "end": window_end},
-            "classes": sorted(counts),
-            "files": {"proposals": "proposals.jsonl"},
-            "counts": counts,
-        }
-        (set_dir / "manifest.json").write_text(
-            json.dumps(relativize_recorded(manifest, ws), indent=2))
-        print(f"proposal set {set_id} -> {set_dir}")
+        res = write_wordless_propset(
+            plan, out_root=out_root, source_id=sid, media_path=media_path,
+            from_skeleton=args.from_skeleton, rendition=args.rendition,
+            labels=args.labels, ws=ws)
+        print(f"proposal set {res['set_id']} -> {res['set_dir']}")
         print("consume: decomp --respine --event-split "
-              f"--event-propset {set_dir / 'manifest.json'} "
-              + " ".join(f"--event-classes {c}" for c in sorted(counts)))
+              f"--event-propset {res['manifest_path']} "
+              + " ".join(f"--event-classes {c}" for c in res["classes"]))
     finally:
         await queue.stop()
         try:

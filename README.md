@@ -23,12 +23,17 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 
 - `bench_command` _function_ — Execute the `bench` subcommand: the reserved-tail verdict join.
 - `build_parser` _function_ — Build the CLI parser (subcommands: run, review).
+- `commit_wordless_transfer` _function_ — COMMIT a planned transfer — the engine's second half. One
 - `export_command` _function_ — Execute `export-wordless-propset`: write one spine's effective wordless
 - `extract_command` _function_ — Execute the `extract` subcommand: fold the gated overlay into a manifested dataset.
 - `gate_command` _function_ — Execute the `gate` subcommand: show or assert per-spine extraction gates.
 - `load_capabilities` _function_ — Discover manifests + load each capability, passing per-capability config (CR-2 caller-wins).
 - `main` _function_ — CLI entry point (console script: `cjm-transcript-correction-core`).
 - `overlay_event_rows` _function_ — Overlay span records -> dataset event rows for ONE spine (pure).
+- `plan_transfer_rows` _function_ — Place wordless donors on the destination (pure) — the event half of
+- `plan_wordless_export` _function_ — PLAN an export (reads only) — the `export-wordless-propset` engine's
+- `plan_wordless_transfer` _function_ — PLAN a wordless transfer (reads only) — the `transfer-wordless`
+- `resolve_source_node` _function_ — Resolve the --source selector the respine verbs share: exactly ONE
 - `review_command` _function_ — Execute the `review` subcommand: interactive text corrections over the flagged worklist.
 - `run_command` _function_ — Execute the `run` subcommand: correct a decomp manifest's committed spine.
 - `run_extract` _function_ — The extract fold on an ALREADY-OPEN graph seat (flywheel build leg 2,
@@ -36,6 +41,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `stats_command` _function_ — Execute the `stats` subcommand: flywheel accounting over the shared graph.
 - `transfer_command` _function_ — Execute `transfer-wordless`: replay wordless event inserts across sibling spines.
 - `wordless_donors` _function_ — The EFFECTIVE wordless layer of a spine: labeled, effectively wordless
+- `write_wordless_propset` _function_ — WRITE a planned export as a proposal set — the engine's write half.
 
 ### `cjm_transcript_correction_core.graph`
 
@@ -183,11 +189,13 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `plan_chunk_insert` _function_ — Plan a chunk insertion into the seam after the cursor (the i gesture unit; pure).
 - `plan_chunk_split` _function_ — Plan a chunk split at a caret position (the S gesture unit; pure).
 - `plan_gate` _function_ — Plan an extraction-gate assertion (the F gesture unit; pure — DEC 8e05b87b).
+- `plan_split_rows` _function_ — Place speaker-split boundaries on a destination spine (pure) — the
 - `plan_time_nudge` _function_ — Plan a boundary-time nudge (the ,/. and </> gesture unit; pure).
 - `resolve_mark_class_token` _function_ — Resolve a leading digit token to its menu class (the M picker; pure).
 - `segment_word_tokens` _function_ — Tokenize a segment's text into words WITH character offsets (pure).
 - `snap_word_span` _function_ — Derive a word range's TIME span from FA word timestamps (pure; fc42614d).
 - `source_status` _function_ — Correction-status-at-a-glance for one Source (the picker's detail row).
+- `split_donors` _function_ — The SPEAKER-SPLIT layer of a spine (pure) — the DoD rider 54aac7d3 on
 
 ### `cjm_transcript_correction_core.state`
 

@@ -1000,6 +1000,98 @@ def plan_chunk_split(
                                "right": right_text.split()[0]}}
 
 
+def split_donors(
+    effective_units: List,          # project_effective_spine output for the DONOR spine
+    insert_meta: Dict[str, Dict],   # chunk_insert payloads keyed by effective-unit id
+    split_ids: set,                 # Insert ids born as split right halves (rationale "chunk-split")
+) -> List[Dict[str, Any]]:  # [{"time","left","right"}] source-time ordered — one per speaker split
+    """The SPEAKER-SPLIT layer of a spine (pure) — the DoD rider 54aac7d3 on
+    the in-app respine (9af9793a): the 67c7391e 'accepted residue' class.
+
+    A split's right half is a WORD-BEARING chunk_insert born with rationale
+    `chunk-split` (build_chunk_split_corrections), so it is exactly the insert
+    class `wordless_donors` leaves behind. What transfers is the BOUNDARY: a
+    cut at source time (the right half's EFFECTIVE start — nudges applied,
+    the heard cut), never the halves' text, which belongs to the donor
+    transcript; the destination re-partitions its OWN words at that time
+    (plan_split_rows). The words either side ride along as plan-render
+    context only."""
+    out: List[Dict[str, Any]] = []
+    for i, u in enumerate(effective_units):
+        if u.id not in split_ids or u.id not in insert_meta or u.start_time is None:
+            continue
+        prev = effective_units[i - 1] if i > 0 else None
+        out.append({"time": float(u.start_time),
+                    "left": (((prev.text or "").split() or [""])[-1]
+                             if prev is not None else ""),
+                    "right": ((u.text or "").split() or [""])[0]})
+    out.sort(key=lambda d: d["time"])
+    return out
+
+
+def plan_split_rows(
+    splits: List[Dict[str, Any]],   # split_donors rows ({"time","left","right"})
+    eff_to: List,                   # The DESTINATION spine's EFFECTIVE units (project_effective_spine)
+    synthetic_ids: set,             # Insert ids among eff_to (anchor resolution past synthetics)
+    existing_splits: List[float],   # Effective start times of the destination's OWN split right halves
+    tolerance: float = 0.05,        # Dup window (s): an existing split this close counts as transferred
+) -> Tuple[List[Dict[str, Any]], int, int, int]:  # (placed rows, dup-skips, unanchored, same-segment conflicts)
+    """Place speaker-split boundaries on a destination spine (pure) — the
+    split half of the transfer plan (54aac7d3 rider on 9af9793a).
+
+    Each donor cut is a source time t. The destination unit CONTAINING t
+    (strictly inside its span) is the split target; the text cut falls at
+    the word boundary NEAREST the time-interpolated character position —
+    the inverse of plan_chunk_split's caret->time seed, so precision stays
+    where the toolkit puts it (nudge after the split, never character
+    precision at split time). plan_chunk_split then supplies the halves and
+    the layer-0 flank anchors (past synthetics), and the row's split time is
+    the DONOR's t, not the re-interpolated seed (the propose-split rule: the
+    heard cut is the cut). Refusals count, never raise: a t outside every
+    unit or inside a one-word unit is `unanchored`; a second donor landing
+    on a unit already claimed this pass is a `conflict` (the first split
+    changes that unit's text and end — redo the rest by hand, or transfer
+    again after the commit: the dup guard then sees the landed one).
+    Rows: plan_chunk_split's fields + {"time","old_text","donor_words"}."""
+    plan: List[Dict[str, Any]] = []
+    dups = unanchored = conflicts = 0
+    taken: set = set()
+    for d in splits:
+        t = float(d["time"])
+        if any(abs(t - s) <= tolerance for s in existing_splits):
+            dups += 1
+            continue
+        i = next((j for j, u in enumerate(eff_to)
+                  if u.start_time is not None and u.end_time is not None
+                  and float(u.start_time) < t < float(u.end_time)), None)
+        if i is None:
+            unanchored += 1
+            continue
+        seg = eff_to[i]
+        if seg.id in taken:
+            conflicts += 1
+            continue
+        text = seg.text or ""
+        cuts = [c for c, _e, _w in segment_word_tokens(text)][1:]   # before every word but the first
+        if not cuts:
+            unanchored += 1
+            continue
+        start, end = float(seg.start_time), float(seg.end_time)
+        seed = len(text) * (t - start) / (end - start)
+        caret = min(cuts, key=lambda c: abs(c - seed))
+        row = plan_chunk_split(eff_to, i, caret, inserted_ids=synthetic_ids)
+        if row is None:
+            unanchored += 1
+            continue
+        row["split_s"] = t
+        row["time"] = t
+        row["old_text"] = text
+        row["donor_words"] = {"left": d.get("left", ""), "right": d.get("right", "")}
+        taken.add(seg.id)
+        plan.append(row)
+    return plan, dups, unanchored, conflicts
+
+
 def segment_word_tokens(
     text: str,  # A segment's effective text
 ) -> List[Tuple[int, int, str]]:  # [(char_start, char_end, word)] in text order

@@ -410,6 +410,56 @@ def test_plan_chunk_split_caret_seed_and_anchors():
     assert pt is not None and 0.0 < pt["split_s"] < 0.02
 
 
+def test_split_donors_and_plan_split_rows():
+    """The speaker-split transfer half (DoD rider 54aac7d3 on 9af9793a):
+    split_donors picks the right halves born `chunk-split` (by id set) and
+    reports the cut as the EFFECTIVE start with the words either side;
+    plan_split_rows re-cuts the destination's OWN words at the word boundary
+    nearest the time-interpolated position, keeps the donor's time as the
+    cut, and COUNTS dup / unanchored / same-segment conflicts instead of
+    raising."""
+    from types import SimpleNamespace
+
+    from cjm_transcript_correction_core.spine import plan_split_rows, split_donors
+
+    # donor effective spine: layer-0 "a" split at 12.0 -> a (left) + ins-1 (right);
+    # ins-2 is an ordinary wordless insert and must not classify as a split
+    eff_from = [SimpleNamespace(id="a", text="alpha beta", start_time=10.0, end_time=12.0),
+                SimpleNamespace(id="ins-1", text="gamma delta", start_time=12.0, end_time=14.0),
+                SimpleNamespace(id="ins-2", text="", start_time=14.2, end_time=14.4),
+                SimpleNamespace(id="b", text="tail", start_time=14.5, end_time=16.0)]
+    meta = {"ins-1": {"operation": "chunk_insert", "text": "gamma delta"},
+            "ins-2": {"operation": "chunk_insert", "label": "inhale"}}
+    sd = split_donors(eff_from, meta, {"ins-1"})
+    assert sd == [{"time": 12.0, "left": "beta", "right": "gamma"}]
+    assert split_donors(eff_from, meta, set()) == []
+
+    # destination: one 4-word unit spans the cut; 12.0 is halfway through
+    # "one two three four" (18 chars -> seed 9.0) -> nearest word start = 8
+    eff_to = [SimpleNamespace(id="x", text="one two three four", start_time=10.0, end_time=14.0),
+              SimpleNamespace(id="y", text="tail", start_time=14.0, end_time=16.0)]
+    rows, dups, un, conf = plan_split_rows(sd, eff_to, set(), [], 0.05)
+    assert (dups, un, conf) == (0, 0, 0) and len(rows) == 1
+    r = rows[0]
+    assert r["segment_id"] == "x" and r["time"] == 12.0 and r["split_s"] == 12.0
+    assert (r["left_text"], r["right_text"]) == ("one two", "three four")
+    assert (r["after_id"], r["before_id"], r["end_s"]) == ("x", "y", 14.0)
+    assert r["old_text"] == "one two three four"
+    assert r["donor_words"] == {"left": "beta", "right": "gamma"}
+    # an earlier cut interpolates to an earlier word boundary
+    early = plan_split_rows([{"time": 11.0}], eff_to, set(), [], 0.05)[0][0]
+    assert (early["left_text"], early["right_text"]) == ("one", "two three four")
+    # dup guard: a destination split already within tolerance -> skipped
+    assert plan_split_rows(sd, eff_to, set(), [12.02], 0.05)[1] == 1
+    # unanchored: a cut outside every unit, or inside a one-word unit
+    assert plan_split_rows([{"time": 9.0}], eff_to, set(), [], 0.05)[2] == 1
+    assert plan_split_rows([{"time": 15.0}], eff_to, set(), [], 0.05)[2] == 1
+    # conflict: two donors on the same destination unit -> the second waits
+    two = [{"time": 11.0}, {"time": 13.0}]
+    rows2, _, _, conf2 = plan_split_rows(two, eff_to, set(), [], 0.05)
+    assert len(rows2) == 1 and rows2[0]["time"] == 11.0 and conf2 == 1
+
+
 def test_spineview_split_echo():
     """Local echo of a chunk split (hermetic): the target keeps the LEFT half
     (text truncated, end pulled to the cut) and the right half splices as a

@@ -117,6 +117,92 @@ def test_export_wordless_propset_subcommand():
         p.parse_args(["export-wordless-propset", "--source", "x"])  # --from-skeleton required
 
 
+def test_transfer_wordless_no_splits_flag():
+    """Speaker splits transfer by default (54aac7d3); --no-splits leaves
+    them, riding beside the existing tolerance / dry-run flags."""
+    p = build_parser()
+    ns = p.parse_args(["transfer-wordless", "--source", "x",
+                       "--from-skeleton", "a", "--to-skeleton", "b"])
+    assert ns.no_splits is False and ns.tolerance == 0.05 and ns.dry_run is False
+    ns = p.parse_args(["transfer-wordless", "--source", "x", "--from-skeleton", "a",
+                       "--to-skeleton", "b", "--no-splits", "--dry-run"])
+    assert ns.no_splits and ns.dry_run
+
+
+def test_plan_transfer_rows_anchors_dups_and_unanchored():
+    """The event half of the transfer plan (pure, factored out of the CLI
+    verb for the in-app driver, 9af9793a): source-time anchoring after the
+    last layer-0 segment starting at or before the donor, tail donors get a
+    None right flank, a donor before the spine is unanchored, and a same-
+    label destination insert within tolerance is a dup — a different label
+    at the same time is not."""
+    from types import SimpleNamespace
+
+    from cjm_transcript_correction_core.cli import plan_transfer_rows
+
+    to_l0 = [SimpleNamespace(id="s0", index=0, start_time=10.0),
+             SimpleNamespace(id="s1", index=1, start_time=20.0),
+             SimpleNamespace(id="s2", index=2, start_time=30.0)]
+    donors = [{"start": 9.0, "end": 9.5, "label": "inhale", "rank": 0.0},    # before the spine
+              {"start": 12.0, "end": 12.3, "label": "inhale", "rank": 1.0},  # gap after s0 (dup below)
+              {"start": 20.0, "end": 20.2, "label": "click", "rank": 0.0},   # at s1's start -> after s1
+              {"start": 31.0, "end": 31.4, "label": "inhale", "rank": 2.0}]  # tail -> no right flank
+    plan, dups, un = plan_transfer_rows(donors, [("inhale", 12.03)], to_l0, 0.05)
+    assert (dups, un) == (1, 1)
+    assert [(p["label"], p["after_id"], p["before_id"]) for p in plan] == [
+        ("click", "s1", "s2"), ("inhale", "s2", None)]
+    assert plan[1]["rank"] == 2.0 and plan[1]["start"] == 31.0
+    other = plan_transfer_rows([donors[1]], [("click", 12.0)], to_l0, 0.05)
+    assert other[1] == 0 and other[0][0]["after_id"] == "s0" and other[0][0]["before_id"] == "s1"
+    # a rerun over the landed rows transfers nothing (idempotency)
+    landed = [(p["label"], p["start"]) for p in plan]
+    assert plan_transfer_rows(donors[2:], landed, to_l0, 0.05) == ([], 2, 0)
+
+
+def test_write_wordless_propset_manifest(tmp_path):
+    """The export engine's write half (factored for the in-app verb,
+    9af9793a): a proposal set in EVENT_PROPOSAL_SET_FORMAT under out_root —
+    tier-1 rows in donor order, the human-effective-layer provenance, and
+    the source binding PropsetIndex.for_source joins on (content hash +
+    path + skeleton hash)."""
+    import json
+    from pathlib import Path
+
+    from cjm_transcript_correction_core.cli import write_wordless_propset
+    from cjm_transcript_correction_core.signals import EVENT_PROPOSAL_SET_FORMAT
+
+    media = tmp_path / "a.wav"
+    media.write_bytes(b"abc")
+    plan = {"donors": [{"start": 1.0, "end": 1.25, "label": "inhale", "rank": 0.5},
+                       {"start": 3.0, "end": 3.1, "label": "click", "rank": 0.0}],
+            "word_bearing": 0, "counts": {"inhale": 1, "click": 1},
+            "from_hash": "sha256:abc", "window_end": 60.0}
+    res = write_wordless_propset(plan, out_root=tmp_path / "proposals",
+                                 source_id="src-1", media_path=str(media),
+                                 from_skeleton="abc", ws=None)
+    assert res["set_id"].startswith("propset_") and res["classes"] == ["click", "inhale"]
+    assert Path(res["set_dir"]).parent == tmp_path / "proposals"
+    m = json.loads(Path(res["manifest_path"]).read_text())
+    assert m["format"] == EVENT_PROPOSAL_SET_FORMAT
+    assert m["proposal_set_id"] == res["set_id"] and m["version"] == "0.2.0"
+    assert m["model"] == {"kind": "human-effective-layer", "from_skeleton_hash": "sha256:abc"}
+    assert m["source"]["source_id"] == "src-1" and m["source"]["path"] == str(media)
+    assert m["source"]["content_hash"].startswith("sha256:")
+    assert m["source"]["skeleton_hash"] == "sha256:abc"
+    assert m["config"]["from_skeleton"] == "abc" and m["config"]["labels"] is None
+    assert m["classes"] == ["click", "inhale"] and m["counts"] == {"inhale": 1, "click": 1}
+    assert m["window"] == {"start": 0.0, "end": 60.0}
+    rows = [json.loads(line) for line in
+            (Path(res["set_dir"]) / "proposals.jsonl").read_text().splitlines()]
+    assert [(r["label"], r["start_time"], r["end_time"], r["score"], r["tier"])
+            for r in rows] == [("inhale", 1.0, 1.25, 0.5, 1), ("click", 3.0, 3.1, 0.0, 1)]
+    # no media on disk: path-only binding, no hash
+    res2 = write_wordless_propset(plan, out_root=tmp_path / "proposals",
+                                  source_id="src-1", media_path="/nope.wav",
+                                  from_skeleton="abc", ws=None)
+    assert json.loads(Path(res2["manifest_path"]).read_text())["source"]["content_hash"] is None
+
+
 def test_scan_mishomed_subcommand():
     """The scan surface (96edc646 verdict bc7ece7b): read-only QA gate sharing
     the source/spine selectors; --strict flips it into a nonzero-exit gate."""
