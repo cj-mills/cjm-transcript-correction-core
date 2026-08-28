@@ -808,10 +808,16 @@ async def bench_command(
                 d = json.loads(rm.read_text())
             except (OSError, json.JSONDecodeError):
                 continue
-            if d.get("format") == "cjm-transcript-decomp-core/run-manifest" \
-                    and d.get("event_propset_id") == set_id \
-                    and d.get("skeleton_config_hash"):
+            if d.get("format") != "cjm-transcript-decomp-core/run-manifest":
+                continue
+            if d.get("event_propset_id") == set_id and d.get("skeleton_config_hash"):
                 skeleton = d["skeleton_config_hash"]
+            # Multi-source runs (decomp manifest 0.2.6) carry the consumed
+            # set + skeleton PER SOURCE record; the run-level fields are
+            # empty there, so the join reads the record that names this set.
+            for rec in d.get("sources") or []:
+                if rec.get("event_propset_id") == set_id and rec.get("skeleton_config_hash"):
+                    skeleton = rec["skeleton_config_hash"]
         if skeleton:
             print(f"  spine: {skeleton[:24]}… (resolved via the consuming decomp manifest)")
     if not source_id:
