@@ -1061,7 +1061,7 @@ async def _list_spines(
     queue: JobQueue,           # Started job queue
     graph_id: str,             # Graph-storage capability id
     rendition_ids: List[str],  # The chosen rendition chain group
-) -> List[Dict[str, Any]]:  # [{"skeleton_hash", "split_policy", "segments"}], legacy first
+) -> List[Dict[str, Any]]:  # [{"skeleton_hash", "split_policy", "segments", "created_at"}], legacy first
     """Group the fine Segments under a rendition set by SKELETON (parallel spines).
 
     One bounded projection (two props over the PART_OF far-end batch), grouped
@@ -1070,16 +1070,19 @@ async def _list_spines(
     the prop existed); it sorts first so pickers show it as the incumbent.
     """
     q = _spine_query(rendition_ids, order_by=None,
-                     project=["skeleton_hash", "split_policy"])
+                     project=["skeleton_hash", "split_policy", "created_at"])
     res = await graph_task(queue, graph_id, "query_nodes", query=q.to_dict())
     groups: Dict[Optional[str], Dict[str, Any]] = {}
     for r in (res.rows or []):
         key = r.get("skeleton_hash")
         g = groups.setdefault(key, {"skeleton_hash": key, "split_policy": None,
-                                    "segments": 0})
+                                    "segments": 0, "created_at": 0.0})
         g["segments"] += 1
         if r.get("split_policy"):
             g["split_policy"] = r["split_policy"]
+        c = float(r.get("created_at") or 0.0)
+        if c and (not g["created_at"] or c < g["created_at"]):
+            g["created_at"] = c   # spine birth = its oldest segment's stamp
     return sorted(groups.values(),
                   key=lambda g: (g["skeleton_hash"] is not None,
                                  g["skeleton_hash"] or ""))
@@ -1090,7 +1093,7 @@ async def list_source_spines(
     graph_id: str,    # Graph-storage capability id
     source_id: str,   # Source node id
     rendition_selector: Optional[str] = None,  # Which rendition chain (None = auto)
-) -> List[Dict[str, Any]]:  # [{"skeleton_hash", "split_policy", "segments"}], legacy first
+) -> List[Dict[str, Any]]:  # [{"skeleton_hash", "split_policy", "segments", "created_at"}], legacy first
     """The SPINES coexisting under a Source's chosen rendition (DEC f1024568).
 
     The picker/discovery surface: each row is one skeleton — the legacy
