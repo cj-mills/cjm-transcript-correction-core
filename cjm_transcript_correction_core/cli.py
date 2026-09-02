@@ -38,12 +38,11 @@ from cjm_transcript_correction_core.signals import (EVENT_PROPOSAL_SET_FORMAT,
 from cjm_transcript_correction_core.strata import (active_strata, bench_filter_proposals,
                                                    build_filter_pack, FILTER_LANE,
                                                    FILTER_PACK_FORMAT, load_filter_proposal_sets,
-                                                   materialized_mark_ids,
-                                                   pending_filter_proposals, proposals_from_rows,
-                                                   render_filter_pack,
+                                                   materialized_mark_ids, pending_filter_proposals,
+                                                   proposals_from_rows, render_filter_pack,
                                                    render_filter_propset_markdown,
-                                                   select_span_segments,
-                                                   validate_proposal_rows, write_filter_propset)
+                                                   select_span_segments, validate_proposal_rows,
+                                                   write_filter_propset)
 
 logger = logging.getLogger(__name__)
 
