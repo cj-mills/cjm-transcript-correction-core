@@ -296,6 +296,24 @@ ANNOTATE_ONLY_ACTIONS = frozenset({
     "word_left", "word_right", "word_select", "annotate_quick", "annotate_pick",
     "annotate_editor", "annotate_audition", "overlay_remove", "overlay_nudge",
     "overlay_cycle", "next_overlay", "prev_overlay"})
+# The FILTER lane (55bcc3c5, the filtering lane's HITL confirm): the walk +
+# audio vocabulary plus the confirm gestures — accept, span edit (mark the
+# run's start/end at the cursor, then accept over the CURRENT effective
+# spine), relabel, accept-as-mark, retract, the lane watermark, and the
+# worklist's jump / audition / tier toggle. Nudges and edits stay out: the
+# lane classifies runs, it never moves boundaries.
+FILTER_LANE_ACTIONS = frozenset({
+    "next", "prev", "replay", "seam_next", "seam_prev", "speed_down", "speed_up",
+    "yank", "filter_accept", "filter_accept_span", "filter_span_start",
+    "filter_span_end", "filter_relabel", "filter_mark", "filter_retract",
+    "filter_watermark", "filter_next", "filter_prev", "filter_jump",
+    "filter_audition", "filter_tier2", "filter_set",
+    "cycle_lane", "cycle_lane_prev", "cancel", "quit_app"})
+FILTER_ONLY_ACTIONS = frozenset({
+    "filter_accept", "filter_accept_span", "filter_span_start", "filter_span_end",
+    "filter_relabel", "filter_mark", "filter_retract", "filter_watermark",
+    "filter_next", "filter_prev", "filter_jump", "filter_audition", "filter_tier2",
+    "filter_set"})
 
 
 @dataclass
