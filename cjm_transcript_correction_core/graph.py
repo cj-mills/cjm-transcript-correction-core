@@ -334,13 +334,14 @@ async def start_session(
     scope: List[str],  # Source node ids in scope
     journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
     purpose: Optional[str] = None,  # None = genuine pass; "feature-test" = excludable from flywheel datasets (DEC c86714a4)
+    actor: str = "human",  # Actor stamped on the journal row (finding ac878d68: the shells pass theirs)
 ) -> CorrectionSession:  # The committed CorrectionSession
     """Create + commit a new CorrectionSession node."""
     sess = CorrectionSession(scope=scope, purpose=purpose)
     node = sess.to_graph_node().to_dict()
     await commit_nodes_edges(queue, graph_id, [node], [])
     if journal_path:
-        journal_correction_op(journal_path, "session-start", actor="human",
+        journal_correction_op(journal_path, "session-start", actor=actor,
                               session_id=node["id"], args={"scope": scope},
                               nodes=[node], edges=[], op_id=node["id"])
     return sess
@@ -364,6 +365,7 @@ async def set_session_status(
     session_id: str,  # CorrectionSession node id
     status: str,      # New status ("in_progress" | "completed" | "reopened")
     journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    actor: str = "human",  # Actor stamped on the journal row (finding ac878d68)
 ) -> None:
     """Update a session's status + updated_at.
 
@@ -375,7 +377,7 @@ async def set_session_status(
     await graph_task(queue, graph_id, "update_node", node_id=session_id,
                      properties={"status": status, "updated_at": ts})
     if journal_path:
-        journal_correction_op(journal_path, "session-status", actor="human",
+        journal_correction_op(journal_path, "session-status", actor=actor,
                               session_id=session_id,
                               args={"session_id": session_id, "status": status,
                                     "updated_at": ts},
@@ -388,6 +390,7 @@ async def record_review_markers(
     session_id: str,                   # Owning session id
     decisions: List[Tuple[str, str]],  # (segment_id, decision) pairs
     journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    actor: str = "human",  # Actor stamped on the journal row (finding ac878d68)
 ) -> int:  # Number of REVIEWED edges committed
     """Persist per-(session, segment) review markers as REVIEWED edges."""
     edges = [_edge(session_id, seg_id, CorrectionRelations.REVIEWED,
@@ -398,7 +401,7 @@ async def record_review_markers(
         # No anchor: markers are derivative session state — the CORRECTION op carries
         # the anchor (DEC ccbab9f5 point 5 scopes anchors to correction ops), and the
         # extra segment reads priced the TUI keystroke (journal-lag finding).
-        journal_correction_op(journal_path, "review-markers", actor="human",
+        journal_correction_op(journal_path, "review-markers", actor=actor,
                               session_id=session_id,
                               args={"decisions": [list(d) for d in decisions]},
                               nodes=[], edges=edges)
@@ -1607,6 +1610,7 @@ async def set_session_purpose(
     session_id: str,  # CorrectionSession node id
     purpose: Optional[str],  # None = genuine pass; "feature-test" = excludable from flywheel datasets (open vocabulary)
     journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    actor: str = "human",  # Actor stamped on the journal row (finding ac878d68)
 ) -> None:
     """Update a session's purpose + updated_at (the test-session hygiene tag, DEC c86714a4).
 
@@ -1618,7 +1622,7 @@ async def set_session_purpose(
     await graph_task(queue, graph_id, "update_node", node_id=session_id,
                      properties={"purpose": purpose, "updated_at": ts})
     if journal_path:
-        journal_correction_op(journal_path, "session-purpose", actor="human",
+        journal_correction_op(journal_path, "session-purpose", actor=actor,
                               session_id=session_id,
                               args={"session_id": session_id, "purpose": purpose,
                                     "updated_at": ts},

@@ -226,11 +226,12 @@ async def run_correction(
             if await get_session(queue, cfg.graph_capability, session_id) is None:
                 raise SystemExit(f"session {session_id} not found in graph")
             if reopen:
-                await set_session_status(queue, cfg.graph_capability, session_id, "reopened")
+                await set_session_status(queue, cfg.graph_capability, session_id, "reopened",
+                                         actor=cfg.actor)
             sess_id = session_id
             logger.info(f"resumed session {sess_id}")
         else:
-            sess = await start_session(queue, cfg.graph_capability, source_ids)
+            sess = await start_session(queue, cfg.graph_capability, source_ids, actor=cfg.actor)
             sess_id = sess.id
             logger.info(f"started session {sess_id} over {len(source_ids)} source(s)")
 
@@ -275,7 +276,8 @@ async def run_correction(
                 "effective_segment_count": len(effective),
             })
 
-        await set_session_status(queue, cfg.graph_capability, sess_id, "completed")
+        await set_session_status(queue, cfg.graph_capability, sess_id, "completed",
+                                 actor=cfg.actor)
     except BaseException as e:
         # The journal exists for exactly this row: a run that DIED records
         # that it was attempted (failures stop being the unattributed case).
@@ -432,11 +434,12 @@ async def run_review(
             if await get_session(queue, cfg.graph_capability, session_id) is None:
                 raise SystemExit(f"session {session_id} not found in graph")
             if reopen:
-                await set_session_status(queue, cfg.graph_capability, session_id, "reopened")
+                await set_session_status(queue, cfg.graph_capability, session_id, "reopened",
+                                         actor=cfg.actor)
             sess_id = session_id
             logger.info(f"resumed session {sess_id}")
         else:
-            sess = await start_session(queue, cfg.graph_capability, source_ids)
+            sess = await start_session(queue, cfg.graph_capability, source_ids, actor=cfg.actor)
             sess_id = sess.id
             logger.info(f"started review session {sess_id} over {len(source_ids)} source(s)")
 
@@ -481,7 +484,8 @@ async def run_review(
                         f"reviewed={counts['reviewed']}; active corrections={len(active)}; "
                         f"effective spine={len(effective)}")
 
-        await set_session_status(queue, cfg.graph_capability, sess_id, "completed")
+        await set_session_status(queue, cfg.graph_capability, sess_id, "completed",
+                                 actor=cfg.actor)
     except BaseException as e:
         # The journal exists for exactly this row: a run that DIED records
         # that it was attempted (failures stop being the unattributed case).

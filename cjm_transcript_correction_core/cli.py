@@ -1321,7 +1321,7 @@ async def commit_wordless_transfer(
     completes. Every commit journals through the sidecar exactly as the
     walk's own gestures do — a replay reproduces the transfer."""
     sess = await start_session(queue, graph_id, [source_id],
-                               journal_path=journal_path, purpose=purpose)
+                               journal_path=journal_path, purpose=purpose, actor=actor)
     for p in plan.get("plan") or []:
         await commit_chunk_insert_correction(
             queue, graph_id, source_id, p["after_id"],
@@ -1336,7 +1336,7 @@ async def commit_wordless_transfer(
             boundary_words=s["boundary_words"], actor=actor,
             journal_path=journal_path)
     await set_session_status(queue, graph_id, sess.id, "completed",
-                             journal_path=journal_path)
+                             journal_path=journal_path, actor=actor)
     return {"session_id": sess.id, "transferred": len(plan.get("plan") or []),
             "splits": len(plan.get("splits") or [])}
 
@@ -1851,7 +1851,8 @@ async def filter_confirm_command(
 
         db = _resolve_graph_db(args, manager, cap, ws)
         jp = sidecar_journal_path(db)
-        sess = await start_session(queue, cap, [sid], journal_path=jp, purpose=args.purpose)
+        sess = await start_session(queue, cap, [sid], journal_path=jp, purpose=args.purpose,
+                                   actor=args.actor)
         to_accept: List[Dict[str, Any]] = []
         if args.accept_all:
             to_accept = list(pending_all)
@@ -1931,7 +1932,8 @@ async def filter_confirm_command(
                 wm, session_id=sess.id, actor=args.actor, journal_path=jp, lane=FILTER_LANE)
             print(f"lane watermark asserted: annotated_through "
                   f"{('%.1fs' % wm) if wm is not None else 'none'} ({_short(gid)})")
-        await set_session_status(queue, cap, sess.id, "completed", journal_path=jp)
+        await set_session_status(queue, cap, sess.id, "completed", journal_path=jp,
+                                 actor=args.actor)
         print(f"session {_short(sess.id)} completed · {done} accepted · journal "
               f"{jp or 'none'}")
     finally:

@@ -49,3 +49,34 @@ def test_replay_handlers_cover_mark_verbs():
     """Marks are BORN JOURNALED (DEC 2a231843): both verbs replay as wire ops."""
     handlers = correction_replay_handlers()
     assert "mark" in handlers and "mark-dismiss" in handlers
+
+
+def test_session_lifecycle_rows_carry_the_callers_actor(tmp_path, monkeypatch):
+    """Finding ac878d68: session-start / session-status / session-purpose rows used to
+    stamp actor="human" regardless of the verb's --actor. The actor threads through
+    now (default "human" keeps every existing caller byte-identical)."""
+    import asyncio
+    from cjm_transcript_correction_core import graph as g
+
+    async def fake_commit(queue, graph_id, nodes, edges):
+        return {"nodes": len(nodes), "edges": len(edges)}
+
+    async def fake_task(queue, graph_id, op, **kw):
+        return None
+
+    monkeypatch.setattr(g, "commit_nodes_edges", fake_commit)
+    monkeypatch.setattr(g, "graph_task", fake_task)
+    j = str(tmp_path / "w.jsonl")
+
+    async def run():
+        sess = await g.start_session(None, "gid", ["src"], journal_path=j,
+                                     purpose="feature-test", actor="agent:smoke")
+        await g.set_session_status(None, "gid", sess.id, "completed", journal_path=j,
+                                   actor="agent:smoke")
+        await g.set_session_purpose(None, "gid", sess.id, None, journal_path=j)
+        return sess
+
+    asyncio.run(run())
+    rows = read_journal(j)
+    assert [r["verb"] for r in rows] == ["session-start", "session-status", "session-purpose"]
+    assert [r["actor"] for r in rows] == ["agent:smoke", "agent:smoke", "human"]
