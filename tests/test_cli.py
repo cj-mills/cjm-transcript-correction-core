@@ -70,6 +70,10 @@ def test_filter_lane_subcommands():
     ns = p.parse_args(["filter-confirm", "--source", "Seven", "--accept", "a1", "--accept", "b2",
                        "--retract", "s9", "--watermark", "end", "--purpose", "feature-test"])
     assert ns.accept == ["a1", "b2"] and ns.retract == ["s9"] and ns.watermark == "end"
+    ns = p.parse_args(["filter-confirm", "--source", "Seven", "--relabel", "c3:research-mark",
+                       "--accept-as-mark", "d4:homophone-substitution", "--accept-as-mark", "e5"])
+    assert ns.relabel == ["c3:research-mark"]
+    assert ns.accept_as_mark == ["d4:homophone-substitution", "e5"]
     with pytest.raises(SystemExit):
         p.parse_args(["filter-ingest", "--pack", "p.json"])   # rows + proposer required
 

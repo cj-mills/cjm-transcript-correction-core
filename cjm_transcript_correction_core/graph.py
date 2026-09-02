@@ -919,6 +919,8 @@ def build_mark_correction(
     supersedes_id: Optional[str] = None,  # Prior mark this one replaces (re-mark)
     actor: str = "human",                 # Actor ("human" | "capability:<name>" for pass-2 assists)
     note: Optional[str] = None,           # Optional free-text note
+    proposal_id: Optional[str] = None,    # The accepted proposal when the mark materializes a proposer's mark-family row (filtering lane class-family routing)
+    proposal_set_id: Optional[str] = None,  # Its proposal set
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (correction node dict, edge dicts)
     """Build a NON-MUTATING mark Correction (DEC 2a231843: routed attention).
 
@@ -940,6 +942,11 @@ def build_mark_correction(
     seg_ids = mark_anchor_segments(anchor)
     payload = {"operation": "mark", "source_id": source_id,
                "anchor": dict(anchor), "mark_class": mc}
+    if proposal_id:
+        # A proposer's mark-family row accepted AS a mark: the id carry keeps the
+        # derived-verdict join exact (DEC 8e05b87b), same as a stratum accept.
+        payload["proposal_id"] = proposal_id
+        payload["proposal_set_id"] = proposal_set_id
     node = build_correction_node("mark", session_id, payload, actor=actor,
                                  rationale=note).to_graph_node()
     edges = [make_edge(node.id, sid, CorrectionRelations.CORRECTS) for sid in seg_ids]
@@ -959,6 +966,8 @@ async def commit_mark_correction(
     actor: str = "human",                 # Actor
     note: Optional[str] = None,           # Optional free-text note
     journal_path: Optional[str] = None,   # Sidecar journal — append the op on success (None = unjournaled)
+    proposal_id: Optional[str] = None,    # Accepted proposal id (mark-family routing; None = hand-placed)
+    proposal_set_id: Optional[str] = None,  # Its proposal set
 ) -> str:  # The new mark Correction node id
     """Commit a mark (node + CORRECTS per anchored segment [+ SUPERSEDES]).
 
@@ -966,13 +975,18 @@ async def commit_mark_correction(
     walked-past state stays exactly as the operator left it.
     """
     node, edges = build_mark_correction(source_id, anchor, mark_class, session_id,
-                                        supersedes_id=supersedes_id, actor=actor, note=note)
+                                        supersedes_id=supersedes_id, actor=actor, note=note,
+                                        proposal_id=proposal_id,
+                                        proposal_set_id=proposal_set_id)
     await commit_nodes_edges(queue, graph_id, [node], edges)
     if journal_path:
         journal_correction_op(journal_path, "mark", actor=actor, session_id=session_id,
                               args={"source_id": source_id, "anchor": dict(anchor),
                                     "mark_class": mark_class, "note": note,
-                                    "supersedes_id": supersedes_id},
+                                    "supersedes_id": supersedes_id,
+                                    **({"proposal_id": proposal_id,
+                                        "proposal_set_id": proposal_set_id}
+                                       if proposal_id else {})},
                               anchor=await segment_anchor(queue, graph_id,
                                                           mark_anchor_segments(anchor)),
                               nodes=[node], edges=edges, op_id=node["id"])

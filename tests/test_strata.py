@@ -259,6 +259,32 @@ def test_pending_hides_tier2_and_drops_materialized():
         == ["tool-mention", "tangent"]
 
 
+def test_mark_family_routing_materializes_and_benches_as_accepted():
+    """Class-family routing: a proposer's mark-family row accepted AS a mark
+    carries the proposal id on the mark payload — the worklist drops it and the
+    bench reads it ACCEPTED (family mark), never rejected below the watermark."""
+    from cjm_transcript_correction_core.graph import build_mark_correction
+    from cjm_transcript_correction_core.strata import materialized_mark_ids
+    _pack_, props = _props()
+    by_cat = {p["category"]: p for p in props}
+    pid = by_cat["tool-mention"]["proposal_id"]
+    node, _edges = build_mark_correction("src", {"kind": "segment", "segment_id": "s3"},
+                                         "homophone-substitution", "sess",
+                                         proposal_id=pid, proposal_set_id="set1")
+    assert node["properties"]["payload"]["proposal_id"] == pid
+    plain, _ = build_mark_correction("src", {"kind": "segment", "segment_id": "s3"}, "suspect", "sess")
+    assert "proposal_id" not in plain["properties"]["payload"]
+    d = dict(node["properties"]); d["id"] = node["id"]
+    mids = materialized_mark_ids([d], set())
+    assert mids == {pid} and materialized_mark_ids([d], {node["id"]}) == set()
+    pend = pending_filter_proposals(props, [], materialized=mids)
+    assert "tool-mention" not in [p["category"] for p in pend]
+    b = bench_filter_proposals(props, [], (0.0, 14.0), watermark=14.0, mark_ids=mids)
+    v = {r["category"]: r for r in b["verdicts"]}
+    assert v["tool-mention"]["verdict"] == "accepted" and v["tool-mention"]["family"] == "mark"
+    assert v["apparatus"]["verdict"] == "rejected"
+
+
 def test_bench_filter_proposals_derives_verdicts_below_watermark():
     _pack_, props = _props()
     by_cat = {p["category"]: p for p in props}

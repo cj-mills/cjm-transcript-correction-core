@@ -22,7 +22,8 @@ from cjm_substrate.core.workspace import relativize_recorded, resolve_workspace
 from cjm_transcript_correction_core.graph import (bench_event_proposals,
                                                   commit_chunk_insert_correction,
                                                   commit_chunk_split_correction,
-                                                  commit_extraction_gate, commit_stratum_correction,
+                                                  commit_extraction_gate, commit_mark_correction,
+                                                  commit_stratum_correction,
                                                   commit_stratum_retraction, correction_stats,
                                                   extract_spine_dataset, labeled_insert_spans,
                                                   list_source_spines, load_extraction_gates,
@@ -37,6 +38,7 @@ from cjm_transcript_correction_core.signals import (EVENT_PROPOSAL_SET_FORMAT,
 from cjm_transcript_correction_core.strata import (active_strata, bench_filter_proposals,
                                                    build_filter_pack, FILTER_LANE,
                                                    FILTER_PACK_FORMAT, load_filter_proposal_sets,
+                                                   materialized_mark_ids,
                                                    pending_filter_proposals, proposals_from_rows,
                                                    render_filter_pack,
                                                    render_filter_propset_markdown,
@@ -380,6 +382,15 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                                "batch-accept gesture — never automatic, DEC 304fd984)")
     fconfirm.add_argument("--accept-all", action="store_true",
                           help="Accept every pending proposal, audition tier included")
+    fconfirm.add_argument("--relabel", action="append", default=None, metavar="PROPOSAL:CLASS",
+                          help="Accept one pending proposal under a DIFFERENT category "
+                               "(repeatable; derives as 'relabeled')")
+    fconfirm.add_argument("--accept-as-mark", action="append", default=None,
+                          metavar="PROPOSAL[:CLASS]",
+                          help="Accept one pending proposal AS A MARK (class-family routing: "
+                               "ASR errors, suspect nouns and other correction-pass attention "
+                               "are marks, never strata); CLASS defaults to the proposal's "
+                               "category; multi-segment runs anchor on each segment")
     fconfirm.add_argument("--retract", action="append", default=None, metavar="STRATUM",
                           help="Retract a live stratum by id prefix (repeatable)")
     fconfirm.add_argument("--watermark", default=None,
@@ -1773,15 +1784,20 @@ async def filter_confirm_command(
                   (m.get("window") or {}).get("end"))
 
         gestures = bool(args.accept or args.accept_tier1 or args.accept_all
+                        or args.relabel or args.accept_as_mark
                         or args.retract or args.watermark is not None)
-        pending_all = pending_filter_proposals(proposals, strata, show_tier2=True)
+        mark_ids = materialized_mark_ids(corrections, superseded)
+        pending_all = pending_filter_proposals(proposals, strata, show_tier2=True,
+                                               materialized=mark_ids)
         print(f"source: {title or sid}  ({sid}) · spine {_spine_tag(skel)}")
         print(f"set {set_id} · proposer {(m.get('model') or {}).get('kind')}:"
               f"{(m.get('model') or {}).get('name')} · window "
               f"{window[0]:.1f}-{(window[1] if window[1] is not None else 0.0):.1f}s"
               + (f" · {len(sets)} sets (newest shown; --set picks)" if len(sets) > 1 else ""))
+        set_pids = {p.get("proposal_id") for p in proposals}
         print(f"lane watermark: {('%.1fs' % float(watermark)) if watermark is not None else 'none'}"
-              f" · live strata: {len(strata)}")
+              f" · live strata: {len(strata)}"
+              + (f" · marks from proposals: {len(mark_ids & set_pids)}" if mark_ids & set_pids else ""))
         if args.markdown:
             pack_path = ws.root / "packs" / f"{(m.get('pack') or {}).get('pack_id')}.json"
             pack = None
@@ -1819,14 +1835,18 @@ async def filter_confirm_command(
                           f"{float(p.get('start_time') or 0):8.1f}-{float(p.get('end_time') or 0):8.1f}s"
                           f"  x{len(p.get('segment_ids') or [])} segs · {c.get('actor')}"
                           + ("  (from proposal)" if p.get("proposal_id") else "  (human)"))
-            b = bench_filter_proposals(proposals, strata, window, watermark=watermark)
-            c1 = b["counts"]["tier1"]
-            print("derived verdicts (tier-1): " + " · ".join(f"{k} {v}" for k, v in c1.items())
-                  + (("  rates " + " ".join(f"{k}={v}" for k, v in b["rates"].items()))
-                     if b["rates"] else "")
-                  + (f" · missed {len(b['missed'])}" if b["missed"] else ""))
-            print("gestures: --accept <id> · --accept-tier1 · --accept-all · --retract <stratum> "
-                  "· --watermark <sec|end>")
+            b = bench_filter_proposals(proposals, strata, window, watermark=watermark,
+                                       mark_ids=mark_ids)
+            for tier_key, label in (("tier1", "tier-1"), ("tier2", "tier-2")):
+                c = b["counts"][tier_key]
+                if tier_key == "tier2" and not any(c.values()):
+                    continue
+                print(f"derived verdicts ({label}): " + " · ".join(f"{k} {v}" for k, v in c.items())
+                      + (("  rates " + " ".join(f"{k}={v}" for k, v in b["rates"].items()))
+                         if b["rates"] and tier_key == "tier1" else "")
+                      + (f" · missed {len(b['missed'])}" if b["missed"] and tier_key == "tier1" else ""))
+            print("gestures: --accept <id> · --relabel <id>:<class> · --accept-as-mark <id>[:<class>] "
+                  "· --accept-tier1 · --accept-all · --retract <stratum> · --watermark <sec|end|none>")
             return 0
 
         db = _resolve_graph_db(args, manager, cap, ws)
@@ -1841,18 +1861,49 @@ async def filter_confirm_command(
             p = _pick_by_prefix(pending_all, "proposal_id", pref, "pending proposal")
             if p not in to_accept:
                 to_accept.append(p)
+        relabels: List[Tuple[Dict[str, Any], str]] = []
+        for spec in (args.relabel or []):
+            pref, _, cls = spec.partition(":")
+            if not cls.strip():
+                raise SystemExit(f"--relabel needs PROPOSAL:CLASS, got {spec!r}")
+            p = _pick_by_prefix(pending_all, "proposal_id", pref, "pending proposal")
+            relabels.append((p, cls.strip()))
+        as_marks: List[Tuple[Dict[str, Any], str]] = []
+        for spec in (args.accept_as_mark or []):
+            pref, _, cls = spec.partition(":")
+            p = _pick_by_prefix(pending_all, "proposal_id", pref, "pending proposal")
+            as_marks.append((p, cls.strip() or str(p.get("category"))))
+        chosen_ids = {id(p) for p, _ in relabels} | {id(p) for p, _ in as_marks}
+        to_accept = [p for p in to_accept if id(p) not in chosen_ids]
         done = 0
-        for p in to_accept:
+        for p, cls in [(p, None) for p in to_accept] + relabels:
+            category = cls or str(p.get("category"))
+            note = p.get("rationale")
+            if cls:
+                note = f"relabeled from {p.get('category')} by {args.actor}: {note or ''}".strip()
             cid = await commit_stratum_correction(
-                queue, cap, sid, list(p.get("segment_ids") or []), str(p.get("category")),
+                queue, cap, sid, list(p.get("segment_ids") or []), category,
                 sess.id, skeleton_hash=skel, start_time=p.get("start_time"),
                 end_time=p.get("end_time"), proposal_id=p.get("proposal_id"),
-                proposal_set_id=set_id, actor=args.actor, note=p.get("rationale"),
+                proposal_set_id=set_id, actor=args.actor, note=note,
                 journal_path=jp)
             done += 1
-            print(f"accepted {_short(p.get('proposal_id'))} -> stratum {_short(cid)} "
-                  f"{p.get('category')} {float(p.get('start_time') or 0):.1f}-"
+            print(f"{'relabeled' if cls else 'accepted'} {_short(p.get('proposal_id'))} -> "
+                  f"stratum {_short(cid)} {category} {float(p.get('start_time') or 0):.1f}-"
                   f"{float(p.get('end_time') or 0):.1f}s")
+        for p, cls in as_marks:
+            note = f"from proposal ({(m.get('model') or {}).get('name')}): {p.get('rationale') or ''}".strip()
+            first = None
+            for seg_id in (p.get("segment_ids") or []):
+                mid = await commit_mark_correction(
+                    queue, cap, sid, {"kind": "segment", "segment_id": seg_id}, cls,
+                    sess.id, actor=args.actor, note=note, journal_path=jp,
+                    proposal_id=p.get("proposal_id"), proposal_set_id=set_id)
+                first = first or mid
+            done += 1
+            print(f"marked {_short(p.get('proposal_id'))} -> mark {_short(first)} {cls} "
+                  f"x{len(p.get('segment_ids') or [])} seg(s) "
+                  f"{float(p.get('start_time') or 0):.1f}-{float(p.get('end_time') or 0):.1f}s")
         for pref in (args.retract or []):
             c = _pick_by_prefix(strata, "id", pref, "live stratum")
             rid = await commit_stratum_retraction(queue, cap, sid, c["id"], sess.id,

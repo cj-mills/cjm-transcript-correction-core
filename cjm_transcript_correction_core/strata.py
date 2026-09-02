@@ -501,16 +501,31 @@ def _iou(a0: float, a1: float, b0: float, b1: float) -> float:  # Intersection o
     return inter / union if union > 0 else 0.0
 
 
+def materialized_mark_ids(
+    corrections: List[Dict[str, Any]],  # Corrections (e.g. from load_source_corrections)
+    superseded_ids: set,                # Ids that are SUPERSEDES targets
+) -> set:  # proposal ids that OPEN marks carry (mark-family rows accepted AS marks)
+    """Class-family routing's other half: a proposer's mark-family row (an ASR
+    error, a suspect noun) is accepted as a MARK, never a stratum — the mark's
+    payload carries the proposal id, so the worklist and the bench see it as
+    materialized exactly like a stratum accept."""
+    return {(c.get("payload") or {}).get("proposal_id") for c in corrections
+            if c.get("correction_type") == "mark"
+            and c.get("id") not in superseded_ids
+            and (c.get("payload") or {}).get("proposal_id")}
+
+
 def pending_filter_proposals(
     proposals: List[Dict[str, Any]],  # A proposal set's rows
     strata: List[Dict[str, Any]],     # active_strata output
     show_tier2: bool = False,         # Include the audition tier
+    materialized: Optional[set] = None,  # Extra proposal ids already materialized (e.g. as marks)
 ) -> List[Dict[str, Any]]:  # Proposals not yet materialized, time order
     """The headless worklist: proposals with NO live stratum carrying their id and
     NO same-category stratum overlapping them in time (accepted in some session
     — the verdict join owns history). Tier 2 hides by default (dual-tier
     doctrine a475ccd6: audition never joins the primary walk uninvited)."""
-    by_pid = {(c.get("payload") or {}).get("proposal_id") for c in strata}
+    by_pid = {(c.get("payload") or {}).get("proposal_id") for c in strata} | set(materialized or ())
     spans = [((c.get("payload") or {}).get("category"),
               float((c.get("payload") or {}).get("start_time") or 0.0),
               float((c.get("payload") or {}).get("end_time") or 0.0)) for c in strata]
@@ -535,6 +550,7 @@ def bench_filter_proposals(
     *,
     watermark: Optional[float] = None,     # The lane's annotated_through (None = nothing visited)
     iou_tolerance: float = 0.9,            # Same-category overlap at/above which a match is ACCEPTED (else EDITED)
+    mark_ids: Optional[set] = None,        # Proposal ids materialized AS MARKS (class-family routing) — ACCEPTED, family mark
 ) -> Dict[str, Any]:  # {"counts", "rates", "verdicts", "missed"}
     """Derive the filtering verdicts (DEC 8e05b87b, the bench_event_proposals
     sibling) — pure, nothing stored.
@@ -599,6 +615,13 @@ def bench_filter_proposals(
         for p in ordered:
             ps, pe = float(p.get("start_time") or 0.0), float(p.get("end_time") or 0.0)
             m = matches.get(id(p))
+            if m is None and p.get("proposal_id") in (mark_ids or ()):
+                counts["accepted"] += 1
+                verdicts.append({"proposal_id": p.get("proposal_id"), "category": p.get("category"),
+                                 "start_time": ps, "end_time": pe, "tier": int(p.get("tier", 1)),
+                                 "confidence": p.get("confidence"), "verdict": "accepted",
+                                 "family": "mark"})
+                continue
             if m is None:
                 verdict = (no_match if (watermark is not None and ps < float(watermark))
                            else "unvisited")
