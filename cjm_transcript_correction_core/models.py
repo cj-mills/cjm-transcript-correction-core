@@ -243,6 +243,7 @@ RECOMMENDED_STRATUM_CLASSES = (
     "research-mark",  # a claim / citation / name a research pass should follow up
     "disfluency",     # hesitations, false starts, repeats — detector training feedstock
     "apparatus",      # credits, dedication, legal, acknowledgments, chapter boilerplate
+    "quotation",      # someone else's voice quoted verbatim (ratified 2026-09-01: proposer-minted on LG ch04)
 )
 
 # The shell-shared gesture vocabulary (1052ce38 wart 2 re-homed, spine

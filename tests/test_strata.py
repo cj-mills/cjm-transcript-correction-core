@@ -20,6 +20,7 @@ from cjm_transcript_correction_core.strata import (FILTER_LANE, FILTER_PACK_FORM
                                                    pending_filter_proposals,
                                                    proposals_from_rows, render_filter_pack,
                                                    render_filter_propset_markdown,
+                                                   select_span_segments,
                                                    STRATUM_GLOSSES, validate_proposal_rows,
                                                    write_filter_propset)
 
@@ -52,6 +53,22 @@ def test_recommended_stratum_classes_are_glossed_class_tokens():
     assert len(set(RECOMMENDED_STRATUM_CLASSES)) == len(RECOMMENDED_STRATUM_CLASSES)
     assert set(RECOMMENDED_STRATUM_CLASSES) <= set(STRATUM_GLOSSES)
     assert "main-topic" not in RECOMMENDED_STRATUM_CLASSES   # absence IS main-topic
+    # quotation: proposer-minted on LG ch04 (8 block quotes), ratified by the user 2026-09-01
+    assert "quotation" in RECOMMENDED_STRATUM_CLASSES and "delimiters" in STRATUM_GLOSSES["quotation"]
+
+
+def test_select_span_segments_is_containment_over_text_segments():
+    """The span-edit gesture: the human re-states a run as a time span over the
+    CURRENT effective view — contained text segments only (a neighbour touching
+    the edge stays out; empties carry nothing to classify), spine order."""
+    run = select_span_segments(SEGS, 3.4, 8.5)
+    assert [s.id for s in run] == ["s2", "s3"]                # s1 empty, s4 starts AT 8.5 (out)
+    assert [s.id for s in select_span_segments(SEGS, 3.0, 8.5)] == ["s2", "s3"]   # s1 in-span but empty
+    assert [s.id for s in select_span_segments(SEGS, 3.43, 8.47)] == ["s2", "s3"]  # tolerance absorbs 0.05 jitter
+    assert [s.id for s in select_span_segments(SEGS, 3.6, 8.5)] == ["s3"]         # s2 not contained
+    assert select_span_segments(SEGS, 20.0, 30.0) == []
+    shuffled = list(reversed(SEGS))
+    assert [s.id for s in select_span_segments(shuffled, 0.0, 14.0)] == ["s0", "s2", "s3", "s4", "s5"]
 
 
 # ---- pack ----

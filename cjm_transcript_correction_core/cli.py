@@ -42,6 +42,7 @@ from cjm_transcript_correction_core.strata import (active_strata, bench_filter_p
                                                    pending_filter_proposals, proposals_from_rows,
                                                    render_filter_pack,
                                                    render_filter_propset_markdown,
+                                                   select_span_segments,
                                                    validate_proposal_rows, write_filter_propset)
 
 logger = logging.getLogger(__name__)
@@ -382,6 +383,14 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                                "batch-accept gesture — never automatic, DEC 304fd984)")
     fconfirm.add_argument("--accept-all", action="store_true",
                           help="Accept every pending proposal, audition tier included")
+    fconfirm.add_argument("--accept-span", action="append", default=None,
+                          metavar="PROPOSAL:START-END",
+                          help="Accept one pending proposal over an EDITED run: the text "
+                               "segments of the CURRENT effective spine contained in "
+                               "START-END source seconds (repeatable; the span-edit gesture — "
+                               "boundary shifts after packing move text between neighbours, so "
+                               "the human re-states the run; derives as 'edited' when the span "
+                               "moved enough, else 'accepted')")
     fconfirm.add_argument("--relabel", action="append", default=None, metavar="PROPOSAL:CLASS",
                           help="Accept one pending proposal under a DIFFERENT category "
                                "(repeatable; derives as 'relabeled')")
@@ -1784,7 +1793,7 @@ async def filter_confirm_command(
                   (m.get("window") or {}).get("end"))
 
         gestures = bool(args.accept or args.accept_tier1 or args.accept_all
-                        or args.relabel or args.accept_as_mark
+                        or args.relabel or args.accept_as_mark or args.accept_span
                         or args.retract or args.watermark is not None)
         mark_ids = materialized_mark_ids(corrections, superseded)
         pending_all = pending_filter_proposals(proposals, strata, show_tier2=True,
@@ -1845,8 +1854,9 @@ async def filter_confirm_command(
                       + (("  rates " + " ".join(f"{k}={v}" for k, v in b["rates"].items()))
                          if b["rates"] and tier_key == "tier1" else "")
                       + (f" · missed {len(b['missed'])}" if b["missed"] and tier_key == "tier1" else ""))
-            print("gestures: --accept <id> · --relabel <id>:<class> · --accept-as-mark <id>[:<class>] "
-                  "· --accept-tier1 · --accept-all · --retract <stratum> · --watermark <sec|end|none>")
+            print("gestures: --accept <id> · --accept-span <id>:<start>-<end> · --relabel <id>:<class> "
+                  "· --accept-as-mark <id>[:<class>] · --accept-tier1 · --accept-all "
+                  "· --retract <stratum> · --watermark <sec|end|none>")
             return 0
 
         db = _resolve_graph_db(args, manager, cap, ws)
@@ -1874,9 +1884,52 @@ async def filter_confirm_command(
             pref, _, cls = spec.partition(":")
             p = _pick_by_prefix(pending_all, "proposal_id", pref, "pending proposal")
             as_marks.append((p, cls.strip() or str(p.get("category"))))
-        chosen_ids = {id(p) for p, _ in relabels} | {id(p) for p, _ in as_marks}
+        spans: List[Tuple[Dict[str, Any], float, float]] = []
+        for spec in (args.accept_span or []):
+            pref, _, rng = spec.partition(":")
+            lo_s, sep, hi_s = rng.partition("-")
+            if not sep or not lo_s.strip() or not hi_s.strip():
+                raise SystemExit(f"--accept-span needs PROPOSAL:START-END (source seconds), got {spec!r}")
+            try:
+                lo, hi = float(lo_s), float(hi_s)
+            except ValueError:
+                raise SystemExit(f"--accept-span needs numeric START-END, got {spec!r}") from None
+            if hi <= lo:
+                raise SystemExit(f"--accept-span: END must exceed START, got {spec!r}")
+            p = _pick_by_prefix(pending_all, "proposal_id", pref, "pending proposal")
+            spans.append((p, lo, hi))
+        eff_segments: List[Any] = []
+        if spans:
+            # The CURRENT effective view — the proposal's ids froze at pack time; the
+            # walk lane has moved text since (the span-edit gesture's whole reason).
+            segs_now = await load_source_segments(queue, cap, sid, rendition_selector=args.rendition,
+                                                  skeleton_selector=args.skeleton)
+            active_now = [c for c in corrections
+                          if c["id"] not in superseded and c.get("status") != "proposed"]
+            eff_segments = project_effective_spine(segs_now, active_now)
+        chosen_ids = ({id(p) for p, _ in relabels} | {id(p) for p, _ in as_marks}
+                      | {id(p) for p, _, _ in spans})
         to_accept = [p for p in to_accept if id(p) not in chosen_ids]
         done = 0
+        for p, lo, hi in spans:
+            run = select_span_segments(eff_segments, lo, hi)
+            if not run:
+                raise SystemExit(f"--accept-span {_short(p.get('proposal_id'))}: no text segment of the "
+                                 f"current spine lies within {lo:.2f}-{hi:.2f}s")
+            category = str(p.get("category"))
+            note = (f"span edited by {args.actor} from {float(p.get('start_time') or 0):.2f}-"
+                    f"{float(p.get('end_time') or 0):.2f}s: {p.get('rationale') or ''}").strip()
+            cid = await commit_stratum_correction(
+                queue, cap, sid, [s.id for s in run], category,
+                sess.id, skeleton_hash=skel, start_time=float(run[0].start_time),
+                end_time=float(run[-1].end_time), proposal_id=p.get("proposal_id"),
+                proposal_set_id=set_id, actor=args.actor, note=note,
+                journal_path=jp)
+            done += 1
+            print(f"accepted (span edited) {_short(p.get('proposal_id'))} -> stratum {_short(cid)} "
+                  f"{category} {float(run[0].start_time):.1f}-{float(run[-1].end_time):.1f}s "
+                  f"x{len(run)} seg(s) (proposed {float(p.get('start_time') or 0):.1f}-"
+                  f"{float(p.get('end_time') or 0):.1f}s x{len(p.get('segment_ids') or [])})")
         for p, cls in [(p, None) for p in to_accept] + relabels:
             category = cls or str(p.get("category"))
             note = p.get("rationale")

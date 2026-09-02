@@ -34,7 +34,7 @@ import json
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from cjm_substrate.core.workspace import relativize_recorded
 from cjm_transcript_correction_core.models import RECOMMENDED_STRATUM_CLASSES, SpineSegment
@@ -55,7 +55,31 @@ STRATUM_GLOSSES: Dict[str, str] = {
     "research-mark": "a claim, citation, name, or reference a research pass should follow up",
     "disfluency": "hesitations, false starts, repeats — timestamp-detector training feedstock",
     "apparatus": "publishing apparatus: credits, dedication, legal, acknowledgments, chapter boilerplate",
+    "quotation": ("someone else's voice quoted verbatim — include the spoken 'quote' / 'end quote' "
+                  "delimiters; a verify-against-source unit, distinct from the research-mark that "
+                  "points at the source"),
 }
+
+
+def select_span_segments(
+    segments: Sequence[SpineSegment],  # The CURRENT effective spine (post-correction), any order
+    start: float,                      # Span start, source seconds
+    end: float,                        # Span end, source seconds
+    tolerance: float = 0.05,           # Boundary slack: a segment is IN when it lies within [start-tol, end+tol]
+) -> List[SpineSegment]:  # Text-bearing segments contained in the span, spine order
+    """The span-EDIT gesture's resolver (agreed 2026-09-01 on the ch04 confirm
+    walk): a proposal's segment ids are frozen at pack time, but the walk lane
+    keeps moving text between neighbours (boundary shifts, restored 'End quote.'
+    bookends), so the human re-states the run as a TIME SPAN over the current
+    effective view. Containment, not overlap — a neighbour that merely touches
+    the span's edge must not be swept in; empty segments carry nothing to
+    classify and are skipped like the pack does."""
+    lo, hi = float(start) - float(tolerance), float(end) + float(tolerance)
+    picked = [s for s in segments
+              if not s.is_empty
+              and s.start_time is not None and s.end_time is not None
+              and float(s.start_time) >= lo and float(s.end_time) <= hi]
+    return sorted(picked, key=lambda s: (float(s.start_time), s.index))
 
 
 def _fmt_ts(seconds: float) -> str:  # mm:ss.s for the rendered pack
