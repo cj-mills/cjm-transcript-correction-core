@@ -282,9 +282,9 @@ PROPOSE_LANE_ACTIONS = frozenset({
     "nudge_start_later", "nudge_step_down", "nudge_step_up",
     "insert_chunk", "insert_labeled", "relabel_insert", "remove_insert", "edit",
     "propose_accept", "propose_next", "propose_prev", "propose_audition",
-    "toggle_tier2", "cycle_lane", "cycle_lane_prev", "cancel", "quit_app"})
+    "propose_jump", "toggle_tier2", "cycle_lane", "cycle_lane_prev", "cancel", "quit_app"})
 PROPOSE_ONLY_ACTIONS = frozenset({"propose_accept", "propose_next", "propose_prev",
-                                  "propose_audition", "toggle_tier2"})
+                                  "propose_audition", "propose_jump", "toggle_tier2"})
 ANNOTATE_LANE_ACTIONS = frozenset({
     "next", "prev", "replay", "seam_next", "seam_prev", "speed_down", "speed_up",
     "yank", "word_left", "word_right", "word_select", "annotate_quick",
