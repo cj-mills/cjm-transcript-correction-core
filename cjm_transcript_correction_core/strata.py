@@ -340,6 +340,82 @@ def write_filter_propset(
             "classes": manifest["classes"], "counts": counts, "tier2_counts": tier2}
 
 
+def render_filter_propset_markdown(
+    manifest: Dict[str, Any],                 # The proposal set's manifest
+    proposals: List[Dict[str, Any]],          # Its rows
+    pack: Optional[Dict[str, Any]] = None,    # The pack the rows reference (None = quote-only rendering)
+    context: int = 1,                         # Pack lines of context shown before/after each run
+) -> str:  # A human-readable projection of the set (markdown)
+    """Project a proposal set for a HUMAN to check against the source in the
+    correction app: one block per proposal — category, source times, the SPINE
+    INDEX range (the app's coordinate), tier, confidence, the full rationale,
+    the quote, and the verbatim segment run from the pack with a line of
+    context either side. Time order. Nothing is decided here; this is the
+    printed worklist the CLI's list mode cannot fit on one line."""
+    src = manifest.get("source") or {}
+    model = manifest.get("model") or {}
+    win = manifest.get("window") or {}
+    rows = sorted(proposals or [],
+                  key=lambda p: (float(p.get("start_time") or 0.0),
+                                 int(((p.get("evidence") or {}).get("from_i")) or 0)))
+    segs = (pack or {}).get("segments") or []
+    tag = (src.get("skeleton_hash") or "legacy").split(":")[-1][:8]
+    end_txt = _fmt_ts(win["end"]) if win.get("end") is not None else "end"
+    counts = manifest.get("counts") or {}
+    t2 = manifest.get("tier2_counts") or {}
+    lines: List[str] = [
+        f"# Filtering proposals — {src.get('title') or src.get('source_id')}",
+        "",
+        f"Set `{manifest.get('proposal_set_id')}` · spine `{tag}` · window "
+        f"{_fmt_ts(win.get('start') or 0.0)}–{end_txt} · proposer "
+        f"{model.get('kind') or '?'}:{model.get('name') or '?'}"
+        + (f" ({model.get('model')})" if model.get("model") else ""),
+        f"Tier 1: {' · '.join(f'{k}×{v}' for k, v in sorted(counts.items())) or 'none'}  ·  "
+        f"Tier 2: {' · '.join(f'{k}×{v}' for k, v in sorted(t2.items())) or 'none'}"
+        + ("" if pack else "  ·  (pack not found — runs shown by quote only)"),
+        "",
+        "Spine index = the segment position the correction app shows; times are source "
+        "seconds. `?` = tier 1 (batch-acceptable), `??` = tier 2 (audition).",
+        "",
+    ]
+    for n, p in enumerate(rows, start=1):
+        ev = p.get("evidence") or {}
+        fi, ti = ev.get("from_i"), ev.get("to_i")
+        run = segs[fi:ti + 1] if (segs and fi is not None and ti is not None) else []
+        idx_txt = (f"spine {run[0]['index']}–{run[-1]['index']}" if run
+                   else f"pack lines {fi}..{ti}")
+        tier = "??" if int(p.get("tier", 1)) == 2 else "?"
+        conf = p.get("confidence")
+        st = _fmt_ts(p["start_time"]) if p.get("start_time") is not None else "--:--"
+        en = _fmt_ts(p["end_time"]) if p.get("end_time") is not None else "--:--"
+        lines.append(f"## {n}. `{tier}` **{p.get('category')}** · {st}–{en} · {idx_txt}"
+                     + (f" · c={conf:.2f}" if isinstance(conf, (int, float)) else "")
+                     + f" · id `…{str(p.get('proposal_id') or '')[-8:]}`")
+        lines.append("")
+        if p.get("rationale"):
+            lines.append(f"**Why:** {p['rationale']}")
+            lines.append("")
+        if ev.get("quote"):
+            lines.append(f"**Quote:** “{ev['quote']}”")
+            lines.append("")
+        if run:
+            lo = max(0, fi - context)
+            hi = min(len(segs), ti + 1 + context)
+            for r in segs[lo:hi]:
+                inside = fi <= r["i"] <= ti
+                rst = _fmt_ts(r["start"]) if r.get("start") is not None else "--:--"
+                mark = "**" if inside else ""
+                pre = "" if inside else "_"
+                post = "" if inside else "_"
+                lines.append(f"> {mark}[{r['i']}]{mark} {rst} · spine {r['index']} — "
+                             f"{pre}{r['text']}{post}")
+            lines.append("")
+    if not rows:
+        lines.append("_(no proposals in this set)_")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def load_filter_proposal_sets(
     ws_root: str,                         # Workspace root (sets live under <root>/proposals/)
     source_id: str,                       # Source node id to match

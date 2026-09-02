@@ -19,6 +19,7 @@ from cjm_transcript_correction_core.strata import (FILTER_LANE, FILTER_PACK_FORM
                                                    load_filter_proposal_sets, pack_digest,
                                                    pending_filter_proposals,
                                                    proposals_from_rows, render_filter_pack,
+                                                   render_filter_propset_markdown,
                                                    STRATUM_GLOSSES, validate_proposal_rows,
                                                    write_filter_propset)
 
@@ -169,6 +170,30 @@ def test_write_and_load_filter_propset(tmp_path):
     assert [p["category"] for p in sets[0]["proposals"]] == ["tool-mention", "sponsor"]  # time order
     assert load_filter_proposal_sets(str(tmp_path), "src", skeleton_hash="sha256:else") == []
     assert load_filter_proposal_sets(str(tmp_path / "nowhere"), "src") == []
+
+
+def test_render_filter_propset_markdown_joins_pack_runs(tmp_path):
+    pack = _pack()
+    props = proposals_from_rows(validate_proposal_rows([
+        {"category": "sponsor", "from_i": 4, "to_i": 4, "confidence": 0.8,
+         "rationale": "A sponsor read.", "quote": "sponsored by X"},
+        {"category": "apparatus", "from_i": 0, "to_i": 1, "tier": 2},
+    ], pack), pack)
+    res = write_filter_propset(pack, props, out_root=tmp_path / "proposals",
+                               proposer={"kind": "api", "name": "m"})
+    manifest = json.loads((tmp_path / "proposals" / res["set_id"] / "manifest.json").read_text())
+    md = render_filter_propset_markdown(manifest, props, pack)
+    assert md.startswith("# Filtering proposals — Chapter 1")
+    # time order: apparatus (0.0s) before sponsor (11.0s); spine index range from the pack
+    assert md.index("**apparatus**") < md.index("**sponsor**")
+    assert "`??` **apparatus** · 00:00.0–00:06.0 · spine 0–2" in md
+    assert "`?` **sponsor** · 00:11.0–00:14.0 · spine 5–5 · c=0.80" in md
+    assert "**Why:** A sponsor read." in md and "**Quote:** “sponsored by X”" in md
+    # the run is bold, the context line either side is italic
+    assert "> **[4]** 00:11.0 · spine 5 — This episode is sponsored by X." in md
+    assert "> [3] 00:08.5 · spine 4 — _Back to the main idea._" in md
+    # without a pack the set still renders, by pack lines
+    assert "pack lines 4..4" in render_filter_propset_markdown(manifest, props, None)
 
 
 # ---- the stratum op ----

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sqlite3
+import textwrap
 import time
 import uuid
 from pathlib import Path
@@ -37,8 +38,9 @@ from cjm_transcript_correction_core.strata import (active_strata, bench_filter_p
                                                    build_filter_pack, FILTER_LANE,
                                                    FILTER_PACK_FORMAT, load_filter_proposal_sets,
                                                    pending_filter_proposals, proposals_from_rows,
-                                                   render_filter_pack, validate_proposal_rows,
-                                                   write_filter_propset)
+                                                   render_filter_pack,
+                                                   render_filter_propset_markdown,
+                                                   validate_proposal_rows, write_filter_propset)
 
 logger = logging.getLogger(__name__)
 
@@ -386,6 +388,10 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                                "pause; absence below it derives rejects")
     fconfirm.add_argument("--tier2", action="store_true",
                           help="Show the audition tier in the pending list")
+    fconfirm.add_argument("--markdown", action="store_true",
+                          help="(Re)write <set-dir>/proposals.md — the human view of the set "
+                               "(full rationale + quote + the verbatim segment run with spine "
+                               "indices, joined against the pack) — and print its path")
     fconfirm.add_argument("--actor", default="human", help="Actor recorded on the ops")
     fconfirm.add_argument("--note", default=None, help="Note recorded on retractions")
     fconfirm.add_argument("--purpose", default=None,
@@ -1696,9 +1702,13 @@ def filter_ingest_command(
     res = write_filter_propset(pack, proposals, out_root=out_root, proposer=proposer, ws=ws)
     src = pack.get("source") or {}
     tag = _spine_tag(src.get("skeleton_hash"))
+    md_path = Path(res["set_dir"]) / "proposals.md"
+    manifest = json.loads(Path(res["manifest_path"]).read_text())
+    md_path.write_text(render_filter_propset_markdown(manifest, proposals, pack))
     print(f"source: {src.get('title') or src.get('source_id')} · spine {tag} · "
           f"pack {pack.get('pack_id')}")
     print(f"proposal set {res['set_id']} -> {res['set_dir']}")
+    print(f"  human view {md_path}")
     t1 = " · ".join(f"{k}x{v}" for k, v in sorted(res["counts"].items())) or "none"
     t2 = " · ".join(f"{k}x{v}" for k, v in sorted(res["tier2_counts"].items())) or "none"
     print(f"tier-1: {t1}\ntier-2: {t2}")
@@ -1772,6 +1782,17 @@ async def filter_confirm_command(
               + (f" · {len(sets)} sets (newest shown; --set picks)" if len(sets) > 1 else ""))
         print(f"lane watermark: {('%.1fs' % float(watermark)) if watermark is not None else 'none'}"
               f" · live strata: {len(strata)}")
+        if args.markdown:
+            pack_path = ws.root / "packs" / f"{(m.get('pack') or {}).get('pack_id')}.json"
+            pack = None
+            if pack_path.is_file():
+                try:
+                    pack = json.loads(pack_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    pack = None
+            md_path = Path(pset["path"]).parent / "proposals.md"
+            md_path.write_text(render_filter_propset_markdown(m, proposals, pack))
+            print(f"human view: {md_path}" + ("" if pack else "  (pack not found — quotes only)"))
         if not gestures:
             shown = [p for p in pending_all if args.tier2 or int(p.get("tier", 1)) == 1]
             hidden_t2 = sum(1 for p in pending_all if int(p.get("tier", 1)) == 2)
@@ -1788,7 +1809,8 @@ async def filter_confirm_command(
                       + (f"  c={conf:.2f}" if isinstance(conf, (int, float)) else "")
                       + (f'  "{q}"' if q else ""))
                 if p.get("rationale"):
-                    print(f"        {p['rationale'][:110]}")
+                    for wrapped in textwrap.wrap(str(p["rationale"]), width=100):
+                        print(f"        {wrapped}")
             if strata:
                 print("live strata:")
                 for c in strata:
