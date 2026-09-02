@@ -41,7 +41,8 @@ def test_journal_correction_op_envelope(tmp_path):
                                                  "chunk-split", "chunk-split-remove",
                                                  "speech-overlay", "speech-overlay-remove",
                                                  "speaker-entity", "speaker-assign",
-                                                 "entity-rename", "extraction-gate"}
+                                                 "entity-rename", "extraction-gate",
+                                                 "stratum", "stratum-retract"}
 
 
 def test_replay_handlers_cover_mark_verbs():

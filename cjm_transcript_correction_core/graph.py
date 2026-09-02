@@ -1008,6 +1008,117 @@ async def commit_mark_dismissal(
     return node["id"]
 
 
+def build_stratum_correction(
+    source_id: str,                        # Source the classified segments belong to
+    segment_ids: List[str],                # The run of layer-0/effective Segment ids the stratum covers
+    category: str,                         # Open-vocabulary class (RECOMMENDED_STRATUM_CLASSES is the slate)
+    session_id: str,                       # Owning session id
+    skeleton_hash: Optional[str] = None,   # Which SKELETON spine the run lives on (None = legacy)
+    start_time: Optional[float] = None,    # Run start (source seconds) — the verdict join's coordinate
+    end_time: Optional[float] = None,      # Run end (source seconds)
+    proposal_id: Optional[str] = None,     # The accepted proposal (None = human-minted stratum)
+    proposal_set_id: Optional[str] = None, # The proposal set it came from
+    supersedes_id: Optional[str] = None,   # Prior stratum this one replaces (reclassify / re-bound)
+    actor: str = "human",                  # Actor ("human" | "agent:<id>" | "capability:<name>")
+    note: Optional[str] = None,            # Optional free-text note (the proposal's rationale rides here on accept)
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (correction node dict, edge dicts)
+    """Build a NON-MUTATING stratum Correction (DECs 304fd984 + 9d4c0a38: the
+    filtering domain op).
+
+    A stratum asserts a CATEGORY over a run of segments — state consumers
+    project on (strata.exclude_strata), never a cut and never text:
+    `corrections_to_edits` has no arm for it, so the effective view is
+    untouched and the skeleton stays immutable. The ACCEPT gesture of the
+    filtering lane IS this op (derived verdicts, DEC 8e05b87b): it carries the
+    proposal id so the bench join is exact; a human-minted stratum carries
+    none. Reclassify / re-bound = a new stratum with `supersedes_id`; retract
+    = `commit_stratum_retraction` (reject-as-supersede). CORRECTS edges anchor
+    every covered segment so strata surface in segment-scoped reads."""
+    cat = (category or "").strip()
+    if not cat:
+        raise ValueError("category must be a non-empty string")
+    if not cat[:1].isalnum():
+        raise ValueError(f"category must start with a letter or digit, got {category!r}")
+    ids = [str(s) for s in (segment_ids or []) if s]
+    if not ids:
+        raise ValueError("a stratum needs at least one segment id")
+    payload = {"operation": "classify", "source_id": source_id,
+               "skeleton_hash": skeleton_hash, "category": cat,
+               "segment_ids": ids, "start_time": start_time, "end_time": end_time,
+               "proposal_id": proposal_id, "proposal_set_id": proposal_set_id}
+    node = build_correction_node("stratum", session_id, payload, actor=actor,
+                                 rationale=note).to_graph_node()
+    edges = [make_edge(node.id, sid, CorrectionRelations.CORRECTS) for sid in ids]
+    if supersedes_id:
+        edges.append(make_edge(node.id, supersedes_id, CorrectionRelations.SUPERSEDES))
+    return node.to_dict(), edges
+
+
+async def commit_stratum_correction(
+    queue: JobQueue,                       # Started job queue
+    graph_id: str,                         # Graph-storage capability id
+    source_id: str,                        # Source the classified segments belong to
+    segment_ids: List[str],                # The covered Segment ids
+    category: str,                         # Open-vocabulary class
+    session_id: str,                       # Owning session id
+    skeleton_hash: Optional[str] = None,   # Which SKELETON spine
+    start_time: Optional[float] = None,    # Run start (source seconds)
+    end_time: Optional[float] = None,      # Run end (source seconds)
+    proposal_id: Optional[str] = None,     # Accepted proposal id (None = human-minted)
+    proposal_set_id: Optional[str] = None, # Its proposal set
+    supersedes_id: Optional[str] = None,   # Prior stratum to supersede
+    actor: str = "human",                  # Actor
+    note: Optional[str] = None,            # Optional note
+    journal_path: Optional[str] = None,    # Sidecar journal — append the op on success (None = unjournaled)
+) -> str:  # The new stratum Correction node id
+    """Commit a stratum (node + CORRECTS per covered segment [+ SUPERSEDES]).
+
+    NO review marker: classification is lane state, not a walked-past decision.
+    Journaled as `stratum` with the run-independent segment anchor so the row
+    is a legible dataset example (category + verbatim run text)."""
+    node, edges = build_stratum_correction(
+        source_id, segment_ids, category, session_id, skeleton_hash=skeleton_hash,
+        start_time=start_time, end_time=end_time, proposal_id=proposal_id,
+        proposal_set_id=proposal_set_id, supersedes_id=supersedes_id, actor=actor, note=note)
+    await commit_nodes_edges(queue, graph_id, [node], edges)
+    if journal_path:
+        journal_correction_op(journal_path, "stratum", actor=actor, session_id=session_id,
+                              args={"source_id": source_id, "skeleton_hash": skeleton_hash,
+                                    "segment_ids": list(segment_ids), "category": category,
+                                    "start_time": start_time, "end_time": end_time,
+                                    "proposal_id": proposal_id,
+                                    "proposal_set_id": proposal_set_id,
+                                    "supersedes_id": supersedes_id, "note": note},
+                              anchor=await segment_anchor(queue, graph_id, list(segment_ids)),
+                              nodes=[node], edges=edges, op_id=node["id"])
+    return node["id"]
+
+
+async def commit_stratum_retraction(
+    queue: JobQueue,                     # Started job queue
+    graph_id: str,                       # Graph-storage capability id
+    source_id: str,                      # Source the stratum belongs to
+    stratum_id: str,                     # The live stratum being retracted
+    session_id: str,                     # Owning session id
+    actor: str = "human",                # Actor (the retractor)
+    note: Optional[str] = None,          # Optional note (why)
+    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+) -> str:  # The review node id that superseded the stratum
+    """Retract a live stratum WITHOUT replacing it (reject-as-supersede, the
+    mark-dismissal shape): a SUPERSEDES edge from a small review node, append-
+    only with actor/note/timestamp — `strata.active_strata` then excludes it.
+    No segment anchor: retraction is derivative lane state."""
+    node, edges = build_reject_review(source_id, stratum_id, session_id,
+                                      actor=actor, rationale=note)
+    await commit_nodes_edges(queue, graph_id, [node], edges)
+    if journal_path:
+        journal_correction_op(journal_path, "stratum-retract", actor=actor,
+                              session_id=session_id,
+                              args={"source_id": source_id, "stratum_id": stratum_id, "note": note},
+                              nodes=[node], edges=edges, op_id=node["id"])
+    return node["id"]
+
+
 def open_marks(
     corrections: List[Dict[str, Any]],  # Corrections (e.g. from load_source_corrections)
     superseded_ids: set,                # Ids that are SUPERSEDES targets
@@ -1953,8 +2064,15 @@ def build_extraction_gate_assertion(
     annotated_through: Optional[float],    # Watermark (source seconds); None = keep nothing-visited
     session_id: Optional[str] = None,      # CorrectionSession context (None = CLI assert)
     actor: str = "human",                  # Actor
+    lane: Optional[str] = None,            # None = the spine's correction gate; a lane tag (e.g. "filter") = that lane's own watermark
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (assertion node dict, edge dicts)
     """Build one extraction-gate ASSERTION (DEC 8e05b87b — flywheel build leg 1).
+
+    LANES: the watermark means "labels of THIS lane are complete below here",
+    so lanes that walk the same spine independently (inhale inserts vs the
+    filtering strata) keep separate chains — latest-wins is per
+    (skeleton_hash, lane); `lane=None` is the original correction gate and
+    stays byte-compatible with every assertion written before lanes existed.
 
     Append-only spine state, never a correction: the node records status +
     watermark for ONE spine (source_id, skeleton_hash), and the read is
@@ -1972,7 +2090,7 @@ def build_extraction_gate_assertion(
         source_id=source_id, skeleton_hash=skeleton_hash,
         extraction_status=extraction_status,
         annotated_through=(float(annotated_through) if annotated_through is not None else None),
-        session_id=session_id, actor=actor)
+        session_id=session_id, actor=actor, lane=lane)
     node = gate.to_graph_node()
     edges = [make_edge(node.id, source_id, CorrectionRelations.GATES)]
     return node.to_dict(), edges
@@ -1988,6 +2106,7 @@ async def commit_extraction_gate(
     session_id: Optional[str] = None,    # CorrectionSession context (None = CLI assert)
     actor: str = "human",                # Actor
     journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    lane: Optional[str] = None,          # None = the correction gate; a lane tag = that lane's watermark chain
 ) -> str:  # The new ExtractionGate assertion node id
     """Commit one extraction-gate assertion (node + GATES edge) — the journaled
     per-spine gate write (DEC 8e05b87b).
@@ -1998,7 +2117,7 @@ async def commit_extraction_gate(
     row as well as the graph."""
     node, edges = build_extraction_gate_assertion(
         source_id, skeleton_hash, extraction_status, annotated_through,
-        session_id=session_id, actor=actor)
+        session_id=session_id, actor=actor, lane=lane)
     await commit_nodes_edges(queue, graph_id, [node], edges)
     if journal_path:
         journal_correction_op(journal_path, "extraction-gate", actor=actor,
@@ -2006,13 +2125,15 @@ async def commit_extraction_gate(
                               args={"source_id": source_id,
                                     "skeleton_hash": skeleton_hash,
                                     "extraction_status": extraction_status,
-                                    "annotated_through": annotated_through},
+                                    "annotated_through": annotated_through,
+                                    **({"lane": lane} if lane else {})},
                               nodes=[node], edges=edges, op_id=node["id"])
     return node["id"]
 
 
 def latest_extraction_gates(
     assertions: List[Dict[str, Any]],  # ExtractionGate property dicts (id included), any order
+    lane: Optional[str] = None,        # Which lane's chain to fold (None = the correction gate)
 ) -> Dict[Optional[str], Dict[str, Any]]:  # skeleton_hash -> the LATEST assertion (the live gate)
     """Fold gate assertions into the live per-spine gate state (pure; latest-wins).
 
@@ -2021,9 +2142,12 @@ def latest_extraction_gates(
     assertion, and the fold keeps the whole chain queryable behind it. Callers
     holding one Source's assertions get one entry per coexisting spine; a spine
     with NO entry defaults to in_progress with no watermark (nothing visited —
-    no negative region is valid)."""
+    no negative region is valid). Lanes fold SEPARATELY: an assertion carrying
+    a `lane` tag never displaces the correction gate, and vice versa."""
     out: Dict[Optional[str], Dict[str, Any]] = {}
     for a in sorted(assertions, key=lambda a: float(a.get("created_at") or 0.0)):
+        if (a.get("lane") or None) != lane:
+            continue
         out[a.get("skeleton_hash")] = a
     return out
 
@@ -2032,6 +2156,7 @@ async def load_extraction_gates(
     queue: JobQueue,  # Started job queue
     graph_id: str,    # Graph-storage capability id
     source_id: str,   # Source whose gate assertions to read
+    lane: Optional[str] = None,  # Which lane's chain (None = the correction gate)
 ) -> Dict[Optional[str], Dict[str, Any]]:  # skeleton_hash -> the live gate assertion
     """Read one Source's live per-spine extraction gates (typed property filter).
 
@@ -2043,7 +2168,7 @@ async def load_extraction_gates(
                   where=[PropertyPredicate("source_id", "eq", source_id)])
     res = await graph_task(queue, graph_id, "query_nodes", query=q.to_dict())
     return latest_extraction_gates(
-        [_node_to_correction_dict(n) for n in (res.nodes or [])])
+        [_node_to_correction_dict(n) for n in (res.nodes or [])], lane=lane)
 
 
 def labeled_insert_spans(

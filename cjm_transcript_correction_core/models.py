@@ -228,6 +228,23 @@ RECOMMENDED_OVERLAY_LABELS = (
     "word-repeat",         # repeated words / stutters
 )
 
+# The RECOMMENDED stratum-class slate (DECs 304fd984 + 9d4c0a38 — the filtering
+# lane): the SAME open-vocabulary regime — a stratum commits with any letter-led
+# class token; this tuple is the starter vocabulary every filtering pack renders
+# with glosses (strata.STRATUM_GLOSSES), grown by real drives. There is NO
+# "main-topic" class: absence of a stratum IS main-topic. "Filtered" is a
+# per-consumer query over these (the notes projection excludes tangent + sponsor
+# + apparatus; a research pass pulls tool-mention + research-mark; detector
+# extracts pull disfluency).
+RECOMMENDED_STRATUM_CLASSES = (
+    "tangent",        # an aside off the main topic (interesting or not)
+    "tool-mention",   # off-hand tool / product / service mention worth research
+    "sponsor",        # sponsor read / advertisement (products may still be research-worthy)
+    "research-mark",  # a claim / citation / name a research pass should follow up
+    "disfluency",     # hesitations, false starts, repeats — detector training feedstock
+    "apparatus",      # credits, dedication, legal, acknowledgments, chapter boilerplate
+)
+
 # The shell-shared gesture vocabulary (1052ce38 wart 2 re-homed, spine
 # absorption follow-through): these were stranded as Textual App CLASS
 # ATTRIBUTES, so the Qt shell carried COPIES (importing them would have
@@ -331,6 +348,7 @@ class ExtractionGate:
     annotated_through: Optional[float] = None              # Watermark (source-coordinate seconds); None = nothing visited
     session_id: Optional[str] = None                       # CorrectionSession context (None = CLI assert)
     actor: str = "human"                                   # Who asserted
+    lane: Optional[str] = None                             # None = the spine's correction gate; "filter" = the filtering lane's own watermark (latest-wins is per (skeleton_hash, lane))
     created_at: float = field(default_factory=time.time)   # Unix timestamp (latest-wins key)
     id: str = field(default_factory=lambda: str(uuid4()))  # Generated node id (assertion = event)
 

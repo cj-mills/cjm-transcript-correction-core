@@ -53,6 +53,27 @@ def test_gate_subcommand():
         p.parse_args(["gate", "--status", "done"])   # not in the vocabulary
 
 
+def test_filter_lane_subcommands():
+    """The filtering lane's headless surface (DECs 304fd984 + 9d4c0a38; pass 1
+    per bc8dbbdd): pack -> ingest -> confirm. Confirm without gestures lists;
+    the batch-accept is an EXPLICIT flag, never a default."""
+    p = build_parser()
+    ns = p.parse_args(["filter-pack", "--source", "Seven", "--skeleton", "abcd",
+                       "--window", "0", "600"])
+    assert ns.command == "filter-pack" and ns.window == [0.0, 600.0] and ns.out_dir is None
+    ns = p.parse_args(["filter-ingest", "--pack", "p.json", "--rows", "r.jsonl",
+                       "--proposer", "reader-1"])
+    assert ns.proposer_kind == "claude-code-subagent" and ns.model is None
+    ns = p.parse_args(["filter-confirm", "--source", "Seven"])
+    assert ns.accept is None and ns.accept_tier1 is False and ns.accept_all is False
+    assert ns.retract is None and ns.watermark is None and ns.tier2 is False
+    ns = p.parse_args(["filter-confirm", "--source", "Seven", "--accept", "a1", "--accept", "b2",
+                       "--retract", "s9", "--watermark", "end", "--purpose", "feature-test"])
+    assert ns.accept == ["a1", "b2"] and ns.retract == ["s9"] and ns.watermark == "end"
+    with pytest.raises(SystemExit):
+        p.parse_args(["filter-ingest", "--pack", "p.json"])   # rows + proposer required
+
+
 def test_extract_subcommand():
     """The extract surface (flywheel leg 2): sibling of stats sharing the
     workspace/graph plumbing; --include-purpose repeats (default None = the

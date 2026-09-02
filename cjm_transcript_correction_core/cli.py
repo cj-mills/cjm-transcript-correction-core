@@ -21,7 +21,8 @@ from cjm_substrate.core.workspace import relativize_recorded, resolve_workspace
 from cjm_transcript_correction_core.graph import (bench_event_proposals,
                                                   commit_chunk_insert_correction,
                                                   commit_chunk_split_correction,
-                                                  commit_extraction_gate, correction_stats,
+                                                  commit_extraction_gate, commit_stratum_correction,
+                                                  commit_stratum_retraction, correction_stats,
                                                   extract_spine_dataset, labeled_insert_spans,
                                                   list_source_spines, load_extraction_gates,
                                                   load_source_corrections, load_source_segments,
@@ -32,6 +33,12 @@ from cjm_transcript_correction_core.pipeline import (load_decomp_manifest, resol
                                                      run_correction, run_review)
 from cjm_transcript_correction_core.signals import (EVENT_PROPOSAL_SET_FORMAT,
                                                     load_event_proposal_set)
+from cjm_transcript_correction_core.strata import (active_strata, bench_filter_proposals,
+                                                   build_filter_pack, FILTER_LANE,
+                                                   FILTER_PACK_FORMAT, load_filter_proposal_sets,
+                                                   pending_filter_proposals, proposals_from_rows,
+                                                   render_filter_pack, validate_proposal_rows,
+                                                   write_filter_propset)
 
 logger = logging.getLogger(__name__)
 
@@ -305,7 +312,100 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
     scan.add_argument("--strict", action="store_true",
                       help="Exit nonzero when any mis-homed word is found (CI/QA gate mode)")
     scan.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
+
+    # ---- the filtering lane (DECs 304fd984 + 9d4c0a38; pass 1 runs HEADLESS per
+    # bc8dbbdd: pack -> proposer -> ingest -> confirm, journal-first) ----------
+    fpack = sub.add_parser(
+        "filter-pack",
+        help="Write one spine window's effective text as a proposer PACK (json + the "
+             "markdown brief any proposer reads — sub-agent, API, local model)")
+    _add_graph_read_args(fpack)
+    fpack.add_argument("--source", required=True,
+                       help="Source node id or title substring (exactly one match)")
+    fpack.add_argument("--rendition", default=None,
+                       help="Which AudioRendition spine when a source has more than one")
+    fpack.add_argument("--skeleton", default=None,
+                       help="Which SKELETON spine (\"legacy\" or a hash prefix); default: auto "
+                            "(errors when several coexist)")
+    fpack.add_argument("--window", nargs=2, type=float, default=None, metavar=("START", "END"),
+                       help="Source-seconds window to pack (default: the whole spine) — the "
+                            "partitioning seam for long sources")
+    fpack.add_argument("--out-dir", default=None,
+                       help="Pack directory (default: <workspace>/packs)")
+    fpack.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
+
+    fingest = sub.add_parser(
+        "filter-ingest",
+        help="Validate a proposer's JSONL rows against their pack and mint a filtering "
+             "PROPOSAL SET (durable inference output; no graph writes)")
+    fingest.add_argument("--pack", required=True, help="The pack json the proposer read")
+    fingest.add_argument("--rows", required=True,
+                         help="The proposer's output: JSONL rows (or a JSON array); code "
+                              "fences and blank lines are tolerated")
+    fingest.add_argument("--proposer", required=True,
+                         help="Proposer name recorded as provenance (e.g. the sub-agent "
+                              "brief name, an API model id)")
+    fingest.add_argument("--proposer-kind", default="claude-code-subagent",
+                         help="Proposer kind (claude-code-subagent | api | local-model | human)")
+    fingest.add_argument("--model", default=None,
+                         help="Model identity when known (recorded beside the kind)")
+    fingest.add_argument("--workspace", default=None,
+                         help="Workspace root (default: CJM_WORKSPACE env, else upward walk from cwd)")
+    fingest.add_argument("--out-dir", default=None,
+                         help="Proposal-set root directory (default: <workspace>/proposals)")
+    fingest.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
+
+    fconfirm = sub.add_parser(
+        "filter-confirm",
+        help="The headless HITL worklist over a filtering proposal set: list pending "
+             "proposals + derived verdicts; --accept/--accept-tier1/--accept-all commit "
+             "strata (accept IS the domain op), --retract supersedes a live stratum, "
+             "--watermark asserts the lane's annotated_through — all journaled")
+    _add_graph_read_args(fconfirm)
+    fconfirm.add_argument("--source", required=True,
+                          help="Source node id or title substring (exactly one match)")
+    fconfirm.add_argument("--rendition", default=None,
+                          help="Which AudioRendition spine when a source has more than one")
+    fconfirm.add_argument("--skeleton", default=None,
+                          help="Which SKELETON spine (\"legacy\" or a hash prefix); default: auto")
+    fconfirm.add_argument("--set", default=None,
+                          help="Proposal-set id or prefix (default: the newest set bound to "
+                               "this source + spine)")
+    fconfirm.add_argument("--accept", action="append", default=None, metavar="PROPOSAL",
+                          help="Accept one pending proposal by id prefix (repeatable)")
+    fconfirm.add_argument("--accept-tier1", action="store_true",
+                          help="Accept EVERY pending tier-1 proposal (the explicit human "
+                               "batch-accept gesture — never automatic, DEC 304fd984)")
+    fconfirm.add_argument("--accept-all", action="store_true",
+                          help="Accept every pending proposal, audition tier included")
+    fconfirm.add_argument("--retract", action="append", default=None, metavar="STRATUM",
+                          help="Retract a live stratum by id prefix (repeatable)")
+    fconfirm.add_argument("--watermark", default=None,
+                          help="Assert the filtering lane's annotated_through (source seconds, "
+                               "\"end\", or \"none\" = nothing visited) — set EXPLICITLY on "
+                               "pause; absence below it derives rejects")
+    fconfirm.add_argument("--tier2", action="store_true",
+                          help="Show the audition tier in the pending list")
+    fconfirm.add_argument("--actor", default="human", help="Actor recorded on the ops")
+    fconfirm.add_argument("--note", default=None, help="Note recorded on retractions")
+    fconfirm.add_argument("--purpose", default=None,
+                          help="CorrectionSession purpose (None = genuine; \"feature-test\" "
+                               "= excludable from flywheel datasets)")
+    fconfirm.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
     return parser
+
+
+def _add_graph_read_args(p: argparse.ArgumentParser) -> None:  # Shared workspace/graph plumbing
+    """Attach the workspace + graph-capability arguments the spine verbs share."""
+    p.add_argument("--manifests-dir", default=None,
+                   help="Capability manifests directory (default: the workspace's .cjm/manifests "
+                        "when one is active, else .cjm/manifests under the cwd)")
+    p.add_argument("--workspace", default=None,
+                   help="Workspace root (default: CJM_WORKSPACE env, else upward walk from cwd)")
+    p.add_argument("--graph-capability", default="cjm-capability-graph-sqlite",
+                   help="Graph-storage capability name")
+    p.add_argument("--graph-db-path", default=None,
+                   help="Graph db path (default: the workspace capability config)")
 
 
 def load_capabilities(
@@ -470,6 +570,12 @@ def main(
         return asyncio.run(export_command(args))
     if args.command == "scan-mishomed":
         return asyncio.run(scan_command(args))
+    if args.command == "filter-pack":
+        return asyncio.run(filter_pack_command(args))
+    if args.command == "filter-ingest":
+        return filter_ingest_command(args)
+    if args.command == "filter-confirm":
+        return asyncio.run(filter_confirm_command(args))
     raise SystemExit(f"unknown command: {args.command}")
 
 
@@ -643,12 +749,10 @@ async def gate_command(
             watermark = max(ends)
         else:
             watermark = float(wm_arg)
-        db = args.graph_db_path or (
-            (manager.instances[args.graph_capability].config or {}).get("db_path"))
+        db = _resolve_graph_db(args, manager, args.graph_capability, ws)
         gate_id = await commit_extraction_gate(
             queue, args.graph_capability, sid, skeleton_hash, args.status, watermark,
-            actor=args.actor,
-            journal_path=(sidecar_journal_path(db) if db else None))
+            actor=args.actor, journal_path=sidecar_journal_path(db))
         wm_txt = f"{float(watermark):.1f}s" if watermark is not None else "none"
         print(f"gate asserted on {title or sid} · spine {_spine_tag(skeleton_hash)}: "
               f"{args.status} · annotated_through {wm_txt}  ({gate_id})")
@@ -1406,6 +1510,359 @@ async def export_command(
             manager.unload_capability(args.graph_capability)
         except Exception as e:  # Best-effort teardown; never mask the export outcome
             logger.warning(f"unload {args.graph_capability} failed: {e}")
+    return 0
+
+
+# ---- the filtering lane verbs (strata.py is the engine; these are thin drivers) ----
+
+async def _open_graph_stack(
+    args: argparse.Namespace,  # Parsed args carrying the _add_graph_read_args surface
+) -> Tuple[Any, CapabilityManager, JobQueue]:  # (resolved workspace or None, manager, started queue)
+    """Resolve the workspace, load the graph capability, start the queue — the
+    plumbing every read-only spine verb repeats (gate/export/scan), shared by
+    the filtering verbs."""
+    ws = resolve_workspace(explicit=getattr(args, "workspace", None))
+    if ws is not None:
+        os.environ["CJM_WORKSPACE"] = str(ws.root)
+    if args.manifests_dir is None:
+        args.manifests_dir = (str(ws.substrate_data_dir / "manifests")
+                              if ws is not None else ".cjm/manifests")
+    manager = CapabilityManager(search_paths=[Path(args.manifests_dir)])
+    configs = ({args.graph_capability: {"db_path": args.graph_db_path}}
+               if args.graph_db_path else None)
+    load_capabilities(manager, [args.graph_capability], configs=configs)
+    queue = JobQueue(deps=manager)
+    await queue.start()
+    return ws, manager, queue
+
+
+def _resolve_graph_db(
+    args: argparse.Namespace,    # Parsed args (graph_db_path may be explicit)
+    manager: CapabilityManager,  # The loaded manager
+    graph_capability: str,       # The graph capability name
+    ws: Any,                     # Resolved workspace or None
+) -> str:  # The effective graph db path — the sidecar journal derives from it
+    """Name the graph db a WRITE verb journals against: explicit --graph-db-path
+    > the loaded instance's config (persisted, workspace-scoped) > the
+    workspace's conventional capability data path when it exists. No answer =
+    LOUD refusal before anything is written — a write that cannot be journaled
+    must not happen (journal-first; the silent `journal none` sighting
+    2026-09-01 on the filtering lane's first accept)."""
+    if args.graph_db_path:
+        return str(args.graph_db_path)
+    inst = manager.instances.get(graph_capability)
+    cfg_db = ((inst.config if inst is not None else None) or {}).get("db_path")
+    if cfg_db:
+        return str(cfg_db)
+    if ws is not None:
+        conv = ws.substrate_data_dir / "data" / graph_capability / "context_graph.db"
+        if conv.is_file():
+            return str(conv)
+    raise SystemExit(f"cannot name the graph db to journal against: pass --graph-db-path, "
+                     f"or persist db_path on {graph_capability} in the workspace config store")
+
+
+async def _close_graph_stack(
+    manager: CapabilityManager,  # The manager _open_graph_stack built
+    queue: JobQueue,             # Its started queue
+    graph_capability: str,       # The loaded capability name
+) -> None:
+    """Best-effort teardown; never masks the verb's outcome."""
+    await queue.stop()
+    try:
+        manager.unload_capability(graph_capability)
+    except Exception as e:
+        logger.warning(f"unload {graph_capability} failed: {e}")
+
+
+async def _source_content_hash(
+    queue: JobQueue,  # Started job queue
+    graph_id: str,    # Graph-storage capability id
+    source_id: str,   # The Source node id
+) -> Optional[str]:  # The media content hash on the Source's provenance SourceRef (None = unhashed)
+    """The Source's content hash lives on its provenance SourceRef (node identity
+    input), not in properties — the run-independent binding a pack records."""
+    node = await graph_task(queue, graph_id, "get_node", node_id=source_id)
+    d = node.to_dict() if hasattr(node, "to_dict") else (node or {})
+    for r in (d.get("sources") or []):
+        h = r.get("content_hash") if isinstance(r, dict) else getattr(r, "content_hash", None)
+        if h:
+            return str(h)
+    return None
+
+
+def _short(value: Optional[str], n: int = 8) -> str:  # Display tail of an id
+    return str(value or "")[-n:] if value else "-"
+
+
+async def filter_pack_command(
+    args: argparse.Namespace,  # Parsed args for the `filter-pack` subcommand
+) -> int:  # Process exit code
+    """Execute `filter-pack`: write one spine window's effective text-bearing
+    segments as a proposer pack — `<out-dir>/<pack_id>.json` (what ingest
+    resolves against) + `<pack_id>.md` (the brief a proposer reads). Reads
+    only; the pack is the read-trace every proposal from it cites."""
+    ws, manager, queue = await _open_graph_stack(args)
+    cap = args.graph_capability
+    try:
+        sid, title, _media = await resolve_source_node(queue, cap, args.source)
+        segs = await load_source_segments(queue, cap, sid, rendition_selector=args.rendition,
+                                          skeleton_selector=args.skeleton)
+        if not segs:
+            raise SystemExit("empty spine (0 segments)")
+        spines = await list_source_spines(queue, cap, sid, rendition_selector=args.rendition)
+        skel = skeleton_hash_for(spines, args.skeleton)
+        corrections, superseded = await load_source_corrections(queue, cap, sid)
+        active = [c for c in corrections
+                  if c["id"] not in superseded and c.get("status") != "proposed"]
+        eff = project_effective_spine(segs, active)
+        strata = active_strata(corrections, superseded)
+        chash = await _source_content_hash(queue, cap, sid)
+        window = tuple(args.window) if args.window else None
+        pack = build_filter_pack(sid, title, skel, eff, content_hash=chash,
+                                 window=window, strata=strata)
+    finally:
+        await _close_graph_stack(manager, queue, cap)
+    out_dir = (Path(args.out_dir) if args.out_dir
+               else (ws.root / "packs" if ws is not None else Path("packs")))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    json_path = out_dir / f"{pack['pack_id']}.json"
+    md_path = out_dir / f"{pack['pack_id']}.md"
+    json_path.write_text(json.dumps(pack, indent=2, ensure_ascii=False))
+    md_path.write_text(render_filter_pack(pack))
+    w = pack["window"]
+    print(f"source: {title or sid}  ({sid}) · spine {_spine_tag(skel)}")
+    print(f"pack {pack['pack_id']}: {len(pack['segments'])} text segments · window "
+          f"{w['start']:.1f}-{(w['end'] if w['end'] is not None else 0.0):.1f}s · "
+          f"{len(pack['existing_strata'])} strata already asserted")
+    print(f"  json  {json_path}")
+    print(f"  brief {md_path}")
+    print(f"next: hand the brief to a proposer; then filter-ingest --pack {json_path} "
+          "--rows <its jsonl> --proposer <name>")
+    return 0
+
+
+def _read_proposer_rows(path: Path) -> List[Dict[str, Any]]:  # Lenient JSONL / JSON-array reader
+    """Read a proposer's output: JSONL rows, or one JSON array; blank lines and
+    code-fence lines are skipped (a sub-agent's reply often carries them)."""
+    text = path.read_text()
+    stripped = text.strip()
+    if stripped.startswith("["):
+        data = json.loads(stripped)
+        if not isinstance(data, list):
+            raise SystemExit(f"{path}: expected a JSON array of rows")
+        return data
+    rows: List[Dict[str, Any]] = []
+    for k, line in enumerate(text.splitlines(), start=1):
+        s = line.strip()
+        if not s or s.startswith("```"):
+            continue
+        try:
+            rows.append(json.loads(s))
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"{path}:{k}: not a JSON row ({e.msg})")
+    return rows
+
+
+def filter_ingest_command(
+    args: argparse.Namespace,  # Parsed args for the `filter-ingest` subcommand
+) -> int:  # Process exit code
+    """Execute `filter-ingest`: validate proposer rows against their pack and
+    write the filtering proposal set (durable inference output; the proposer's
+    provenance + the pack digest ride the manifest). No graph, no journal —
+    nothing is decided here."""
+    ws = resolve_workspace(explicit=getattr(args, "workspace", None))
+    pack_path = Path(args.pack)
+    try:
+        pack = json.loads(pack_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(f"cannot read pack {pack_path}: {e}")
+    if pack.get("format") != FILTER_PACK_FORMAT:
+        raise SystemExit(f"{pack_path} is not a filter pack (format {pack.get('format')!r})")
+    rows = _read_proposer_rows(Path(args.rows))
+    try:
+        valid = validate_proposal_rows(rows, pack)
+    except ValueError as e:
+        raise SystemExit(f"rows rejected: {e}")
+    proposals = proposals_from_rows(valid, pack)
+    out_root = (Path(args.out_dir) if args.out_dir
+                else (ws.root / "proposals" if ws is not None else None))
+    if out_root is None:
+        raise SystemExit("proposal sets land workspace-local — pass --out-dir or run "
+                         "inside a workspace (CJM_WORKSPACE)")
+    proposer = {"kind": args.proposer_kind, "name": args.proposer,
+                **({"model": args.model} if args.model else {}),
+                **({"session": os.environ["CJM_SESSION"]} if os.environ.get("CJM_SESSION") else {})}
+    res = write_filter_propset(pack, proposals, out_root=out_root, proposer=proposer, ws=ws)
+    src = pack.get("source") or {}
+    tag = _spine_tag(src.get("skeleton_hash"))
+    print(f"source: {src.get('title') or src.get('source_id')} · spine {tag} · "
+          f"pack {pack.get('pack_id')}")
+    print(f"proposal set {res['set_id']} -> {res['set_dir']}")
+    t1 = " · ".join(f"{k}x{v}" for k, v in sorted(res["counts"].items())) or "none"
+    t2 = " · ".join(f"{k}x{v}" for k, v in sorted(res["tier2_counts"].items())) or "none"
+    print(f"tier-1: {t1}\ntier-2: {t2}")
+    print(f"next: filter-confirm --source {src.get('source_id')} --skeleton {tag}")
+    return 0
+
+
+def _pick_by_prefix(
+    candidates: List[Dict[str, Any]],  # Rows carrying `key`
+    key: str,                          # The id field
+    prefix: str,                       # An id or prefix (case-insensitive; matches head or tail)
+    what: str,                         # Noun for the refusal message
+) -> Dict[str, Any]:  # The unique match
+    """Resolve an id prefix to exactly one row — loud on 0 or many."""
+    p = prefix.strip().lower()
+    hits = [c for c in candidates
+            if str(c.get(key) or "").lower().startswith(p)
+            or str(c.get(key) or "").lower().endswith(p)]
+    if len(hits) != 1:
+        raise SystemExit(f"{what} {prefix!r} matches {len(hits)} candidates; need exactly one")
+    return hits[0]
+
+
+async def filter_confirm_command(
+    args: argparse.Namespace,  # Parsed args for the `filter-confirm` subcommand
+) -> int:  # Process exit code
+    """Execute `filter-confirm`: the HEADLESS HITL worklist (bc8dbbdd pass-1
+    doctrine) over one filtering proposal set.
+
+    Without gestures it LISTS: the pending tier-1 walk (tier 2 behind --tier2,
+    dim by doctrine), the live strata, the lane's watermark and the derived
+    verdict summary — nothing written. With gestures it commits, journal-first:
+    --accept / --accept-tier1 / --accept-all mint strata carrying the proposal
+    id (accept IS the domain op); --retract supersedes a live stratum;
+    --watermark asserts the filtering lane's annotated_through explicitly.
+    Rejects are never marked — absence below the watermark derives them."""
+    ws, manager, queue = await _open_graph_stack(args)
+    cap = args.graph_capability
+    try:
+        sid, title, _media = await resolve_source_node(queue, cap, args.source)
+        spines = await list_source_spines(queue, cap, sid, rendition_selector=args.rendition)
+        skel = skeleton_hash_for(spines, args.skeleton)
+        if ws is None:
+            raise SystemExit("proposal sets are workspace-local — run inside a workspace "
+                             "(CJM_WORKSPACE or --workspace)")
+        sets = load_filter_proposal_sets(str(ws.root), sid, skeleton_hash=skel)
+        if not sets:
+            print(f"no filtering proposal set for {title or sid} · spine {_spine_tag(skel)} "
+                  f"under {ws.root / 'proposals'} — run filter-pack + a proposer + filter-ingest")
+            return 1
+        chosen = (_pick_by_prefix([s["manifest"] for s in sets], "proposal_set_id", args.set,
+                                  "proposal set") if args.set else sets[0]["manifest"])
+        pset = next(s for s in sets if s["manifest"] is chosen)
+        m, proposals = pset["manifest"], pset["proposals"]
+        set_id = m.get("proposal_set_id")
+        corrections, superseded = await load_source_corrections(queue, cap, sid)
+        strata = active_strata(corrections, superseded)
+        gates = await load_extraction_gates(queue, cap, sid, lane=FILTER_LANE)
+        gate = gates.get(skel) or {}
+        watermark = gate.get("annotated_through")
+        window = (float((m.get("window") or {}).get("start") or 0.0),
+                  (m.get("window") or {}).get("end"))
+
+        gestures = bool(args.accept or args.accept_tier1 or args.accept_all
+                        or args.retract or args.watermark is not None)
+        pending_all = pending_filter_proposals(proposals, strata, show_tier2=True)
+        print(f"source: {title or sid}  ({sid}) · spine {_spine_tag(skel)}")
+        print(f"set {set_id} · proposer {(m.get('model') or {}).get('kind')}:"
+              f"{(m.get('model') or {}).get('name')} · window "
+              f"{window[0]:.1f}-{(window[1] if window[1] is not None else 0.0):.1f}s"
+              + (f" · {len(sets)} sets (newest shown; --set picks)" if len(sets) > 1 else ""))
+        print(f"lane watermark: {('%.1fs' % float(watermark)) if watermark is not None else 'none'}"
+              f" · live strata: {len(strata)}")
+        if not gestures:
+            shown = [p for p in pending_all if args.tier2 or int(p.get("tier", 1)) == 1]
+            hidden_t2 = sum(1 for p in pending_all if int(p.get("tier", 1)) == 2)
+            print(f"pending: {len(shown)} shown"
+                  + (f" · tier-2 {hidden_t2} hidden (--tier2 shows)" if hidden_t2 and not args.tier2 else ""))
+            for p in shown:
+                ev = p.get("evidence") or {}
+                q = (ev.get("quote") or "")[:60]
+                tier = "??" if int(p.get("tier", 1)) == 2 else "? "
+                conf = p.get("confidence")
+                print(f"  {tier}{_short(p.get('proposal_id'))}  {p.get('category'):>14}  "
+                      f"{float(p.get('start_time') or 0):8.1f}-{float(p.get('end_time') or 0):8.1f}s"
+                      f"  [{ev.get('from_i')}..{ev.get('to_i')}]"
+                      + (f"  c={conf:.2f}" if isinstance(conf, (int, float)) else "")
+                      + (f'  "{q}"' if q else ""))
+                if p.get("rationale"):
+                    print(f"        {p['rationale'][:110]}")
+            if strata:
+                print("live strata:")
+                for c in strata:
+                    p = c.get("payload") or {}
+                    print(f"  {_short(c.get('id'))}  {p.get('category'):>14}  "
+                          f"{float(p.get('start_time') or 0):8.1f}-{float(p.get('end_time') or 0):8.1f}s"
+                          f"  x{len(p.get('segment_ids') or [])} segs · {c.get('actor')}"
+                          + ("  (from proposal)" if p.get("proposal_id") else "  (human)"))
+            b = bench_filter_proposals(proposals, strata, window, watermark=watermark)
+            c1 = b["counts"]["tier1"]
+            print("derived verdicts (tier-1): " + " · ".join(f"{k} {v}" for k, v in c1.items())
+                  + (("  rates " + " ".join(f"{k}={v}" for k, v in b["rates"].items()))
+                     if b["rates"] else "")
+                  + (f" · missed {len(b['missed'])}" if b["missed"] else ""))
+            print("gestures: --accept <id> · --accept-tier1 · --accept-all · --retract <stratum> "
+                  "· --watermark <sec|end>")
+            return 0
+
+        db = _resolve_graph_db(args, manager, cap, ws)
+        jp = sidecar_journal_path(db)
+        sess = await start_session(queue, cap, [sid], journal_path=jp, purpose=args.purpose)
+        to_accept: List[Dict[str, Any]] = []
+        if args.accept_all:
+            to_accept = list(pending_all)
+        elif args.accept_tier1:
+            to_accept = [p for p in pending_all if int(p.get("tier", 1)) == 1]
+        for pref in (args.accept or []):
+            p = _pick_by_prefix(pending_all, "proposal_id", pref, "pending proposal")
+            if p not in to_accept:
+                to_accept.append(p)
+        done = 0
+        for p in to_accept:
+            cid = await commit_stratum_correction(
+                queue, cap, sid, list(p.get("segment_ids") or []), str(p.get("category")),
+                sess.id, skeleton_hash=skel, start_time=p.get("start_time"),
+                end_time=p.get("end_time"), proposal_id=p.get("proposal_id"),
+                proposal_set_id=set_id, actor=args.actor, note=p.get("rationale"),
+                journal_path=jp)
+            done += 1
+            print(f"accepted {_short(p.get('proposal_id'))} -> stratum {_short(cid)} "
+                  f"{p.get('category')} {float(p.get('start_time') or 0):.1f}-"
+                  f"{float(p.get('end_time') or 0):.1f}s")
+        for pref in (args.retract or []):
+            c = _pick_by_prefix(strata, "id", pref, "live stratum")
+            rid = await commit_stratum_retraction(queue, cap, sid, c["id"], sess.id,
+                                                  actor=args.actor, note=args.note,
+                                                  journal_path=jp)
+            print(f"retracted stratum {_short(c['id'])} "
+                  f"({(c.get('payload') or {}).get('category')}) via {_short(rid)}")
+        if args.watermark is not None:
+            wm_arg = str(args.watermark).strip().lower()
+            wm: Optional[float]
+            if wm_arg == "end":
+                segs = await load_source_segments(queue, cap, sid,
+                                                  rendition_selector=args.rendition,
+                                                  skeleton_selector=args.skeleton)
+                ends = [float(s.end_time) for s in segs if s.end_time is not None]
+                if not ends:
+                    raise SystemExit("--watermark end: the spine has no timed segments")
+                wm = max(ends)
+            elif wm_arg == "none":
+                wm = None      # nothing visited — no negative region is valid below anything
+            else:
+                wm = float(args.watermark)
+            gid = await commit_extraction_gate(
+                queue, cap, sid, skel, str(gate.get("extraction_status") or "in_progress"),
+                wm, session_id=sess.id, actor=args.actor, journal_path=jp, lane=FILTER_LANE)
+            print(f"lane watermark asserted: annotated_through "
+                  f"{('%.1fs' % wm) if wm is not None else 'none'} ({_short(gid)})")
+        await set_session_status(queue, cap, sess.id, "completed", journal_path=jp)
+        print(f"session {_short(sess.id)} completed · {done} accepted · journal "
+              f"{jp or 'none'}")
+    finally:
+        await _close_graph_stack(manager, queue, cap)
     return 0
 
 

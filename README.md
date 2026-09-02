@@ -6,7 +6,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 
 ## Modules
 
-- **`cjm_transcript_correction_core`**
+- **`cjm_transcript_correction_core.__init__`**
 - **`cjm_transcript_correction_core.cli`** — The CLI driver — the correction core's first (and currently only) frontend. run <decomp-manifest> corrects the committed spine in the decomp graph DB, pointing the graph worker at that shared DB via load-time config, with optional session resume/reopen; review runs the interactive text-correction loop (the cross-transcriber diff is intra-graph since stage 5).
 - **`cjm_transcript_correction_core.graph`** — The correction overlay's graph I/O: targeted (scale-shaped) reads of a committed spine via the graph-storage query action, construction of Correction / CorrectionSession nodes + CORRECTS / SUPERSEDES / DERIVED_FROM / REVIEWED edges, the in-core effective-spine projection (layer-0 + applied corrections), and commit through the job queue. Hand-rolled (revolution-1) = direct CR-18 spec material; append-only on layer-0 (never update/delete a Segment).
 - **`cjm_transcript_correction_core.journal`** — Live append-through for the correction verbs — the workflow journal's domain half.
@@ -16,6 +16,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - **`cjm_transcript_correction_core.signals`** — Pure deterministic Tier-1 signal functions (no capability calls): empty-segment detection, bidirectional boundary punctuation/capitalization heuristics, forced-alignment coverage flags, positional cross-transcriber diff, phonetic + edit-distance variant clustering, and the event-proposal overlay (leg 4: the finetuned detector's spans anchored onto the spine). The worklist is recomputed from these each session; revolution-1 builds ZERO new capabilities.
 - **`cjm_transcript_correction_core.spine`**
 - **`cjm_transcript_correction_core.state`** — Sidecar view-state + spine-picker helpers — the correction TUI's pure
+- **`cjm_transcript_correction_core.strata`** — Strata — the filtering lane's domain half (DECs 304fd984 + 9d4c0a38; work items
 
 ## API
 
@@ -26,6 +27,9 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `commit_wordless_transfer` _function_ — COMMIT a planned transfer — the engine's second half. One
 - `export_command` _function_ — Execute `export-wordless-propset`: write one spine's effective wordless
 - `extract_command` _function_ — Execute the `extract` subcommand: fold the gated overlay into a manifested dataset.
+- `filter_confirm_command` _function_ — Execute `filter-confirm`: the HEADLESS HITL worklist (bc8dbbdd pass-1
+- `filter_ingest_command` _function_ — Execute `filter-ingest`: validate proposer rows against their pack and
+- `filter_pack_command` _function_ — Execute `filter-pack`: write one spine window's effective text-bearing
 - `gate_command` _function_ — Execute the `gate` subcommand: show or assert per-spine extraction gates.
 - `load_capabilities` _function_ — Discover manifests + load each capability, passing per-capability config (CR-2 caller-wins).
 - `main` _function_ — CLI entry point (console script: `cjm-transcript-correction-core`).
@@ -39,7 +43,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `run_extract` _function_ — The extract fold on an ALREADY-OPEN graph seat (flywheel build leg 2,
 - `scan_command` _function_ — Execute `scan-mishomed`: flag authoritative FA words stranded outside
 - `stats_command` _function_ — Execute the `stats` subcommand: flywheel accounting over the shared graph.
-- `transfer_command` _function_ — Execute `transfer-wordless`: replay wordless event inserts across sibling spines.
+- `transfer_command` _function_ — Execute `transfer-wordless`: replay wordless event inserts (and speaker-
 - `wordless_donors` _function_ — The EFFECTIVE wordless layer of a spine: labeled, effectively wordless
 - `write_wordless_propset` _function_ — WRITE a planned export as a proposal set — the engine's write half.
 
@@ -63,6 +67,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `build_reject_review` _function_ — Build a review Correction that REJECTS a prior correction (reject-as-supersede).
 - `build_speaker_assign_correction` _function_ — Build a speaker Correction — the assignment op envelope (DEC d6df3a8e).
 - `build_speech_overlay_correction` _function_ — Build a NON-MUTATING speech-overlay Correction (check fc42614d, DEC 4e05a066).
+- `build_stratum_correction` _function_ — Build a NON-MUTATING stratum Correction (DECs 304fd984 + 9d4c0a38: the
 - `build_text_correction` _function_ — Build a text_content Correction + its CORRECTS (+ optional SUPERSEDES) edges.
 - `build_time_nudge_correction` _function_ — Build a timing Correction that nudges segment boundary TIMES (node + CORRECTS edges).
 - `commit_boundary_shift_correction` _function_ — Commit a boundary-shift correction (node + CORRECTS x2 [+ SUPERSEDES]) + REVIEWED markers on both segments.
@@ -79,6 +84,8 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `commit_speaker_entity` _function_ — Mint a source-spanning Entity into the shared registry (DEC 4ec6a49c).
 - `commit_speech_overlay_correction` _function_ — Commit a speech overlay (node + CORRECTS [+ SUPERSEDES]).
 - `commit_speech_overlay_removal` _function_ — Remove a speech overlay WITHOUT a replacement (reject-as-supersede).
+- `commit_stratum_correction` _function_ — Commit a stratum (node + CORRECTS per covered segment [+ SUPERSEDES]).
+- `commit_stratum_retraction` _function_ — Retract a live stratum WITHOUT replacing it (reject-as-supersede, the
 - `commit_text_correction` _function_ — Commit a text_content correction (node + CORRECTS [+ SUPERSEDES]) + a REVIEWED marker.
 - `commit_time_nudge_correction` _function_ — Commit a time-nudge correction (node + CORRECTS per touched segment).
 - `correction_stats` _function_ — Fold one Source's ACTIVE overlay into flywheel-accounting counts (pure).
@@ -203,6 +210,22 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `save_tui_state` _function_ — Merge one source's view state into the sidecar state file.
 - `selector_for_spine` _function_ — The selector value a picker choice persists (pure): the full skeleton
 - `spine_label` _function_ — One picker row's config summary for a skeleton spine (pure).
+
+### `cjm_transcript_correction_core.strata`
+
+- `active_strata` _function_ — The live strata: stratum corrections neither superseded (reclassified /
+- `bench_filter_proposals` _function_ — Derive the filtering verdicts (DEC 8e05b87b, the bench_event_proposals
+- `build_filter_pack` _function_ — Build the proposer's input: one source window's text-bearing effective
+- `exclude_strata` _function_ — The per-consumer filtered projection (DEC 9d4c0a38): "filtered" is a
+- `load_filter_proposal_sets` _function_ — Every filtering proposal set for a source (and optionally one spine),
+- `new_pack_id` _function_ — Generate a unique, sortable pack id.
+- `pack_digest` _function_ — Digest the READ content (source binding + window + numbered segments) —
+- `pending_filter_proposals` _function_ — The headless worklist: proposals with NO live stratum carrying their id and
+- `proposals_from_rows` _function_ — Resolve validated rows to proposal-set rows: proposal id, category, source
+- `render_filter_pack` _function_ — Render a pack as the brief a proposer reads: identity + window, the class
+- `strata_index` _function_ — Segment-keyed view of the live strata (the consumer query's index).
+- `validate_proposal_rows` _function_ — Validate + normalize proposer rows against their pack — loud on the first
+- `write_filter_propset` _function_ — Write one filtering proposal set: `<out_root>/<set_id>/manifest.json` +
 
 ## Dependencies
 
