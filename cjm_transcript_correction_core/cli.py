@@ -413,6 +413,11 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                                "line no longer matches the segment (re-state NEW_TEXT); repeatable")
     fconfirm.add_argument("--retract", action="append", default=None, metavar="STRATUM",
                           help="Retract a live stratum by id prefix (repeatable)")
+    fconfirm.add_argument("--reclassify", action="append", default=None, metavar="STRATUM:CLASS",
+                          help="Re-class a live stratum by id prefix under a different category "
+                               "(repeatable): mints the superseding stratum over the SAME run in one "
+                               "op, provenance carried — the boundary-class drive (section-header / "
+                               "cross-reference / transition out of apparatus, ruling b398d73f)")
     fconfirm.add_argument("--watermark", default=None,
                           help="Assert the filtering lane's annotated_through (source seconds, "
                                "\"end\", or \"none\" = nothing visited) — set EXPLICITLY on "
@@ -1805,7 +1810,8 @@ async def filter_confirm_command(
 
         gestures = bool(args.accept or args.accept_tier1 or args.accept_all
                         or args.relabel or args.accept_as_mark or args.accept_span
-                        or args.apply or args.retract or args.watermark is not None)
+                        or args.apply or args.retract or args.reclassify
+                        or args.watermark is not None)
         mark_ids = materialized_mark_ids(corrections, superseded)
         fix_ids = materialized_fix_ids(corrections, superseded)
         pending_all = pending_filter_proposals(proposals, strata, show_tier2=True,
@@ -1871,7 +1877,8 @@ async def filter_confirm_command(
                       + (f" · missed {len(b['missed'])}" if b["missed"] and tier_key == "tier1" else ""))
             print("gestures: --accept <id> · --accept-span <id>:<start>-<end> · --relabel <id>:<class> "
                   "· --accept-as-mark <id>[:<class>] · --apply <id>[:<new text>] · --accept-tier1 "
-                  "· --accept-all · --retract <stratum> · --watermark <sec|end|none>")
+                  "· --accept-all · --retract <stratum> · --reclassify <stratum>:<class> "
+                  "· --watermark <sec|end|none>")
             return 0
 
         db = _resolve_graph_db(args, manager, cap, ws)
@@ -2037,6 +2044,27 @@ async def filter_confirm_command(
                                                   journal_path=jp)
             print(f"retracted stratum {_short(c['id'])} "
                   f"({(c.get('payload') or {}).get('category')}) via {_short(rid)}")
+        for tok in (args.reclassify or []):
+            # The boundary-class drive (ruling b398d73f): the SAME run under a finer class, minted
+            # as the superseding stratum in one op; proposal provenance rides along.
+            pref, _, cls = str(tok).partition(":")
+            cls = cls.strip()
+            if not pref.strip() or not cls or not cls[:1].isalnum():
+                raise SystemExit(f"--reclassify wants STRATUM:CLASS (got {tok!r})")
+            c = _pick_by_prefix(strata, "id", pref.strip(), "live stratum")
+            p = c.get("payload") or {}
+            if str(p.get("category")) == cls:
+                raise SystemExit(f"--reclassify {_short(c['id'])}: already `{cls}`")
+            note = (f"reclassified from {p.get('category')}" + (f": {args.note}" if args.note else ""))
+            nid = await commit_stratum_correction(
+                queue, cap, sid, list(p.get("segment_ids") or []), cls, sess.id,
+                skeleton_hash=p.get("skeleton_hash"), start_time=p.get("start_time"),
+                end_time=p.get("end_time"), proposal_id=p.get("proposal_id"),
+                proposal_set_id=p.get("proposal_set_id"), supersedes_id=c["id"],
+                actor=args.actor, note=note, journal_path=jp)
+            print(f"reclassified stratum {_short(c['id'])} {p.get('category')} -> {cls} via {_short(nid)} "
+                  f"x{len(p.get('segment_ids') or [])} seg(s) "
+                  f"{float(p.get('start_time') or 0):.1f}-{float(p.get('end_time') or 0):.1f}s")
         if args.watermark is not None:
             wm_arg = str(args.watermark).strip().lower()
             wm: Optional[float]

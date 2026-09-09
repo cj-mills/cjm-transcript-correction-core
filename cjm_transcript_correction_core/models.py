@@ -242,8 +242,14 @@ RECOMMENDED_STRATUM_CLASSES = (
     "sponsor",        # sponsor read / advertisement (products may still be research-worthy)
     "research-mark",  # a claim / citation / name a research pass should follow up
     "disfluency",     # hesitations, false starts, repeats — detector training feedstock
-    "apparatus",      # credits, dedication, legal, acknowledgments, chapter boilerplate
+    "apparatus",      # credits, dedication, legal, acknowledgments, boilerplate (narrowed 2026-09-09: headers moved out)
     "quotation",      # someone else's voice quoted verbatim (ratified 2026-09-01: proposer-minted on LG ch04)
+    # The boundary classes (user ruling 2026-09-09, item 2047cf1d): a notes deliverable renders
+    # its heading hierarchy from section-header runs ONLY; a cross-reference or a transition is
+    # never a heading and never content.
+    "section-header",   # a section title read aloud (a chapter identity readout included)
+    "cross-reference",  # an in-book pointer to another chapter / page — how-to-read-this-book framing
+    "transition",       # a closing segue or hand-off into the next unit
 )
 
 # The shell-shared gesture vocabulary (1052ce38 wart 2 re-homed, spine

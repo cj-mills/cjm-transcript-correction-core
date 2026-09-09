@@ -218,6 +218,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `build_filter_pack` _function_ — Build the proposer's input: one source window's text-bearing effective
 - `exclude_strata` _function_ — The per-consumer filtered projection (DEC 9d4c0a38): "filtered" is a
 - `load_filter_proposal_sets` _function_ — Every filtering proposal set for a source (and optionally one spine),
+- `materialized_fix_ids` _function_ — The fidelity-edit apply path's materialization: a proposer row whose
 - `materialized_mark_ids` _function_ — Class-family routing's other half: a proposer's mark-family row (an ASR
 - `new_pack_id` _function_ — Generate a unique, sortable pack id.
 - `pack_digest` _function_ — Digest the READ content (source binding + window + numbered segments) —

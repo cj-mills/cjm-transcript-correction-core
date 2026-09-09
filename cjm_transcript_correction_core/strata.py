@@ -54,7 +54,14 @@ STRATUM_GLOSSES: Dict[str, str] = {
     "sponsor": "a sponsor read or advertisement (products in it may still be research-worthy)",
     "research-mark": "a claim, citation, name, or reference a research pass should follow up",
     "disfluency": "hesitations, false starts, repeats — timestamp-detector training feedstock",
-    "apparatus": "publishing apparatus: credits, dedication, legal, acknowledgments, chapter boilerplate",
+    "apparatus": "publishing apparatus: credits, dedication, legal, acknowledgments, boilerplate — NOT a "
+                 "read-aloud section title, cross-reference or segue (those have their own classes)",
+    "section-header": ("a section title read aloud — the heading a notes deliverable renders under; the "
+                       "chapter's own number-and-title readout counts (it is suppressed as the unit title)"),
+    "cross-reference": ("an in-book pointer to another chapter or page ('See Chapter 19 for more') — "
+                        "how-to-read-this-book framing, never a heading, never content"),
+    "transition": ("a closing segue or hand-off into the next unit ('To see how, let's look at…') — "
+                   "never a heading, never content; the seam a section boundary can be cut at"),
     "quotation": ("someone else's voice quoted verbatim — include the spoken 'quote' / 'end quote' "
                   "delimiters; a verify-against-source unit, distinct from the research-mark that "
                   "points at the source"),
