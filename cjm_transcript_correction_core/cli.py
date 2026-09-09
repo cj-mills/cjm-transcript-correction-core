@@ -24,12 +24,13 @@ from cjm_transcript_correction_core.graph import (bench_event_proposals,
                                                   commit_chunk_split_correction,
                                                   commit_extraction_gate, commit_mark_correction,
                                                   commit_stratum_correction,
-                                                  commit_stratum_retraction, correction_stats,
-                                                  extract_spine_dataset, labeled_insert_spans,
-                                                  list_source_spines, load_extraction_gates,
-                                                  load_source_corrections, load_source_segments,
-                                                  project_effective_spine, set_session_status,
-                                                  skeleton_hash_for, start_session)
+                                                  commit_stratum_retraction, commit_text_correction,
+                                                  correction_stats, extract_spine_dataset,
+                                                  labeled_insert_spans, list_source_spines,
+                                                  load_extraction_gates, load_source_corrections,
+                                                  load_source_segments, project_effective_spine,
+                                                  set_session_status, skeleton_hash_for,
+                                                  start_session)
 from cjm_transcript_correction_core.models import CorrectionConfig, DatasetManifest, new_dataset_id
 from cjm_transcript_correction_core.pipeline import (load_decomp_manifest, resolve_graph_db_path,
                                                      run_correction, run_review)
@@ -38,8 +39,9 @@ from cjm_transcript_correction_core.signals import (EVENT_PROPOSAL_SET_FORMAT,
 from cjm_transcript_correction_core.strata import (active_strata, bench_filter_proposals,
                                                    build_filter_pack, FILTER_LANE,
                                                    FILTER_PACK_FORMAT, load_filter_proposal_sets,
-                                                   materialized_mark_ids, pending_filter_proposals,
-                                                   proposals_from_rows, render_filter_pack,
+                                                   materialized_fix_ids, materialized_mark_ids,
+                                                   pending_filter_proposals, proposals_from_rows,
+                                                   render_filter_pack,
                                                    render_filter_propset_markdown,
                                                    select_span_segments, validate_proposal_rows,
                                                    write_filter_propset)
@@ -399,6 +401,16 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                                "ASR errors, suspect nouns and other correction-pass attention "
                                "are marks, never strata); CLASS defaults to the proposal's "
                                "category; multi-segment runs anchor on each segment")
+    fconfirm.add_argument("--apply", action="append", default=None,
+                          metavar="PROPOSAL[:NEW_TEXT]",
+                          help="APPLY one proposal as a text edit (the fidelity-edit apply path, "
+                               "context-evidence corrections per d162cd64): the ONE text segment "
+                               "of the current spine under its span gets a text_content correction "
+                               "(new text = NEW_TEXT, else the row's `replacement`) carrying the "
+                               "proposal id, plus the class-family mark unless the proposal is "
+                               "already materialized as one; refuses a run that is not one segment, "
+                               "a row with no replacement and no NEW_TEXT, and a row whose packed "
+                               "line no longer matches the segment (re-state NEW_TEXT); repeatable")
     fconfirm.add_argument("--retract", action="append", default=None, metavar="STRATUM",
                           help="Retract a live stratum by id prefix (repeatable)")
     fconfirm.add_argument("--watermark", default=None,
@@ -1793,10 +1805,11 @@ async def filter_confirm_command(
 
         gestures = bool(args.accept or args.accept_tier1 or args.accept_all
                         or args.relabel or args.accept_as_mark or args.accept_span
-                        or args.retract or args.watermark is not None)
+                        or args.apply or args.retract or args.watermark is not None)
         mark_ids = materialized_mark_ids(corrections, superseded)
+        fix_ids = materialized_fix_ids(corrections, superseded)
         pending_all = pending_filter_proposals(proposals, strata, show_tier2=True,
-                                               materialized=mark_ids)
+                                               materialized=mark_ids | fix_ids)
         print(f"source: {title or sid}  ({sid}) · spine {_spine_tag(skel)}")
         print(f"set {set_id} · proposer {(m.get('model') or {}).get('kind')}:"
               f"{(m.get('model') or {}).get('name')} · window "
@@ -1805,7 +1818,8 @@ async def filter_confirm_command(
         set_pids = {p.get("proposal_id") for p in proposals}
         print(f"lane watermark: {('%.1fs' % float(watermark)) if watermark is not None else 'none'}"
               f" · live strata: {len(strata)}"
-              + (f" · marks from proposals: {len(mark_ids & set_pids)}" if mark_ids & set_pids else ""))
+              + (f" · marks from proposals: {len(mark_ids & set_pids)}" if mark_ids & set_pids else "")
+              + (f" · applied as text edits: {len(fix_ids & set_pids)}" if fix_ids & set_pids else ""))
         if args.markdown:
             pack_path = ws.root / "packs" / f"{(m.get('pack') or {}).get('pack_id')}.json"
             pack = None
@@ -1835,6 +1849,8 @@ async def filter_confirm_command(
                 if p.get("rationale"):
                     for wrapped in textwrap.wrap(str(p["rationale"]), width=100):
                         print(f"        {wrapped}")
+                if p.get("replacement") is not None:
+                    print(f"        fix -> {p['replacement']!r}  (--apply {_short(p.get('proposal_id'))})")
             if strata:
                 print("live strata:")
                 for c in strata:
@@ -1844,7 +1860,7 @@ async def filter_confirm_command(
                           f"  x{len(p.get('segment_ids') or [])} segs · {c.get('actor')}"
                           + ("  (from proposal)" if p.get("proposal_id") else "  (human)"))
             b = bench_filter_proposals(proposals, strata, window, watermark=watermark,
-                                       mark_ids=mark_ids)
+                                       mark_ids=mark_ids, fix_ids=fix_ids)
             for tier_key, label in (("tier1", "tier-1"), ("tier2", "tier-2")):
                 c = b["counts"][tier_key]
                 if tier_key == "tier2" and not any(c.values()):
@@ -1854,8 +1870,8 @@ async def filter_confirm_command(
                          if b["rates"] and tier_key == "tier1" else "")
                       + (f" · missed {len(b['missed'])}" if b["missed"] and tier_key == "tier1" else ""))
             print("gestures: --accept <id> · --accept-span <id>:<start>-<end> · --relabel <id>:<class> "
-                  "· --accept-as-mark <id>[:<class>] · --accept-tier1 · --accept-all "
-                  "· --retract <stratum> · --watermark <sec|end|none>")
+                  "· --accept-as-mark <id>[:<class>] · --apply <id>[:<new text>] · --accept-tier1 "
+                  "· --accept-all · --retract <stratum> · --watermark <sec|end|none>")
             return 0
 
         db = _resolve_graph_db(args, manager, cap, ws)
@@ -1897,8 +1913,17 @@ async def filter_confirm_command(
                 raise SystemExit(f"--accept-span: END must exceed START, got {spec!r}")
             p = _pick_by_prefix(pending_all, "proposal_id", pref, "pending proposal")
             spans.append((p, lo, hi))
+        applies: List[Tuple[Dict[str, Any], Optional[str]]] = []
+        for spec in (args.apply or []):
+            # A fix targets a PENDING row or one already accepted AS A MARK (the
+            # attention landed earlier, the text lands now) — never a row whose
+            # fix is already the effective text.
+            pref, _, txt = spec.partition(":")
+            cands = [p for p in proposals if p.get("proposal_id") not in fix_ids]
+            p = _pick_by_prefix(cands, "proposal_id", pref, "proposal (not yet applied)")
+            applies.append((p, txt.strip() or None))
         eff_segments: List[Any] = []
-        if spans:
+        if spans or applies:
             # The CURRENT effective view — the proposal's ids froze at pack time; the
             # walk lane has moved text since (the span-edit gesture's whole reason).
             segs_now = await load_source_segments(queue, cap, sid, rendition_selector=args.rendition,
@@ -1929,6 +1954,54 @@ async def filter_confirm_command(
                   f"{category} {float(run[0].start_time):.1f}-{float(run[-1].end_time):.1f}s "
                   f"x{len(run)} seg(s) (proposed {float(p.get('start_time') or 0):.1f}-"
                   f"{float(p.get('end_time') or 0):.1f}s x{len(p.get('segment_ids') or [])})")
+        for p, given in applies:
+            pid = p.get("proposal_id")
+            ps, pe = float(p.get("start_time") or 0.0), float(p.get("end_time") or 0.0)
+            run = [s for s in eff_segments
+                   if (s.text or "").strip() and s.start_time is not None and s.end_time is not None
+                   and min(float(s.end_time), pe) - max(float(s.start_time), ps) > 0.01]
+            if len(run) != 1:
+                raise SystemExit(f"--apply {_short(pid)}: the span {ps:.2f}-{pe:.2f}s covers {len(run)} "
+                                 f"text segment(s) of the current spine — a text edit is per segment")
+            seg = run[0]
+            packed = (p.get("evidence") or {}).get("text")
+            new_text = given if given is not None else p.get("replacement")
+            if new_text is None:
+                raise SystemExit(f"--apply {_short(pid)}: the row carries no replacement (it flags the "
+                                 f"line for audio review) — pass --apply {_short(pid)}:<new text>")
+            if given is None and packed is not None and str(seg.text) != str(packed):
+                raise SystemExit(f"--apply {_short(pid)}: #{seg.index} changed since the pack "
+                                 f"({packed!r} -> {seg.text!r}) — re-state the fix as "
+                                 f"--apply {_short(pid)}:<new text>")
+            if new_text == seg.text:
+                raise SystemExit(f"--apply {_short(pid)}: #{seg.index} already reads {new_text!r}")
+            prior = sorted((c for c in corrections
+                            if c.get("correction_type") == "text_content"
+                            and c.get("id") not in superseded and c.get("status") != "proposed"
+                            and (c.get("payload") or {}).get("segment_id") == seg.id),
+                           key=lambda c: float(c.get("created_at") or 0.0))
+            note = (f"applied from proposal ({(m.get('model') or {}).get('name')}): "
+                    f"{p.get('rationale') or ''}").strip()
+            cid = await commit_text_correction(
+                queue, cap, sid, seg.id, new_text, sess.id, old_text=seg.text,
+                supersedes_id=(prior[-1]["id"] if prior else None), actor=args.actor,
+                journal_path=jp, rationale=note, proposal_id=pid, proposal_set_id=set_id)
+            marked = ""
+            carried = pid in mark_ids or any(
+                (c.get("payload") or {}).get("proposal_id") == pid for c in strata)
+            if not carried:
+                # The attention half lands with the text: the class-family mark,
+                # unless a mark or a live stratum already carries this proposal
+                # (the pre-routing asr-error strata of 2026-09-02 included).
+                mid = await commit_mark_correction(
+                    queue, cap, sid, {"kind": "segment", "segment_id": seg.id},
+                    str(p.get("category")), sess.id, actor=args.actor, note=note,
+                    journal_path=jp, proposal_id=pid, proposal_set_id=set_id)
+                marked = f" · mark {_short(mid)} {p.get('category')}"
+            done += 1
+            print(f"applied {_short(pid)} -> text correction {_short(cid)} on #{seg.index} "
+                  f"{float(seg.start_time):.1f}s: {seg.text!r} -> {new_text!r}" + marked
+                  + (f" (supersedes {_short(prior[-1]['id'])})" if prior else ""))
         for p, cls in [(p, None) for p in to_accept] + relabels:
             category = cls or str(p.get("category"))
             note = p.get("rationale")

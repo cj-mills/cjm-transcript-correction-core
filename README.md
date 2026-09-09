@@ -218,11 +218,14 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `build_filter_pack` _function_ — Build the proposer's input: one source window's text-bearing effective
 - `exclude_strata` _function_ — The per-consumer filtered projection (DEC 9d4c0a38): "filtered" is a
 - `load_filter_proposal_sets` _function_ — Every filtering proposal set for a source (and optionally one spine),
+- `materialized_mark_ids` _function_ — Class-family routing's other half: a proposer's mark-family row (an ASR
 - `new_pack_id` _function_ — Generate a unique, sortable pack id.
 - `pack_digest` _function_ — Digest the READ content (source binding + window + numbered segments) —
 - `pending_filter_proposals` _function_ — The headless worklist: proposals with NO live stratum carrying their id and
 - `proposals_from_rows` _function_ — Resolve validated rows to proposal-set rows: proposal id, category, source
 - `render_filter_pack` _function_ — Render a pack as the brief a proposer reads: identity + window, the class
+- `render_filter_propset_markdown` _function_ — Project a proposal set for a HUMAN to check against the source in the
+- `select_span_segments` _function_ — The span-EDIT gesture's resolver (agreed 2026-09-01 on the ch04 confirm
 - `strata_index` _function_ — Segment-keyed view of the live strata (the consumer query's index).
 - `validate_proposal_rows` _function_ — Validate + normalize proposer rows against their pack — loud on the first
 - `write_filter_propset` _function_ — Write one filtering proposal set: `<out_root>/<set_id>/manifest.json` +
@@ -230,4 +233,4 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 ## Dependencies
 
 **Depends on:** `cjm-capability-primitives`, `cjm-context-graph-layer`, `cjm-context-graph-primitives`, `cjm-substrate`, `cjm-transcript-graph-schema`, `numpy`
-**Used by:** `cjm-transcript-correction-qt`, `cjm-transcript-correction-tui`, `cjm-transcription-core`, `cjm-workflow-hub-qt`, `cjm-workflow-hub-tui`
+**Used by:** `cjm-context-graph-projection`, `cjm-transcript-correction-qt`, `cjm-transcription-core`, `cjm-workflow-hub-qt`

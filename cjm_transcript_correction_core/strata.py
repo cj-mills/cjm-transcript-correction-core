@@ -181,7 +181,8 @@ Write ONE JSON object per line (JSONL). Each row proposes ONE stratum over a run
 consecutive pack lines:
 
     {"category": "<class>", "from_i": <int>, "to_i": <int>, "tier": 1|2,
-     "confidence": <0.0-1.0>, "rationale": "<one sentence>", "quote": "<short verbatim>"}
+     "confidence": <0.0-1.0>, "rationale": "<one sentence>", "quote": "<short verbatim>",
+     "replacement": "<optional: the full corrected text of ONE line>"}
 
 * `category`: a class from the vocabulary above, or a NEW kebab-case class when none fits
   (say why in the rationale). Do NOT propose the main topic — absence of a stratum IS
@@ -192,6 +193,12 @@ consecutive pack lines:
   2 = borderline, audition only (dim in the walk, never batch-accepted).
 * `confidence`: your own calibration, 0..1.
 * `quote`: a few verbatim words from the run, for the human to find it fast.
+* `replacement` (mis-transcription rows such as `asr-error` only): when the surrounding
+  CONTEXT supplies the fix — a niche term, a name, a word the sentence cannot mean —
+  give the full corrected text of that ONE line (`from_i` == `to_i`), differing from the
+  line as printed. The human applies it as a text edit with one gesture. When you can
+  only tell that the line is wrong, leave `replacement` out: the row then flags the line
+  for the human's audio review. Never guess a replacement from sound alone.
 
 Rows only — no prose before or after, no code fences.
 """
@@ -246,8 +253,11 @@ def validate_proposal_rows(
     """Validate + normalize proposer rows against their pack — loud on the first
     bad row (row number in the message). Enforces the contract: class token,
     in-range inclusive run, tier in {1, 2}, confidence in [0, 1], no same-class
-    overlap between rows."""
+    overlap between rows, and — for a row carrying `replacement` (the
+    fidelity-edit apply path) — a ONE-line run whose replacement is a non-empty
+    string that differs from the line as packed."""
     n = len(pack.get("segments") or [])
+    segs = pack.get("segments") or []
     out: List[Dict[str, Any]] = []
     seen: Dict[str, List[Tuple[int, int]]] = {}
     for k, raw in enumerate(rows, start=1):
@@ -274,10 +284,21 @@ def validate_proposal_rows(
             if fi <= b and ti >= a:
                 raise ValueError(f"row {k}: {cat} run {fi}..{ti} overlaps an earlier {cat} run {a}..{b}")
         seen.setdefault(cat, []).append((fi, ti))
+        replacement = raw.get("replacement")
+        if replacement is not None:
+            if not isinstance(replacement, str) or not replacement.strip():
+                raise ValueError(f"row {k}: replacement must be a non-empty string")
+            if fi != ti:
+                raise ValueError(f"row {k}: a replacement corrects ONE line — run {fi}..{ti} "
+                                 f"spans several (a text edit is per segment)")
+            replacement = replacement.strip()
+            if replacement == str(segs[fi].get("text") or "").strip():
+                raise ValueError(f"row {k}: replacement equals line {fi} as packed — nothing to apply")
         out.append({"category": cat, "from_i": fi, "to_i": ti, "tier": tier,
                     "confidence": conf,
                     "rationale": str(raw.get("rationale") or "").strip() or None,
-                    "quote": str(raw.get("quote") or "").strip() or None})
+                    "quote": str(raw.get("quote") or "").strip() or None,
+                    **({"replacement": replacement} if replacement is not None else {})})
     return out
 
 
@@ -287,13 +308,17 @@ def proposals_from_rows(
 ) -> List[Dict[str, Any]]:  # Proposal-set rows (time-ordered), pack positions resolved to spine identity
     """Resolve validated rows to proposal-set rows: proposal id, category, source
     times, the covered segment ids, tier, confidence, rationale, and the evidence
-    read-trace (pack id + run + quote)."""
+    read-trace (pack id + run + quote). A row with `replacement` (the fidelity-
+    edit apply path) carries it through plus the line's verbatim text as
+    `evidence.text` — the drift check an apply performs against the CURRENT
+    effective spine."""
     segs = pack.get("segments") or []
     out: List[Dict[str, Any]] = []
     for r in rows:
         run = segs[r["from_i"]:r["to_i"] + 1]
         starts = [s["start"] for s in run if s.get("start") is not None]
         ends = [s["end"] for s in run if s.get("end") is not None]
+        fix = r.get("replacement")
         out.append({
             "proposal_id": str(uuid.uuid4()),
             "category": r["category"],
@@ -305,8 +330,10 @@ def proposals_from_rows(
             "confidence": r.get("confidence"),
             "score": r.get("confidence"),   # the propset walkers' generic key
             "rationale": r.get("rationale"),
+            **({"replacement": fix} if fix is not None else {}),
             "evidence": {"pack_id": pack.get("pack_id"), "from_i": r["from_i"],
-                         "to_i": r["to_i"], "quote": r.get("quote")},
+                         "to_i": r["to_i"], "quote": r.get("quote"),
+                         **({"text": str(run[0].get("text") or "")} if fix is not None else {})},
         })
     out.sort(key=lambda p: (p["start_time"] if p["start_time"] is not None else 0.0,
                             p["evidence"]["from_i"]))
@@ -421,6 +448,10 @@ def render_filter_propset_markdown(
             lines.append("")
         if ev.get("quote"):
             lines.append(f"**Quote:** “{ev['quote']}”")
+            lines.append("")
+        if p.get("replacement") is not None:
+            was = ev.get("text") if ev.get("text") is not None else (run[0]["text"] if run else "?")
+            lines.append(f"**Fix:** ~~{was}~~ → {p['replacement']}")
             lines.append("")
         if run:
             lo = max(0, fi - context)
@@ -539,6 +570,23 @@ def materialized_mark_ids(
             and (c.get("payload") or {}).get("proposal_id")}
 
 
+def materialized_fix_ids(
+    corrections: List[Dict[str, Any]],  # Corrections (e.g. from load_source_corrections)
+    superseded_ids: set,                # Ids that are SUPERSEDES targets
+) -> set:  # proposal ids that ACTIVE text corrections carry (rows APPLIED as fidelity edits)
+    """The fidelity-edit apply path's materialization: a proposer row whose
+    replacement the human applied lands as a text_content correction carrying
+    the proposal id — the worklist drops it and the bench reads it ACCEPTED
+    (family fix). A later human re-edit of the same segment supersedes the
+    applied correction, which then no longer counts: the proposal is pending
+    again only in the sense that its fix is no longer the effective text."""
+    return {(c.get("payload") or {}).get("proposal_id") for c in corrections
+            if c.get("correction_type") == "text_content"
+            and c.get("id") not in superseded_ids
+            and c.get("status") != "proposed"
+            and (c.get("payload") or {}).get("proposal_id")}
+
+
 def pending_filter_proposals(
     proposals: List[Dict[str, Any]],  # A proposal set's rows
     strata: List[Dict[str, Any]],     # active_strata output
@@ -575,6 +623,7 @@ def bench_filter_proposals(
     watermark: Optional[float] = None,     # The lane's annotated_through (None = nothing visited)
     iou_tolerance: float = 0.9,            # Same-category overlap at/above which a match is ACCEPTED (else EDITED)
     mark_ids: Optional[set] = None,        # Proposal ids materialized AS MARKS (class-family routing) — ACCEPTED, family mark
+    fix_ids: Optional[set] = None,         # Proposal ids APPLIED as text edits (the apply path) — ACCEPTED, family fix
 ) -> Dict[str, Any]:  # {"counts", "rates", "verdicts", "missed"}
     """Derive the filtering verdicts (DEC 8e05b87b, the bench_event_proposals
     sibling) — pure, nothing stored.
@@ -639,12 +688,14 @@ def bench_filter_proposals(
         for p in ordered:
             ps, pe = float(p.get("start_time") or 0.0), float(p.get("end_time") or 0.0)
             m = matches.get(id(p))
-            if m is None and p.get("proposal_id") in (mark_ids or ()):
+            family = ("fix" if p.get("proposal_id") in (fix_ids or ())
+                      else "mark" if p.get("proposal_id") in (mark_ids or ()) else None)
+            if m is None and family:
                 counts["accepted"] += 1
                 verdicts.append({"proposal_id": p.get("proposal_id"), "category": p.get("category"),
                                  "start_time": ps, "end_time": pe, "tier": int(p.get("tier", 1)),
                                  "confidence": p.get("confidence"), "verdict": "accepted",
-                                 "family": "mark"})
+                                 "family": family})
                 continue
             if m is None:
                 verdict = (no_match if (watermark is not None and ps < float(watermark))

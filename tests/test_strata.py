@@ -9,6 +9,7 @@ import pytest
 
 from cjm_transcript_correction_core.graph import (build_stratum_correction,
                                                   build_extraction_gate_assertion,
+                                                  build_text_correction,
                                                   corrections_to_edits,
                                                   latest_extraction_gates)
 from cjm_transcript_correction_core.models import RECOMMENDED_STRATUM_CLASSES, SpineSegment
@@ -300,6 +301,77 @@ def test_mark_family_routing_materializes_and_benches_as_accepted():
     v = {r["category"]: r for r in b["verdicts"]}
     assert v["tool-mention"]["verdict"] == "accepted" and v["tool-mention"]["family"] == "mark"
     assert v["apparatus"]["verdict"] == "rejected"
+
+
+def test_replacement_rows_validate_carry_through_and_render():
+    """The fidelity-edit apply path's ROW CONTRACT: `replacement` is the full
+    corrected text of ONE packed line, differing from it; it rides the proposal
+    row with the packed line as evidence.text (the drift check) and the human
+    view prints the fix; rows without it are untouched."""
+    pack = _pack()   # pack line 2 = s3 "By the way, I use Notion for this." (s1 is wordless, left out)
+    ok = validate_proposal_rows([
+        {"category": "asr-error", "from_i": 2, "to_i": 2, "tier": 2, "confidence": 0.6,
+         "rationale": "Notion, not motion", "quote": "I use Notion",
+         "replacement": "By the way, I use Notion for this, daily. "},
+        {"category": "sponsor", "from_i": 4, "to_i": 4},
+    ], pack)
+    assert ok[0]["replacement"] == "By the way, I use Notion for this, daily."   # stripped
+    assert "replacement" not in ok[1]
+    with pytest.raises(ValueError, match="ONE line"):
+        validate_proposal_rows([{"category": "asr-error", "from_i": 2, "to_i": 3,
+                                 "replacement": "x"}], pack)
+    with pytest.raises(ValueError, match="equals line 2"):
+        validate_proposal_rows([{"category": "asr-error", "from_i": 2, "to_i": 2,
+                                 "replacement": "By the way, I use Notion for this."}], pack)
+    with pytest.raises(ValueError, match="non-empty"):
+        validate_proposal_rows([{"category": "asr-error", "from_i": 2, "to_i": 2,
+                                 "replacement": "   "}], pack)
+    props = proposals_from_rows(ok, pack)
+    fix = next(p for p in props if p["category"] == "asr-error")
+    assert fix["replacement"] == "By the way, I use Notion for this, daily."
+    assert fix["evidence"]["text"] == "By the way, I use Notion for this."
+    assert fix["segment_ids"] == ["s3"]
+    plain = next(p for p in props if p["category"] == "sponsor")
+    assert "replacement" not in plain and "text" not in plain["evidence"]
+    manifest = {"proposal_set_id": "set1", "source": {"title": "Chapter 1"}, "model": {},
+                "window": {"start": 0.0, "end": 14.0}}
+    md = render_filter_propset_markdown(manifest, props, pack)
+    assert "**Fix:** ~~By the way, I use Notion for this.~~ → By the way, I use Notion for this, daily." in md
+    assert "## Output contract" in render_filter_pack(pack) and "`replacement`" in render_filter_pack(pack)
+
+
+def test_fix_family_materializes_and_benches_as_accepted():
+    """The apply path's materialization: an APPLIED row is a text_content
+    correction carrying the proposal id — the worklist drops it, the bench reads
+    it ACCEPTED (family fix, ahead of a mark carrying the same id), and a later
+    human re-edit that supersedes the applied correction un-materializes it."""
+    from cjm_transcript_correction_core.strata import materialized_fix_ids, materialized_mark_ids
+    _pack_, props = _props()
+    by_cat = {p["category"]: p for p in props}
+    pid = by_cat["tool-mention"]["proposal_id"]
+    node, edges = build_text_correction("src", "s3", "By the way, I use Notion for this, daily.",
+                                        "sess", old_text="By the way, I use Notion for this.",
+                                        rationale="applied from proposal (reader-1): Notion",
+                                        proposal_id=pid, proposal_set_id="set1")
+    pl = node["properties"]["payload"]
+    assert pl["operation"] == "replace_text" and pl["proposal_id"] == pid and pl["proposal_set_id"] == "set1"
+    assert node["properties"]["rationale"] == "applied from proposal (reader-1): Notion"
+    assert [e["relation_type"] for e in edges] == ["CORRECTS"]
+    hand, _ = build_text_correction("src", "s3", "x", "sess")
+    assert "proposal_id" not in hand["properties"]["payload"]
+    d = dict(node["properties"]); d["id"] = node["id"]
+    fids = materialized_fix_ids([d], set())
+    assert fids == {pid} and materialized_fix_ids([d], {node["id"]}) == set()
+    assert materialized_mark_ids([d], set()) == set()          # a text edit is not a mark
+    pend = pending_filter_proposals(props, [], materialized=fids)
+    assert "tool-mention" not in [p["category"] for p in pend]
+    b = bench_filter_proposals(props, [], (0.0, 14.0), watermark=14.0, mark_ids={pid}, fix_ids=fids)
+    v = {r["category"]: r for r in b["verdicts"]}
+    assert v["tool-mention"]["verdict"] == "accepted" and v["tool-mention"]["family"] == "fix"
+    assert b["counts"]["tier1"]["accepted"] == 1
+    # a proposed (not applied) text correction does not materialize
+    d2 = dict(d); d2["status"] = "proposed"
+    assert materialized_fix_ids([d2], set()) == set()
 
 
 def test_bench_filter_proposals_derives_verdicts_below_watermark():

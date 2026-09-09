@@ -300,18 +300,22 @@ ANNOTATE_ONLY_ACTIONS = frozenset({
 # audio vocabulary plus the confirm gestures — accept, span edit (mark the
 # run's start/end at the cursor, then accept over the CURRENT effective
 # spine), relabel, accept-as-mark, retract, the lane watermark, and the
-# worklist's jump / audition / tier toggle. Nudges and edits stay out: the
-# lane classifies runs, it never moves boundaries.
+# worklist's jump / audition / tier toggle. Nudges and free edits stay out: the
+# lane classifies runs, it never moves boundaries. The one text-touching
+# gesture is filter_fix — the fidelity-edit APPLY path: a proposer row's
+# replacement (context evidence, d162cd64) lands as the walk lane's own
+# text_content correction + the class-family mark, the human reading the one
+# segment it corrects.
 FILTER_LANE_ACTIONS = frozenset({
     "next", "prev", "replay", "seam_next", "seam_prev", "speed_down", "speed_up",
     "yank", "filter_accept", "filter_accept_span", "filter_span_start",
-    "filter_span_end", "filter_relabel", "filter_mark", "filter_retract",
+    "filter_span_end", "filter_relabel", "filter_mark", "filter_fix", "filter_retract",
     "filter_watermark", "filter_next", "filter_prev", "filter_jump",
     "filter_audition", "filter_tier2", "filter_set",
     "cycle_lane", "cycle_lane_prev", "cancel", "quit_app"})
 FILTER_ONLY_ACTIONS = frozenset({
     "filter_accept", "filter_accept_span", "filter_span_start", "filter_span_end",
-    "filter_relabel", "filter_mark", "filter_retract", "filter_watermark",
+    "filter_relabel", "filter_mark", "filter_fix", "filter_retract", "filter_watermark",
     "filter_next", "filter_prev", "filter_jump", "filter_audition", "filter_tier2",
     "filter_set"})
 

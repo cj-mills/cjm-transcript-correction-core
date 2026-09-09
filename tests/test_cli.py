@@ -74,6 +74,12 @@ def test_filter_lane_subcommands():
                        "--accept-as-mark", "d4:homophone-substitution", "--accept-as-mark", "e5"])
     assert ns.relabel == ["c3:research-mark"]
     assert ns.accept_as_mark == ["d4:homophone-substitution", "e5"]
+    # the fidelity-edit apply path: PROPOSAL alone takes the row's replacement,
+    # PROPOSAL:NEW_TEXT re-states it (a colon inside the text survives)
+    ns = p.parse_args(["filter-confirm", "--source", "Seven", "--apply", "f6",
+                       "--apply", "g7:Confidence in public schools: near all-time lows,"])
+    assert ns.apply == ["f6", "g7:Confidence in public schools: near all-time lows,"]
+    assert p.parse_args(["filter-confirm", "--source", "Seven"]).apply is None
     with pytest.raises(SystemExit):
         p.parse_args(["filter-ingest", "--pack", "p.json"])   # rows + proposer required
 

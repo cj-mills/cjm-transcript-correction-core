@@ -569,6 +569,8 @@ def build_text_correction(
     actor: str = "human",                  # Actor
     canonical_form: Optional[str] = None,  # Optional entity key (cross-transcript matching)
     rationale: Optional[str] = None,       # Optional note
+    proposal_id: Optional[str] = None,     # Applied proposal id (the fidelity-edit apply path; None = hand edit)
+    proposal_set_id: Optional[str] = None,  # Its proposal set
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (correction node dict, edge dicts)
     """Build a text_content Correction + its CORRECTS (+ optional SUPERSEDES) edges.
 
@@ -577,9 +579,14 @@ def build_text_correction(
     SUPERSEDES edge (new -> prior) so supersession is graph-native + append-only
     (the prior Correction is never mutated; it is excluded from the effective view
     because it is a SUPERSEDES target — the C16 semantics, layer-resolved).
+    An APPLIED proposer row (the fidelity-edit apply path) carries its proposal
+    id + set on the payload, exactly like marks and strata do — the bench and
+    the worklist derive 'applied' from it, nothing else is stored.
     """
     payload = {"operation": "replace_text", "source_id": source_id,
-               "segment_id": segment_id, "new_text": new_text, "old_text": old_text}
+               "segment_id": segment_id, "new_text": new_text, "old_text": old_text,
+               **({"proposal_id": proposal_id, "proposal_set_id": proposal_set_id}
+                  if proposal_id else {})}
     node = build_correction_node("text_content", session_id, payload, actor=actor,
                                  canonical_form=canonical_form, rationale=rationale).to_graph_node()
     edges = [make_edge(node.id, segment_id, CorrectionRelations.CORRECTS)]
@@ -600,11 +607,15 @@ async def commit_text_correction(
     actor: str = "human",                  # Actor
     canonical_form: Optional[str] = None,  # Optional entity key
     journal_path: Optional[str] = None,    # Sidecar journal — append the op on success (None = unjournaled)
+    rationale: Optional[str] = None,       # Optional note (an applied proposal's provenance line)
+    proposal_id: Optional[str] = None,     # Applied proposal id (the fidelity-edit apply path)
+    proposal_set_id: Optional[str] = None,  # Its proposal set
 ) -> str:  # The new Correction node id
     """Commit a text_content correction (node + CORRECTS [+ SUPERSEDES]) + a REVIEWED marker."""
     node, edges = build_text_correction(
         source_id, segment_id, new_text, session_id, old_text=old_text,
-        supersedes_id=supersedes_id, actor=actor, canonical_form=canonical_form)
+        supersedes_id=supersedes_id, actor=actor, canonical_form=canonical_form,
+        rationale=rationale, proposal_id=proposal_id, proposal_set_id=proposal_set_id)
     await commit_nodes_edges(queue, graph_id, [node], edges)
     if journal_path:
         journal_correction_op(journal_path, "text-correction", actor=actor,
@@ -612,7 +623,11 @@ async def commit_text_correction(
                               args={"source_id": source_id, "segment_id": segment_id,
                                     "new_text": new_text, "old_text": old_text,
                                     "supersedes_id": supersedes_id,
-                                    "canonical_form": canonical_form},
+                                    "canonical_form": canonical_form,
+                                    **({"rationale": rationale} if rationale else {}),
+                                    **({"proposal_id": proposal_id,
+                                        "proposal_set_id": proposal_set_id}
+                                       if proposal_id else {})},
                               anchor=await segment_anchor(queue, graph_id, [segment_id]),
                               nodes=[node], edges=edges, op_id=node["id"])
     await record_review_markers(queue, graph_id, session_id, [(segment_id, "corrected")],
