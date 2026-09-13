@@ -53,6 +53,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `active_speaker_assignments` _function_ — Project the ACTIVE speaker assignment per segment (latest-wins).
 - `active_speech_overlays` _function_ — The surviving speech-overlay corrections (supersession applied; pure).
 - `aggregate_session_purposes` _function_ — Fold sessions into a per-source purpose mix (pure; d915d545 picker rung).
+- `annotate_retired` _function_ — Mark spine rows with their retirement state (pure).
 - `apply_chunk_inserts` _function_ — Synthesize inserted chunks into the effective spine (DEC 3d3fa2a8).
 - `apply_time_nudges` _function_ — Apply timing corrections onto segment times (latest-wins per edge).
 - `bench_event_proposals` _function_ — The reserved-tail bench join (leg 4, DECs 8e05b87b + 8cf12c22) — pure.
@@ -91,6 +92,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `correction_stats` _function_ — Fold one Source's ACTIVE overlay into flywheel-accounting counts (pure).
 - `corrections_to_edits` _function_ — Map this core's Correction payloads onto the layer's spine-edit vocabulary.
 - `count_source_segments` _function_ — Count a Source's segments server-side under its chosen rendition + skeleton (typed count mode).
+- `default_spine` _function_ — Which spine opens by default (pure; ruling a7617bd4 rule (c)): preference is a
 - `extract_spine_dataset` _function_ — Fold ONE spine's overlay into its v1 insert-span dataset slice (pure).
 - `fa_words_for_transcript` _function_ — One transcript's FA words in source coordinates (the scan-mishomed join,
 - `find_active_text_correction` _function_ — Single-segment convenience over the batch read (cross-session; latest wins).
