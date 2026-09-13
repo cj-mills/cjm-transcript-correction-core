@@ -79,10 +79,11 @@ def spine_label(
     spines show their policy tag + a hash prefix (the persisted selector value
     stays the FULL hash — see selector_for_spine)."""
     h = spine.get("skeleton_hash")
+    suffix = " · retired" if spine.get("retired") else ""
     if not h:
-        return "vad-only (pre-split)"
+        return "vad-only (pre-split)" + suffix
     tag = spine.get("split_policy") or "vad-only"
-    return f"{tag} · {str(h).split(':')[-1][:8]}"
+    return f"{tag} · {str(h).split(':')[-1][:8]}{suffix}"
 
 
 def selector_for_spine(

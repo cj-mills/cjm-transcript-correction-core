@@ -1213,9 +1213,10 @@ async def _list_spines(
     the prop existed); it sorts first so pickers show it as the incumbent.
     """
     q = _spine_query(rendition_ids, order_by=None,
-                     project=["skeleton_hash", "split_policy", "created_at"])
+                     project=["skeleton_hash", "split_policy", "created_at", "source_id"])
     res = await graph_task(queue, graph_id, "query_nodes", query=q.to_dict())
     groups: Dict[Optional[str], Dict[str, Any]] = {}
+    source_ids: set = set()
     for r in (res.rows or []):
         key = r.get("skeleton_hash")
         g = groups.setdefault(key, {"skeleton_hash": key, "split_policy": None,
@@ -1226,9 +1227,62 @@ async def _list_spines(
         c = float(r.get("created_at") or 0.0)
         if c and (not g["created_at"] or c < g["created_at"]):
             g["created_at"] = c   # spine birth = its oldest segment's stamp
-    return sorted(groups.values(),
-                  key=lambda g: (g["skeleton_hash"] is not None,
-                                 g["skeleton_hash"] or ""))
+        if r.get("source_id"):
+            source_ids.add(r["source_id"])
+    # Retirement facts (ruling a7617bd4) live on the Source node's `retired_spines`
+    # map, keyed by skeleton hash (LEGACY_SKELETON for the pre-split spine): one
+    # get per listing annotates every row, so pickers/loaders can skip retired
+    # spines and `spine_where_for` can auto-select the sole LIVE one.
+    retired: Dict[str, Dict[str, Any]] = {}
+    for sid in sorted(source_ids):
+        node = await graph_task(queue, graph_id, "get_node", node_id=sid)
+        props = ((node.to_dict() if isinstance(node, GraphNode) else node) or {}).get("properties") or {}
+        for k, v in (props.get(RETIRED_SPINES_PROP) or {}).items():
+            if isinstance(v, dict):
+                retired[str(k)] = dict(v)
+    return annotate_retired(sorted(groups.values(),
+                                   key=lambda g: (g["skeleton_hash"] is not None,
+                                                  g["skeleton_hash"] or "")), retired)
+
+
+RETIRED_SPINES_PROP = "retired_spines"  # Source-node property carrying the retirement map (decomp core's spine-retire fact)
+
+
+def annotate_retired(
+    spines: List[Dict[str, Any]],        # _list_spines rows
+    retired: Dict[str, Dict[str, Any]],  # The Source's retirement map ({hash | "legacy": entry})
+) -> List[Dict[str, Any]]:  # The rows + retired / retired_reason / successor / retired_ts / compacted
+    """Mark spine rows with their retirement state (pure)."""
+    out = []
+    for s in spines:
+        r = dict(s)
+        e = retired.get(s.get("skeleton_hash") or LEGACY_SKELETON)
+        r["retired"] = e is not None
+        r["retired_reason"] = (e or {}).get("reason")
+        r["successor"] = (e or {}).get("successor")
+        r["retired_ts"] = (e or {}).get("ts")
+        r["compacted"] = bool((e or {}).get("compacted"))
+        out.append(r)
+    return out
+
+
+def default_spine(
+    spines: List[Dict[str, Any]],  # Annotated _list_spines rows
+) -> Optional[Dict[str, Any]]:  # Rule (c): the most recently declared successor, else the newest live spine
+    """Which spine opens by default (pure; ruling a7617bd4 rule (c)): preference is a
+    DECLARED fact, never creation order — the successor named by the most recent
+    retirement wins when it is live; otherwise the newest live spine; None when
+    every spine is retired."""
+    live = [s for s in spines if not s.get("retired")]
+    if not live:
+        return None
+    by_key = {(s.get("skeleton_hash") or LEGACY_SKELETON): s for s in live}
+    declared = sorted(((float(s.get("retired_ts") or 0.0), s.get("successor"))
+                       for s in spines if s.get("retired") and s.get("successor")), reverse=True)
+    for _, succ in declared:
+        if succ in by_key:
+            return by_key[succ]
+    return max(live, key=lambda s: float(s.get("created_at") or 0.0))
 
 
 async def list_source_spines(
@@ -1281,14 +1335,27 @@ def spine_where_for(
     def _label(s: Dict[str, Any]) -> str:
         h = s["skeleton_hash"]
         tag = s.get("split_policy") or ("vad-only" if h else LEGACY_SKELETON)
-        return f"{tag}:{h.split(':')[-1][:8]}" if h else tag
+        base = f"{tag}:{h.split(':')[-1][:8]}" if h else tag
+        return base + (" (retired)" if s.get("retired") else "")
 
     if selector is None:
         if len(spines) <= 1:
             return []
+        # Retired spines (ruling a7617bd4) coexist on the graph until compaction, so
+        # auto scopes to the sole LIVE spine — an unfiltered read would MIX them.
+        live = [s for s in spines if not s.get("retired")]
+        if len(live) == 1:
+            h = live[0]["skeleton_hash"]
+            return ([PropertyPredicate("skeleton_hash", "eq", h)] if h
+                    else [PropertyPredicate("skeleton_hash", "is_null")])
+        if not live:
+            raise ValueError(
+                f"every spine under this rendition is retired "
+                f"({', '.join(_label(s) for s in spines)}); pass --skeleton to read one anyway, "
+                f"or unretire / decompose a successor")
         raise ValueError(
-            f"{len(spines)} spines coexist under this rendition "
-            f"({', '.join(_label(s) for s in spines)}); pass --skeleton "
+            f"{len(live)} live spines coexist under this rendition "
+            f"({', '.join(_label(s) for s in live)}); pass --skeleton "
             f"('{LEGACY_SKELETON}' or a hash prefix) to choose one")
     sel = selector.strip().lower()
     if sel == LEGACY_SKELETON:

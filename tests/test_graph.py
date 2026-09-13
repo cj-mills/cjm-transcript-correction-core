@@ -1050,3 +1050,43 @@ def test_extract_spine_dataset_overlay_cuts():
     # negatives derive from speech + insert spans only — the overlay at
     # 0.5-0.9 sits inside speech [0,2] and must not re-shape the gaps
     assert out["negatives"] == [{"start_time": 2.0, "end_time": 5.0}]
+
+
+def test_spine_where_for_skips_retired_spines_and_default_spine_rule_c():
+    # ruling a7617bd4: retired spines coexist until compaction — auto scopes to the sole LIVE one.
+    from cjm_transcript_correction_core.graph import annotate_retired, default_spine
+    old = {"skeleton_hash": "sha256:0ld0ld0ld", "split_policy": "sentence-split/capability",
+           "segments": 1000, "created_at": 20.0}
+    new = {"skeleton_hash": "sha256:n3wn3wn3w", "split_policy": "sentence-split/capability",
+           "segments": 1020, "created_at": 40.0}
+    legacy = {"skeleton_hash": None, "split_policy": None, "segments": 900, "created_at": 10.0}
+    # the NEWEST spine retired with the OLDER one declared successor (rule (a): any age, any successor)
+    rows = annotate_retired([legacy, old, new],
+                            {"sha256:n3wn3wn3w": {"reason": "prefer previous", "successor": "sha256:0ld0ld0ld", "ts": 5.0},
+                             LEGACY_SKELETON: {"reason": "pre-split", "ts": 4.0}})
+    assert [r["retired"] for r in rows] == [True, False, True]
+    [p] = spine_where_for(rows)
+    assert (p.prop, p.op, p.value) == ("skeleton_hash", "eq", "sha256:0ld0ld0ld")
+    assert default_spine(rows)["skeleton_hash"] == "sha256:0ld0ld0ld"
+    # the sole live spine being the legacy one scopes with is_null
+    rows2 = annotate_retired([legacy, old], {"sha256:0ld0ld0ld": {"reason": "x"}})
+    [p2] = spine_where_for(rows2)
+    assert (p2.prop, p2.op) == ("skeleton_hash", "is_null")
+    # all retired: auto refuses naming the roster; explicit selector still reads
+    rows3 = annotate_retired([old, new], {"sha256:0ld0ld0ld": {"reason": "x"}, "sha256:n3wn3wn3w": {"reason": "y"}})
+    try:
+        spine_where_for(rows3)
+        assert False, "all-retired auto must refuse"
+    except ValueError as e:
+        assert "retired" in str(e)
+    assert default_spine(rows3) is None
+    [p3] = spine_where_for(rows3, "n3w")
+    assert p3.value == "sha256:n3wn3wn3w"
+    # two live spines still refuse (the f1024568 hazard), listing only the live ones
+    rows4 = annotate_retired([legacy, old, new], {LEGACY_SKELETON: {"reason": "x"}})
+    try:
+        spine_where_for(rows4)
+        assert False
+    except ValueError as e:
+        assert "2 live spines" in str(e) and "legacy" not in str(e).split("(")[1]
+    assert default_spine(rows4)["skeleton_hash"] == "sha256:n3wn3wn3w"  # no declaration: newest live
