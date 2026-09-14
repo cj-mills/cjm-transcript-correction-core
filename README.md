@@ -22,6 +22,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 
 ### `cjm_transcript_correction_core.cli`
 
+- `attention_command` _function_ — Execute `attention`: the walk-lane ATTENTION TIER (item 3758f6cb, ruling f400d2c3)
 - `bench_command` _function_ — Execute the `bench` subcommand: the reserved-tail verdict join.
 - `build_parser` _function_ — Build the CLI parser (subcommands: run, review).
 - `commit_wordless_transfer` _function_ — COMMIT a planned transfer — the engine's second half. One
@@ -93,6 +94,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `corrections_to_edits` _function_ — Map this core's Correction payloads onto the layer's spine-edit vocabulary.
 - `count_source_segments` _function_ — Count a Source's segments server-side under its chosen rendition + skeleton (typed count mode).
 - `default_spine` _function_ — Which spine opens by default (pure; ruling a7617bd4 rule (c)): preference is a
+- `discharge_mark` _function_ — Discharge an open mark BY THE CORRECTION THAT ADDRESSED IT — the closure
 - `extract_spine_dataset` _function_ — Fold ONE spine's overlay into its v1 insert-span dataset slice (pure).
 - `fa_words_for_transcript` _function_ — One transcript's FA words in source coordinates (the scan-mishomed join,
 - `find_active_text_correction` _function_ — Single-segment convenience over the batch read (cross-session; latest wins).
@@ -170,6 +172,11 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 
 ### `cjm_transcript_correction_core.signals`
 
+- `attention_boundary_marks` _function_ — The boundary signals of the attention tier (item 3758f6cb signals 3 + the folded
+- `attention_divergence_marks` _function_ — The two-transcriber disagreement signal of the attention tier (item 3758f6cb signal
+- `attention_fa_marks` _function_ — The forced-alignment signals of the attention tier (item 3758f6cb signal 1), pure.
+- `attention_marks` _function_ — Compose the attention tier (item 3758f6cb): every enabled signal's mark rows,
+- `attention_speaker_marks` _function_ — The next-speaker-change landmark of the folded item 65791933, pure: `speaker-change`
 - `boundary_punct_caps_flags` _function_ — Bidirectional boundary punctuation/capitalization heuristics (in-segment only).
 - `cluster_variants` _function_ — Cluster word variants by phonetic key + edit distance (fix-one-fix-all).
 - `compute_signal_flags` _function_ — Combine all deterministic Tier-1 signals into per-segment flags.

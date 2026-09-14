@@ -10,6 +10,7 @@ import sqlite3
 import textwrap
 import time
 import uuid
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,22 +20,26 @@ from cjm_context_graph_primitives.query import NodeQuery
 from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
 from cjm_substrate.core.workspace import relativize_recorded, resolve_workspace
-from cjm_transcript_correction_core.graph import (bench_event_proposals,
+from cjm_transcript_correction_core.graph import (active_corrections, bench_event_proposals,
                                                   commit_chunk_insert_correction,
                                                   commit_chunk_split_correction,
                                                   commit_extraction_gate, commit_mark_correction,
-                                                  commit_stratum_correction,
+                                                  commit_mark_dismissal, commit_stratum_correction,
                                                   commit_stratum_retraction, commit_text_correction,
                                                   correction_stats, extract_spine_dataset,
-                                                  labeled_insert_spans, list_source_spines,
-                                                  load_extraction_gates, load_source_corrections,
-                                                  load_source_segments, project_effective_spine,
+                                                  fa_words_for_transcript, labeled_insert_spans,
+                                                  list_source_spines, load_extraction_gates,
+                                                  load_source_corrections, load_source_segments,
+                                                  load_variant_texts, mark_anchor_segments,
+                                                  open_marks, project_effective_spine,
                                                   set_session_status, skeleton_hash_for,
                                                   start_session)
 from cjm_transcript_correction_core.models import CorrectionConfig, DatasetManifest, new_dataset_id
 from cjm_transcript_correction_core.pipeline import (load_decomp_manifest, resolve_graph_db_path,
                                                      run_correction, run_review)
-from cjm_transcript_correction_core.signals import (EVENT_PROPOSAL_SET_FORMAT,
+from cjm_transcript_correction_core.signals import (ATTENTION_ACTOR, ATTENTION_DEFAULT_SIGNALS,
+                                                    attention_marks, ATTENTION_SIGNALS,
+                                                    ATTENTION_THRESHOLDS, EVENT_PROPOSAL_SET_FORMAT,
                                                     load_event_proposal_set)
 from cjm_transcript_correction_core.strata import (active_strata, bench_filter_proposals,
                                                    build_filter_pack, FILTER_LANE,
@@ -318,6 +323,42 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
     scan.add_argument("--strict", action="store_true",
                       help="Exit nonzero when any mis-homed word is found (CI/QA gate mode)")
     scan.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
+
+    # ---- attention: the walk-lane attention tier (item 3758f6cb, ruling f400d2c3) ----
+    att = sub.add_parser(
+        "attention",
+        help="Derive walk-lane ATTENTION marks over one spine from the signals already in the "
+             "stack (forced alignment, two-transcriber disagreement, event inserts, diarization "
+             "turns; no model) so the human listens only where flagged — lists by default, "
+             "--commit lands them as marks the app's n/N jump walks")
+    _add_graph_read_args(att)
+    att.add_argument("--source", required=True,
+                     help="Source node id or title substring (exactly one match)")
+    att.add_argument("--rendition", default=None,
+                     help="Which AudioRendition spine when a source has more than one")
+    att.add_argument("--skeleton", default=None,
+                     help="Which spine (\"legacy\" or a skeleton-hash prefix; default: auto, loud when several)")
+    att.add_argument("--signals", default=None,
+                     help="Comma list of signals to derive (known: " + ",".join(ATTENTION_SIGNALS)
+                          + "; default: " + ",".join(ATTENTION_DEFAULT_SIGNALS) + " — speaker is opt-in)")
+    att.add_argument("--threshold", action="append", default=None, metavar="KEY=VALUE",
+                     help="Override a threshold (keys: " + ", ".join(ATTENTION_THRESHOLDS) + ")")
+    att.add_argument("--fa-cache-db", default=None,
+                     help="Forced-alignment cache db (default: the workspace's qwen3-forced-aligner data dir)")
+    att.add_argument("--turns", default=None,
+                     help="Diarization turns JSON (default: <workspace>/diarization/<source content hash>.json)")
+    att.add_argument("--limit", type=int, default=60,
+                     help="Rows to print when listing (0 = all)")
+    att.add_argument("--from", dest="from_s", type=float, default=None, metavar="SECONDS",
+                     help="Only rows at or after this source second — and, with --clear, only open tier "
+                          "marks there are dismissed (re-land the unwalked remainder, never re-flag handled segments)")
+    att.add_argument("--to", dest="to_s", type=float, default=None, metavar="SECONDS",
+                     help="Only rows (and --clear dismissals) before this source second")
+    att.add_argument("--commit", action="store_true",
+                     help="Land the derived rows as mark Corrections (journal-first; idempotent by class+anchor)")
+    att.add_argument("--clear", action="store_true",
+                     help="With --commit: first dismiss every open attention-tier mark on the source")
+    att.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
 
     # ---- the filtering lane (DECs 304fd984 + 9d4c0a38; pass 1 runs HEADLESS per
     # bc8dbbdd: pack -> proposer -> ingest -> confirm, journal-first) ----------
@@ -612,6 +653,8 @@ def main(
         return asyncio.run(export_command(args))
     if args.command == "scan-mishomed":
         return asyncio.run(scan_command(args))
+    if args.command == "attention":
+        return asyncio.run(attention_command(args))
     if args.command == "filter-pack":
         return asyncio.run(filter_pack_command(args))
     if args.command == "filter-ingest":
@@ -2274,6 +2317,139 @@ async def scan_command(
         except Exception as e:  # Best-effort teardown; never mask the scan outcome
             logger.warning(f"unload {args.graph_capability} failed: {e}")
     return 0
+
+
+async def attention_command(
+    args: argparse.Namespace,  # Parsed args for the `attention` subcommand
+) -> int:  # Process exit code
+    """Execute `attention`: the walk-lane ATTENTION TIER (item 3758f6cb, ruling f400d2c3)
+    — derive marks over one spine from the signals already in the stack (forced
+    alignment, two-transcriber disagreement, event inserts, diarization turns; no model)
+    so the human listens only where flagged. Without --commit it LISTS the rows; with
+    --commit it lands each row as a mark Correction (actor capability:attention-tier,
+    journal-first, under a fresh session purposed 'attention-tier') that the correction
+    app's n/N mark-jump walks. Idempotent: a row whose (class, anchor) already has an
+    open tier mark is skipped; --clear first dismisses every open tier mark on the
+    source (a re-run after thresholds change). Signals whose input is missing degrade
+    to off with a printed note, never a refusal."""
+    ws, manager, queue = await _open_graph_stack(args)
+    cap = args.graph_capability
+    try:
+        sid, title, _media = await resolve_source_node(queue, cap, args.source)
+        segs = await load_source_segments(queue, cap, sid, rendition_selector=args.rendition,
+                                          skeleton_selector=args.skeleton)
+        if not segs:
+            raise SystemExit("empty spine (0 segments)")
+        corrections, superseded = await load_source_corrections(queue, cap, sid)
+        active = active_corrections(corrections, superseded)
+        effective = project_effective_spine(segs, active)
+        events = [{"start": float(p.get("start_time") or 0.0), "end": float(p.get("end_time") or 0.0),
+                   "label": str(p.get("label") or "")}
+                  for c in active for p in [c.get("payload") or {}]
+                  if c.get("correction_type") == "insertion" and p.get("operation") == "chunk_insert"]
+        signals = [s.strip() for s in (args.signals or "").split(",") if s.strip()] or None
+        want = set(signals or ATTENTION_DEFAULT_SIGNALS)
+        fa_words: Optional[List[Dict[str, Any]]] = None
+        if want & {"fa", "cut"}:
+            fa_cache = (Path(args.fa_cache_db) if args.fa_cache_db
+                        else (ws.substrate_data_dir / "data" / "cjm-capability-qwen3-forced-aligner"
+                              / "forced_alignments.db" if ws is not None else None))
+            if fa_cache is not None and fa_cache.is_file():
+                fa_words, misses, tids = [], 0, sorted({s.text_from for s in segs if s.text_from})
+                for tid in tids:
+                    w = await fa_words_for_transcript(queue, cap, tid, fa_cache)
+                    if w is None:
+                        misses += 1
+                    else:
+                        fa_words.extend(w)
+                print(f"forced alignment: {len(fa_words)} words from {len(tids) - misses} of {len(tids)} "
+                      f"chunk transcript(s)" + (f" ({misses} cache miss(es))" if misses else ""))
+            else:
+                print(f"forced alignment: cache not found ({fa_cache}) — fa/cut signals off")
+        variants = await load_variant_texts(queue, cap, segs) if "divergence" in want else None
+        turns: Optional[List[Dict[str, Any]]] = None
+        if "speaker" in want:
+            tp = Path(args.turns) if args.turns else None
+            if tp is None and ws is not None:
+                h = await _source_content_hash(queue, cap, sid)
+                if h:
+                    tp = ws.root / "diarization" / f"{h.replace(':', '-')}.json"
+            if tp is not None and tp.is_file():
+                doc = json.loads(tp.read_text())
+                turns = list(doc.get("turns") or []) if isinstance(doc, dict) else list(doc)
+                print(f"diarization: {len(turns)} turns from {tp.name}")
+            else:
+                print(f"diarization turns not found ({tp}) — speaker signal off")
+        thresholds: Dict[str, float] = {}
+        for spec in (args.threshold or []):
+            k, _, v = spec.partition("=")
+            if not k.strip() or not v.strip():
+                raise SystemExit(f"--threshold needs KEY=VALUE, got {spec!r}")
+            thresholds[k.strip()] = float(v)
+        rows = attention_marks(effective, fa_words=fa_words, variants=variants, events=events,
+                               turns=turns, signals=signals, thresholds=thresholds)
+        lo = float(args.from_s or 0.0)
+        hi = float(args.to_s) if args.to_s is not None else None
+        if lo > 0.0 or hi is not None:
+            rows = [r for r in rows if float(r["t"]) >= lo and (hi is None or float(r["t"]) < hi)]
+        seg_start = {s.id: float(s.start_time) for s in effective if s.start_time is not None}
+
+        def _in_window(m: Dict[str, Any]) -> bool:  # a mark is in the window when its earliest anchored segment is
+            try:
+                ts = [seg_start[a] for a in mark_anchor_segments((m.get("payload") or {}).get("anchor") or {})
+                      if a in seg_start]
+            except ValueError:
+                return False
+            return bool(ts) and min(ts) >= lo and (hi is None or min(ts) < hi)
+        tier_open = [m for m in open_marks(corrections, superseded) if m.get("actor") == ATTENTION_ACTOR]
+        have = set()
+        for m in tier_open:
+            p = m.get("payload") or {}
+            try:
+                have.add(f"{p.get('mark_class')}@{'|'.join(mark_anchor_segments(p.get('anchor') or {}))}")
+            except ValueError:
+                continue
+        new = [r for r in rows if r["key"] not in have]
+        by_class = Counter(r["mark_class"] for r in rows)
+        print(f"source: {title or sid}  ({sid}) · {len(effective)} effective segments · "
+              f"{len(events)} event insert(s) · signals {','.join(sorted(want))}")
+        print("derived: " + " · ".join(f"{k} {v}" for k, v in sorted(by_class.items()))
+              + f" · total {len(rows)}"
+              + (f" · already open {len(rows) - len(new)}" if len(rows) != len(new) else "")
+              + (f" · open tier marks on the source {len(tier_open)}" if tier_open else ""))
+        if not args.commit:
+            shown = rows[:args.limit] if args.limit else rows
+            for r in shown:
+                print(f"  {r['t']:9.2f}s  {r['mark_class']:>20}  {r['rationale']}")
+            if len(shown) < len(rows):
+                print(f"  … {len(rows) - len(shown)} more (--limit 0 shows all)")
+            print("(listing only — --commit lands these as marks; --clear dismisses open tier marks first)")
+            return 0
+        db = _resolve_graph_db(args, manager, cap, ws)
+        jp = sidecar_journal_path(db)
+        sess = await start_session(queue, cap, [sid], journal_path=jp, purpose="attention-tier",
+                                   actor=ATTENTION_ACTOR)
+        dismissed = 0
+        if args.clear:
+            for m in tier_open:
+                if not _in_window(m):
+                    continue   # --clear honours --from/--to: segments already walked keep their marks
+                await commit_mark_dismissal(queue, cap, sid, m["id"], sess.id, actor=ATTENTION_ACTOR,
+                                            note="attention tier re-run (--clear)", journal_path=jp)
+                dismissed += 1
+            new = rows
+        landed = 0
+        for r in new:
+            await commit_mark_correction(queue, cap, sid, r["anchor"], r["mark_class"], sess.id,
+                                         actor=ATTENTION_ACTOR, note=r["rationale"], journal_path=jp)
+            landed += 1
+        await set_session_status(queue, cap, sess.id, "completed", journal_path=jp, actor=ATTENTION_ACTOR)
+        print(f"landed {landed} mark(s)" + (f", dismissed {dismissed}" if dismissed else "")
+              + f" · session {sess.id}")
+        print(f"journal: {jp}")
+        return 0
+    finally:
+        await _close_graph_stack(manager, queue, cap)
 
 
 async def run_extract(

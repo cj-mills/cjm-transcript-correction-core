@@ -1,10 +1,11 @@
 """Pure deterministic Tier-1 signal functions (no capability calls): empty-segment detection, bidirectional boundary punctuation/capitalization heuristics, forced-alignment coverage flags, positional cross-transcriber diff, phonetic + edit-distance variant clustering, and the event-proposal overlay (leg 4: the finetuned detector's spans anchored onto the spine). The worklist is recomputed from these each session; revolution-1 builds ZERO new capabilities."""
 
+import difflib
 import json
 import re
 from bisect import bisect_right
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from cjm_transcript_correction_core.models import SpineSegment
 
@@ -262,6 +263,341 @@ def speaker_turn_proposals(
     return out
 
 
+def attention_fa_marks(
+    segments: List[SpineSegment],       # Effective spine (source-coordinate times), text-bearing segments considered
+    fa_words: List[Dict[str, Any]],     # Aligned words in SOURCE seconds: [{"s", "e", "text"}], any order
+    events: Optional[List[Dict[str, Any]]] = None,  # Active event inserts [{"start", "end", "label"}] (inhale, noise ...)
+    thresholds: Optional[Dict[str, float]] = None,  # Overrides of ATTENTION_THRESHOLDS
+) -> List[Dict[str, Any]]:  # Mark rows: {"mark_class", "anchor", "t", "rationale", "key"}
+    """The forced-alignment signals of the attention tier (item 3758f6cb signal 1), pure.
+
+    Four classes, each a mechanical boundary-shift / nudge / omission candidate the
+    walk lane otherwise finds only by listening: `fa-mid-word-boundary` — a boundary
+    between two text-bearing segments falls INSIDE an aligned word (past `word_margin_s`
+    from its edges; boundary anchor); `fa-stretched-word` — the word around the boundary
+    is `stretch_s` or longer, i.e. the aligner absorbed untranscribed audio (a breath, a
+    dropped 'uh') and the transcript is missing something beside the boundary; `fa-trailing-audio` / `fa-leading-audio` — a
+    segment's audio runs on for `tail_s` after the last aligned speech in it (or before
+    the first) with no event insert explaining the stretch (segment anchor: text the
+    transcriber may have dropped). Aligned speech is measured by OVERLAP clipped to the
+    segment, so a word straddling a boundary counts on both sides and never fakes a tail."""
+    th = {**ATTENTION_THRESHOLDS, **(thresholds or {})}
+    words = sorted((w for w in (fa_words or []) if w.get("s") is not None and w.get("e") is not None),
+                   key=lambda w: float(w["s"]))
+    starts = [float(w["s"]) for w in words]
+    evs = sorted(((float(e.get("start") or 0.0), float(e.get("end") or 0.0), str(e.get("label") or ""))
+                  for e in (events or [])), key=lambda e: e[0])
+
+    def _covered(a: float, b: float) -> float:  # seconds of [a, b] an event insert covers
+        return sum(max(0.0, min(b, ee) - max(a, es)) for es, ee, _ in evs if es < b and ee > a)
+
+    def _word_at(t: float) -> Optional[Dict[str, Any]]:  # the word strictly containing t (past the margin)
+        i = bisect_right(starts, t) - 1
+        while i >= 0 and float(words[i]["s"]) > t - 5.0:   # words are short: a few seconds back is enough
+            w = words[i]
+            if float(w["s"]) + th["word_margin_s"] < t < float(w["e"]) - th["word_margin_s"]:
+                return w
+            i -= 1
+        return None
+
+    rows: List[Dict[str, Any]] = []
+    timed = [s for s in segments if s.start_time is not None and s.end_time is not None
+             and (s.text or "").strip()]
+    for a, b in zip(timed, timed[1:]):
+        for t, side in ((float(a.end_time), "left"), (float(b.start_time), "right")):
+            w = _word_at(t)
+            if w is None:
+                continue
+            ws_, we_ = float(w["s"]), float(w["e"])
+            if we_ - ws_ >= th["stretch_s"]:
+                # A word this long is the aligner ABSORBING untranscribed audio (a breath, a
+                # dropped 'uh') — the boundary is not in the word, the transcript is missing
+                # something beside it (first-walk sighting: 'performance' 1.28 s over an inhale + 'uh').
+                rows.append({"mark_class": "fa-stretched-word",
+                             "anchor": {"kind": "boundary", "boundary_after": a.id, "right_segment_id": b.id},
+                             "t": t,
+                             "rationale": f"aligned word '{w.get('text', '')}' spans {ws_:.2f}-{we_:.2f}s "
+                                          f"({we_ - ws_:.2f}s) across the boundary at {t:.2f}s — the aligner "
+                                          f"absorbed untranscribed audio: listen for a missing word or breath",
+                             "key": f"fa-stretched-word@{a.id}|{b.id}"})
+                break
+            rows.append({"mark_class": "fa-mid-word-boundary",
+                         "anchor": {"kind": "boundary", "boundary_after": a.id, "right_segment_id": b.id},
+                         "t": t,
+                         "rationale": f"boundary at {t:.2f}s ({side} edge) falls inside aligned word "
+                                      f"'{w.get('text', '')}' {ws_:.2f}-{we_:.2f}s",
+                         "key": f"fa-mid-word-boundary@{a.id}|{b.id}"})
+            break   # one mark per boundary
+    for s in timed:
+        s0, s1 = float(s.start_time), float(s.end_time)
+        lo = bisect_right(starts, s0 - 10.0)
+        over = [w for w in words[lo:] if float(w["s"]) < s1 and float(w["e"]) > s0]
+        if not over:
+            continue
+        covered_end = max(min(float(w["e"]), s1) for w in over)
+        covered_start = min(max(float(w["s"]), s0) for w in over)
+        last_w = max(over, key=lambda w: float(w["e"]))
+        first_w = min(over, key=lambda w: float(w["s"]))
+        tail = s1 - covered_end
+        if tail >= th["tail_s"] and _covered(covered_end, s1) < tail * 0.5:
+            rows.append({"mark_class": "fa-trailing-audio",
+                         "anchor": {"kind": "segment", "segment_id": s.id}, "t": covered_end,
+                         "rationale": f"{tail:.2f}s of audio after the last aligned word "
+                                      f"'{last_w.get('text', '')}' ({covered_end:.2f}s) before the segment ends "
+                                      f"at {s1:.2f}s — no event insert explains it",
+                         "key": f"fa-trailing-audio@{s.id}"})
+        lead = covered_start - s0
+        if lead >= th["tail_s"] and _covered(s0, covered_start) < lead * 0.5:
+            rows.append({"mark_class": "fa-leading-audio",
+                         "anchor": {"kind": "segment", "segment_id": s.id}, "t": s0,
+                         "rationale": f"{lead:.2f}s of audio from the segment start ({s0:.2f}s) before the "
+                                      f"first aligned word '{first_w.get('text', '')}' ({covered_start:.2f}s) — "
+                                      f"no event insert explains it",
+                         "key": f"fa-leading-audio@{s.id}"})
+    return rows
+
+
+def attention_boundary_marks(
+    segments: List[SpineSegment],       # Effective spine (source-coordinate times)
+    events: Optional[List[Dict[str, Any]]] = None,  # Active event inserts [{"start", "end", "label"}]
+    fa_words: Optional[List[Dict[str, Any]]] = None,  # Aligned words in SOURCE seconds (gap + cut signals)
+    thresholds: Optional[Dict[str, float]] = None,  # Overrides of ATTENTION_THRESHOLDS
+) -> List[Dict[str, Any]]:  # Mark rows: {"mark_class", "anchor", "t", "rationale", "key"}
+    """The boundary signals of the attention tier (item 3758f6cb signals 1+3 and the folded
+    65791933 Tier-1 flags), pure. Over consecutive TEXT-BEARING segments: `speech-in-gap`
+    — aligned words lie WHOLLY inside the gap between two segments (the fold homed text
+    into a neighbour whose audio lacks it: VAD-missed speech or a stray carve — the
+    scan-mishomed shape at the walk lane's grain; a word straddling the gap's edge is the
+    mid-word boundary's finding, not this one, and a word an event insert mostly covers is
+    the breath the aligner absorbed, not speech — first-walk sighting, an inhale flagged
+    as 'to'); `unexplained-gap` — a gap of `gap_s` or more that
+    event inserts cover under half of (a long silence nothing explains); `segment-overlap`
+    — the times cross by more than `overlap_s`; `cut-in-speech` — a gap below `cut_gap_s`
+    with no event insert within `event_reach_s` and aligned speech within `cut_word_s` on
+    BOTH sides (a boundary cut through continuous speech — the breath structure says no
+    pause was here); `numeral-adjacency` — a number ends the left text or starts the right
+    (the boundary that splits a figure from its unit)."""
+    th = {**ATTENTION_THRESHOLDS, **(thresholds or {})}
+    evs = sorted(((float(e.get("start") or 0.0), float(e.get("end") or 0.0), str(e.get("label") or ""))
+                  for e in (events or [])), key=lambda e: e[0])
+    ws = sorted(((float(w["s"]), float(w["e"]), str(w.get("text") or "")) for w in (fa_words or [])
+                 if w.get("s") is not None and w.get("e") is not None), key=lambda p: p[0])
+    w_ends = sorted(e for _, e, _ in ws)
+    w_starts = [s for s, _, _ in ws]
+    num_tail = re.compile(r"(\d[\d,.]*)\s*[%$]?[\"')\]]*$")
+    num_head = re.compile(r"^[\"'(\[]*[$€£]?\d")
+
+    def _covered(a: float, b: float) -> float:
+        return sum(max(0.0, min(b, ee) - max(a, es)) for es, ee, _ in evs if es < b and ee > a)
+
+    def _event_near(t: float) -> bool:
+        r = th["event_reach_s"]
+        return any(es - r <= t <= ee + r for es, ee, _ in evs)
+
+    def _words_in(a: float, b: float) -> List[str]:  # words lying WHOLLY inside (a, b) — a straddler is mid-word's finding
+        tol = th["overlap_s"]
+        lo = bisect_right(w_starts, a - tol)
+        out: List[str] = []
+        for i in range(lo, len(ws)):
+            s, e, text = ws[i]
+            if s >= b:
+                break
+            if s >= a - tol and e <= b + tol and _covered(s, e) < 0.5 * max(e - s, 1e-6):
+                out.append(text)   # a word an event insert (inhale …) mostly covers is the breath the aligner absorbed
+        return out
+
+    def _word_end_before(t: float) -> Optional[float]:
+        i = bisect_right(w_ends, t) - 1
+        return w_ends[i] if i >= 0 else None
+
+    def _word_start_after(t: float) -> Optional[float]:
+        i = bisect_right(w_starts, t)
+        return w_starts[i] if i < len(w_starts) else None
+
+    rows: List[Dict[str, Any]] = []
+    timed = [s for s in segments if s.start_time is not None and s.end_time is not None
+             and (s.text or "").strip()]
+    for a, b in zip(timed, timed[1:]):
+        a_end, b_start = float(a.end_time), float(b.start_time)
+        anchor = {"kind": "boundary", "boundary_after": a.id, "right_segment_id": b.id}
+        gap = b_start - a_end
+        if gap < -th["overlap_s"]:
+            rows.append({"mark_class": "segment-overlap", "anchor": anchor, "t": b_start,
+                         "rationale": f"segments overlap by {-gap:.2f}s ({b_start:.2f}s starts before "
+                                      f"{a_end:.2f}s ends)",
+                         "key": f"segment-overlap@{a.id}|{b.id}"})
+        elif gap >= th["gap_word_s"] and ws:
+            inside = _words_in(a_end, b_start)
+            if inside:
+                rows.append({"mark_class": "speech-in-gap", "anchor": anchor, "t": a_end,
+                             "rationale": f"{len(inside)} aligned word(s) inside the {gap:.2f}s gap "
+                                          f"{a_end:.2f}-{b_start:.2f}s: '{' '.join(inside)[:60]}'",
+                             "key": f"speech-in-gap@{a.id}|{b.id}"})
+        if gap >= th["gap_s"]:
+            cov = _covered(a_end, b_start)
+            if cov < gap * 0.5:
+                rows.append({"mark_class": "unexplained-gap", "anchor": anchor, "t": a_end,
+                             "rationale": f"{gap:.2f}s gap {a_end:.2f}-{b_start:.2f}s between text-bearing "
+                                          f"segments; event inserts cover {cov:.2f}s of it",
+                             "key": f"unexplained-gap@{a.id}|{b.id}"})
+        elif ws and 0.0 <= gap < th["cut_gap_s"] and not _event_near(a_end):
+            we, wsn = _word_end_before(a_end + th["cut_word_s"]), _word_start_after(b_start - th["cut_word_s"])
+            if (we is not None and a_end - we <= th["cut_word_s"]
+                    and wsn is not None and wsn - b_start <= th["cut_word_s"]):
+                rows.append({"mark_class": "cut-in-speech", "anchor": anchor, "t": a_end,
+                             "rationale": f"boundary at {a_end:.2f}s sits in continuous speech: aligned words "
+                                          f"within {abs(a_end - we):.2f}s before and {abs(wsn - b_start):.2f}s "
+                                          f"after, no breath/event insert within {th['event_reach_s']:.2f}s",
+                             "key": f"cut-in-speech@{a.id}|{b.id}"})
+        left, right = (a.text or "").rstrip(), (b.text or "").lstrip()
+        if num_tail.search(left) or num_head.search(right):
+            rows.append({"mark_class": "numeral-adjacency", "anchor": anchor, "t": a_end,
+                         "rationale": f"a number touches the boundary: '…{left[-24:]}' | '{right[:24]}…'",
+                         "key": f"numeral-adjacency@{a.id}|{b.id}"})
+    return rows
+
+
+def attention_divergence_marks(
+    segments: List[SpineSegment],            # Effective spine (authoritative text)
+    variants: Dict[str, Dict[str, str]],     # segment_id -> {transcriber: chunk text} (load_variant_texts)
+    thresholds: Optional[Dict[str, float]] = None,  # Overrides of ATTENTION_THRESHOLDS
+) -> List[Dict[str, Any]]:  # Mark rows: {"mark_class", "anchor", "t", "rationale", "key"}
+    """The two-transcriber disagreement signal of the attention tier (item 3758f6cb signal
+    2), pure — narrowed to what the WALK lane acts on: `asr-extra-words` on a segment whose
+    second transcriber heard CONTENT words the authority lacks AT THE SEGMENT'S EDGES — a
+    text-PLACEMENT disagreement (the other transcriber put those words in this chunk, the
+    authority in a neighbour: the boundary shifts the first walk made, evidence 974f5500);
+    mid-segment extra words are the fidelity lane's and do not mark. Filler-only differences (uh, um, like, the
+    hedges a lightweight transcriber drops by design) and substitutions — same-length
+    replacements, or a longer one whose letters are still half the authority's ('carpet
+    the' for Karpathy: a mishearing re-split, the fidelity lane's material) — do not mark. A RUNAWAY variant is not a
+    disagreement (finding 84f466bb): a token repeated `degenerate_run` times in a row, or
+    a variant longer than `degenerate_ratio` times the authority, is skipped. The rationale
+    quotes the extra words."""
+    th = {**ATTENTION_THRESHOLDS, **(thresholds or {})}
+    run_n, ratio = int(th["degenerate_run"]), float(th["degenerate_ratio"])
+    min_extra = int(th.get("extra_words", 1))
+
+    def _toks(text: str) -> List[str]:
+        return _normalize_text(text or "").split()
+
+    def _degenerate(auth: List[str], var: List[str]) -> bool:
+        if len(var) > ratio * max(1, len(auth)):
+            return True
+        run = 1
+        for x, y in zip(var, var[1:]):
+            run = run + 1 if x == y else 1
+            if run >= run_n:
+                return True
+        return False
+
+    rows: List[Dict[str, Any]] = []
+    for s in segments:
+        if not (s.text or "").strip():
+            continue
+        auth = _toks(s.text)
+        auth_set = set(auth)
+        for transcriber, vtext in (variants.get(s.id) or {}).items():
+            var = _toks(vtext)
+            if var == auth or not var or _degenerate(auth, var):
+                continue
+            sm = difflib.SequenceMatcher(a=auth, b=var, autojunk=False)
+            extra: List[str] = []
+            for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                if tag not in ("insert", "replace"):
+                    continue
+                if j1 != 0 and j2 != len(var):
+                    continue   # mid-segment extra words are the fidelity lane's; placement shows at an edge
+                if tag == "replace":
+                    if (i2 - i1) >= (j2 - j1):
+                        continue   # a substitution, not extra speech
+                    a_join, b_join = "".join(auth[i1:i2]), "".join(var[j1:j2])
+                    if levenshtein(a_join, b_join) <= 0.5 * max(len(a_join), len(b_join), 1):
+                        continue   # a mishearing that merely re-splits the sound ('carpet the' for Karpathy)
+                words = [w for w in var[j1:j2] if w not in ATTENTION_FILLERS and len(w) >= 3
+                         and w not in auth_set]
+                if words:
+                    extra.append(" ".join(var[j1:j2]))
+            if len(extra) < min_extra:
+                continue
+            shown = "; ".join(f"'{e[:40]}'" for e in extra[:3])
+            rows.append({"mark_class": "asr-extra-words",
+                         "anchor": {"kind": "segment", "segment_id": s.id},
+                         "t": float(s.start_time) if s.start_time is not None else 0.0,
+                         "rationale": f"{transcriber} heard words the authority lacks: {shown}",
+                         "key": f"asr-extra-words@{s.id}"})
+            break   # one mark per segment
+    return rows
+
+
+def attention_speaker_marks(
+    segments: List[SpineSegment],  # Effective spine (source-coordinate times)
+    turns: List[Dict[str, Any]],   # Diarization turns [{start, end, speaker}], source coordinates
+) -> List[Dict[str, Any]]:  # Mark rows: {"mark_class", "anchor", "t", "rationale", "key"}
+    """The next-speaker-change landmark of the folded item 65791933, pure: `speaker-change`
+    on the boundary between consecutive text-bearing segments whose dominant diarization
+    cluster differs (`speaker_turn_proposals` decides dominance). Navigation, not
+    suspicion — opt-in (`speaker` is not a default signal), because an eight-speaker
+    lecture would otherwise swamp the ⚑ set the walk lane jumps through."""
+    dom = speaker_turn_proposals(segments, turns)
+    rows: List[Dict[str, Any]] = []
+    timed = [s for s in segments if s.start_time is not None and s.end_time is not None
+             and (s.text or "").strip()]
+    for a, b in zip(timed, timed[1:]):
+        ca, cb = (dom.get(a.id) or {}).get("cluster"), (dom.get(b.id) or {}).get("cluster")
+        if ca and cb and ca != cb:
+            rows.append({"mark_class": "speaker-change",
+                         "anchor": {"kind": "boundary", "boundary_after": a.id, "right_segment_id": b.id},
+                         "t": float(a.end_time),
+                         "rationale": f"dominant cluster changes {ca} -> {cb} at {float(a.end_time):.2f}s",
+                         "key": f"speaker-change@{a.id}|{b.id}"})
+    return rows
+
+
+def attention_marks(
+    segments: List[SpineSegment],                       # Effective spine (project_effective_spine output)
+    *,
+    fa_words: Optional[List[Dict[str, Any]]] = None,    # Aligned words in SOURCE seconds (None = FA signals off)
+    variants: Optional[Dict[str, Dict[str, str]]] = None,  # segment_id -> {transcriber: text} (None = divergence off)
+    events: Optional[List[Dict[str, Any]]] = None,      # Active event inserts [{start, end, label}]
+    turns: Optional[List[Dict[str, Any]]] = None,       # Diarization turns (None = speaker signal off)
+    signals: Optional[Sequence[str]] = None,            # Subset of ATTENTION_SIGNALS (default: ATTENTION_DEFAULT_SIGNALS)
+    thresholds: Optional[Dict[str, float]] = None,      # Overrides of ATTENTION_THRESHOLDS
+) -> List[Dict[str, Any]]:  # Mark rows in source-time order, deduplicated by key
+    """Compose the attention tier (item 3758f6cb): every enabled signal's mark rows,
+    merged, sorted by time, one row per (class, anchor) key. A signal whose input is
+    absent contributes nothing — the tier degrades to what the stack has, never
+    refuses. Pure: the CLI verb lands the rows as marks; this only derives them."""
+    want = set(signals or ATTENTION_DEFAULT_SIGNALS)
+    unknown = want - set(ATTENTION_SIGNALS)
+    if unknown:
+        raise ValueError(f"unknown attention signal(s): {sorted(unknown)} — "
+                         f"known: {list(ATTENTION_SIGNALS)}")
+    rows: List[Dict[str, Any]] = []
+    if "fa" in want and fa_words:
+        rows += attention_fa_marks(segments, fa_words, events=events, thresholds=thresholds)
+    if want & {"gap", "cut", "numeral"}:
+        allowed = {"gap": {"unexplained-gap", "segment-overlap", "speech-in-gap"},
+                   "cut": {"cut-in-speech"}, "numeral": {"numeral-adjacency"}}
+        keep = set().union(*(allowed[s] for s in want if s in allowed))
+        rows += [r for r in attention_boundary_marks(segments, events=events,
+                                                     fa_words=fa_words if want & {"cut", "gap"} else None,
+                                                     thresholds=thresholds)
+                 if r["mark_class"] in keep]
+    if "divergence" in want and variants:
+        rows += attention_divergence_marks(segments, variants, thresholds=thresholds)
+    if "speaker" in want and turns:
+        rows += attention_speaker_marks(segments, turns)
+    seen: set = set()
+    out: List[Dict[str, Any]] = []
+    for r in sorted(rows, key=lambda r: (float(r.get("t") or 0.0), r["mark_class"])):
+        if r["key"] in seen:
+            continue
+        seen.add(r["key"])
+        out.append(r)
+    return out
+
+
 # Format tag of a consumed proposal set (leg 4, DEC 8e05b87b): the manifest
 # chain's inference-run record — capability-owned today, read by the workflow
 # BY FORMAT TAG (generalized to a workflow-generic seam at n=2 proposal
@@ -339,3 +675,29 @@ def event_span_proposals(
         i = max(0, bisect_right(starts, ps) - 1)
         out.setdefault(timed[i][1], []).append(p)
     return out
+
+
+# ---- the walk-lane ATTENTION TIER (item 3758f6cb; ruling f400d2c3): derived marks, no model ----
+ATTENTION_ACTOR = "capability:attention-tier"   # the actor every tier mark + dismissal carries (idempotency key)
+ATTENTION_SIGNALS = ("fa", "gap", "divergence", "numeral", "cut", "speaker")  # open set; `speaker` is opt-in
+ATTENTION_DEFAULT_SIGNALS = ("fa", "gap", "divergence", "numeral")   # cut-in-speech opt-in since evidence 974f5500 (4/19)
+ATTENTION_THRESHOLDS: Dict[str, float] = {
+    "word_margin_s": 0.06,    # a boundary is INSIDE a word only past this margin from the word's edges (FA jitter; 0.08 missed a real cut — 974f5500)
+    "tail_s": 0.6,            # audio after the last aligned word (or before the first) worth a listen
+    "stretch_s": 0.8,         # an aligned word this long absorbed untranscribed audio (breath, dropped filler)
+    "gap_s": 1.5,             # an inter-segment silence no event insert explains (a pause is not a finding)
+    "gap_word_s": 0.15,       # a gap this wide with an aligned word INSIDE it = speech the fold mis-homed
+    "overlap_s": 0.02,        # consecutive segments whose times cross by more than this
+    "cut_gap_s": 0.12,        # a cut in continuous speech: gap below this ...
+    "cut_word_s": 0.15,       # ... with aligned words this close on both sides of the boundary
+    "event_reach_s": 0.25,    # an event insert this near a boundary explains the cut
+    "degenerate_run": 6,      # a token repeated this many times in a row = runaway variant, not disagreement
+    "degenerate_ratio": 2.5,  # a variant this many times longer than the authority = runaway, not disagreement
+    "extra_words": 1,         # extra-content-word runs a variant needs before it marks
+}
+ATTENTION_FILLERS = frozenset((  # tokens a lightweight transcriber drops by design — never "extra words"
+    "uh", "um", "uhm", "hmm", "mm", "ah", "oh", "like", "so", "yeah", "okay", "ok", "right", "well",
+    "you", "know", "i", "mean", "kind", "of", "sort", "just", "and", "the", "a", "an", "to", "it",
+    "that", "this", "is", "was", "are", "be", "we", "they", "he", "she", "but", "or", "in", "on",
+    "at", "for", "with", "there", "s", "t", "re", "ve", "ll", "d", "m", "then", "now", "also", "very",
+))

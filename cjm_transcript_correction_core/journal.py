@@ -108,7 +108,8 @@ def correction_replay_handlers() -> Dict[str, Any]:  # verb -> async handler(que
                          properties=props)
 
     handlers = wires_handlers("session-start", "boundary-shift", "text-correction",
-                              "prune-amendment", "mark", "mark-dismiss", "review-markers",
+                              "prune-amendment", "mark", "mark-dismiss", "mark-discharge",
+                              "review-markers",
                               "time-nudge", "chunk-insert", "chunk-insert-remove",
                               "chunk-split", "chunk-split-remove",
                               "speech-overlay", "speech-overlay-remove",

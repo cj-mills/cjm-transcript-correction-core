@@ -1040,6 +1040,35 @@ async def commit_mark_dismissal(
     return node["id"]
 
 
+async def discharge_mark(
+    queue: JobQueue,                     # Started job queue
+    graph_id: str,                       # Graph-storage capability id
+    source_id: str,                      # Source the mark belongs to
+    mark_id: str,                        # The open mark being discharged
+    correction_id: str,                  # The ALREADY-COMMITTED correction that addressed it
+    session_id: str,                     # Owning session id
+    actor: str = "human",                # Actor (whose edit discharged it)
+    note: Optional[str] = None,          # Optional note (which gesture)
+    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+) -> str:  # The SUPERSEDES edge id
+    """Discharge an open mark BY THE CORRECTION THAT ADDRESSED IT — the closure
+    `build_mark_correction` names (the real correction supersedes the mark), applied
+    AFTER the fact: one SUPERSEDES edge from the committed correction to the mark, no
+    node. A walk-lane edit thereby clears the attention tier's marks on the segments it
+    touched without the dismissal round trip (user ask 2026-09-14: a capability's mark
+    is routing, so the edit that lands there IS its answer). `open_marks` then excludes
+    the mark exactly as a dismissal would; the edge carries the provenance a dismissal
+    review would (who, when, which correction)."""
+    edge = make_edge(correction_id, mark_id, CorrectionRelations.SUPERSEDES)
+    await commit_nodes_edges(queue, graph_id, [], [edge])
+    if journal_path:
+        journal_correction_op(journal_path, "mark-discharge", actor=actor, session_id=session_id,
+                              args={"source_id": source_id, "mark_id": mark_id,
+                                    "correction_id": correction_id, "note": note},
+                              nodes=[], edges=[edge], op_id=edge["id"])
+    return edge["id"]
+
+
 def build_stratum_correction(
     source_id: str,                        # Source the classified segments belong to
     segment_ids: List[str],                # The run of layer-0/effective Segment ids the stratum covers
