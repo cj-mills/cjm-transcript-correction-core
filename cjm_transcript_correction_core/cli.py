@@ -30,10 +30,9 @@ from cjm_transcript_correction_core.graph import (active_corrections, bench_even
                                                   fa_words_for_transcript, labeled_insert_spans,
                                                   list_source_spines, load_extraction_gates,
                                                   load_source_corrections, load_source_segments,
-                                                  load_variant_texts, mark_anchor_segments,
-                                                  open_marks, project_effective_spine,
-                                                  set_session_status, skeleton_hash_for,
-                                                  start_session)
+                                                  mark_anchor_segments, open_marks,
+                                                  project_effective_spine, set_session_status,
+                                                  skeleton_hash_for, start_session)
 from cjm_transcript_correction_core.models import CorrectionConfig, DatasetManifest, new_dataset_id
 from cjm_transcript_correction_core.pipeline import (load_decomp_manifest, resolve_graph_db_path,
                                                      run_correction, run_review)
@@ -2366,7 +2365,6 @@ async def attention_command(
                       f"chunk transcript(s)" + (f" ({misses} cache miss(es))" if misses else ""))
             else:
                 print(f"forced alignment: cache not found ({fa_cache}) — fa/cut signals off")
-        variants = await load_variant_texts(queue, cap, segs) if "divergence" in want else None
         turns: Optional[List[Dict[str, Any]]] = None
         if "speaker" in want:
             tp = Path(args.turns) if args.turns else None
@@ -2386,7 +2384,7 @@ async def attention_command(
             if not k.strip() or not v.strip():
                 raise SystemExit(f"--threshold needs KEY=VALUE, got {spec!r}")
             thresholds[k.strip()] = float(v)
-        rows = attention_marks(effective, fa_words=fa_words, variants=variants, events=events,
+        rows = attention_marks(effective, fa_words=fa_words, events=events,
                                turns=turns, signals=signals, thresholds=thresholds)
         lo = float(args.from_s or 0.0)
         hi = float(args.to_s) if args.to_s is not None else None

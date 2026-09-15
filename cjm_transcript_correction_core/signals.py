@@ -271,12 +271,10 @@ def attention_fa_marks(
 ) -> List[Dict[str, Any]]:  # Mark rows: {"mark_class", "anchor", "t", "rationale", "key"}
     """The forced-alignment signals of the attention tier (item 3758f6cb signal 1), pure.
 
-    Four classes, each a mechanical boundary-shift / nudge / omission candidate the
+    Three classes, each a mechanical boundary-shift / nudge / omission candidate the
     walk lane otherwise finds only by listening: `fa-mid-word-boundary` — a boundary
     between two text-bearing segments falls INSIDE an aligned word (past `word_margin_s`
-    from its edges; boundary anchor); `fa-stretched-word` — the word around the boundary
-    is `stretch_s` or longer, i.e. the aligner absorbed untranscribed audio (a breath, a
-    dropped 'uh') and the transcript is missing something beside the boundary; `fa-trailing-audio` / `fa-leading-audio` — a
+    from its edges; boundary anchor); `fa-trailing-audio` / `fa-leading-audio` — a
     segment's audio runs on for `tail_s` after the last aligned speech in it (or before
     the first) with no event insert explaining the stretch (segment anchor: text the
     transcriber may have dropped). Aligned speech is measured by OVERLAP clipped to the
@@ -309,18 +307,9 @@ def attention_fa_marks(
             if w is None:
                 continue
             ws_, we_ = float(w["s"]), float(w["e"])
-            if we_ - ws_ >= th["stretch_s"]:
-                # A word this long is the aligner ABSORBING untranscribed audio (a breath, a
-                # dropped 'uh') — the boundary is not in the word, the transcript is missing
-                # something beside it (first-walk sighting: 'performance' 1.28 s over an inhale + 'uh').
-                rows.append({"mark_class": "fa-stretched-word",
-                             "anchor": {"kind": "boundary", "boundary_after": a.id, "right_segment_id": b.id},
-                             "t": t,
-                             "rationale": f"aligned word '{w.get('text', '')}' spans {ws_:.2f}-{we_:.2f}s "
-                                          f"({we_ - ws_:.2f}s) across the boundary at {t:.2f}s — the aligner "
-                                          f"absorbed untranscribed audio: listen for a missing word or breath",
-                             "key": f"fa-stretched-word@{a.id}|{b.id}"})
-                break
+            # No stretched-word class here any more: a long aligned word across the boundary
+            # was the fa-stretched-word mark of re-tune 1 (b7e9838a) — removed by ruling
+            # 328c48ae (every standalone instance dismissed on the second walk, evidence 1dbbc512).
             rows.append({"mark_class": "fa-mid-word-boundary",
                          "anchor": {"kind": "boundary", "boundary_after": a.id, "right_segment_id": b.id},
                          "t": t,
@@ -370,8 +359,7 @@ def attention_boundary_marks(
     scan-mishomed shape at the walk lane's grain; a word straddling the gap's edge is the
     mid-word boundary's finding, not this one, and a word an event insert mostly covers is
     the breath the aligner absorbed, not speech — first-walk sighting, an inhale flagged
-    as 'to'); `unexplained-gap` — a gap of `gap_s` or more that
-    event inserts cover under half of (a long silence nothing explains); `segment-overlap`
+    as 'to'); `segment-overlap`
     — the times cross by more than `overlap_s`; `cut-in-speech` — a gap below `cut_gap_s`
     with no event insert within `event_reach_s` and aligned speech within `cut_word_s` on
     BOTH sides (a boundary cut through continuous speech — the breath structure says no
@@ -433,14 +421,9 @@ def attention_boundary_marks(
                              "rationale": f"{len(inside)} aligned word(s) inside the {gap:.2f}s gap "
                                           f"{a_end:.2f}-{b_start:.2f}s: '{' '.join(inside)[:60]}'",
                              "key": f"speech-in-gap@{a.id}|{b.id}"})
-        if gap >= th["gap_s"]:
-            cov = _covered(a_end, b_start)
-            if cov < gap * 0.5:
-                rows.append({"mark_class": "unexplained-gap", "anchor": anchor, "t": a_end,
-                             "rationale": f"{gap:.2f}s gap {a_end:.2f}-{b_start:.2f}s between text-bearing "
-                                          f"segments; event inserts cover {cov:.2f}s of it",
-                             "key": f"unexplained-gap@{a.id}|{b.id}"})
-        elif ws and 0.0 <= gap < th["cut_gap_s"] and not _event_near(a_end):
+        # A long silence between text-bearing segments (the unexplained-gap class) no longer
+        # marks — ruling 328c48ae on evidence 1dbbc512: a pause is not a finding.
+        if ws and 0.0 <= gap < th["cut_gap_s"] and not _event_near(a_end):
             we, wsn = _word_end_before(a_end + th["cut_word_s"]), _word_start_after(b_start - th["cut_word_s"])
             if (we is not None and a_end - we <= th["cut_word_s"]
                     and wsn is not None and wsn - b_start <= th["cut_word_s"]):
@@ -558,7 +541,6 @@ def attention_marks(
     segments: List[SpineSegment],                       # Effective spine (project_effective_spine output)
     *,
     fa_words: Optional[List[Dict[str, Any]]] = None,    # Aligned words in SOURCE seconds (None = FA signals off)
-    variants: Optional[Dict[str, Dict[str, str]]] = None,  # segment_id -> {transcriber: text} (None = divergence off)
     events: Optional[List[Dict[str, Any]]] = None,      # Active event inserts [{start, end, label}]
     turns: Optional[List[Dict[str, Any]]] = None,       # Diarization turns (None = speaker signal off)
     signals: Optional[Sequence[str]] = None,            # Subset of ATTENTION_SIGNALS (default: ATTENTION_DEFAULT_SIGNALS)
@@ -577,15 +559,16 @@ def attention_marks(
     if "fa" in want and fa_words:
         rows += attention_fa_marks(segments, fa_words, events=events, thresholds=thresholds)
     if want & {"gap", "cut", "numeral"}:
-        allowed = {"gap": {"unexplained-gap", "segment-overlap", "speech-in-gap"},
+        allowed = {"gap": {"segment-overlap", "speech-in-gap"},
                    "cut": {"cut-in-speech"}, "numeral": {"numeral-adjacency"}}
         keep = set().union(*(allowed[s] for s in want if s in allowed))
         rows += [r for r in attention_boundary_marks(segments, events=events,
                                                      fa_words=fa_words if want & {"cut", "gap"} else None,
                                                      thresholds=thresholds)
                  if r["mark_class"] in keep]
-    if "divergence" in want and variants:
-        rows += attention_divergence_marks(segments, variants, thresholds=thresholds)
+    # The two-transcriber `divergence` signal (asr-extra-words) left the tier by ruling
+    # 328c48ae (evidence 1dbbc512: dismissed whenever it stood alone); attention_divergence_marks
+    # stays a pure helper for other consumers.
     if "speaker" in want and turns:
         rows += attention_speaker_marks(segments, turns)
     seen: set = set()
@@ -679,13 +662,11 @@ def event_span_proposals(
 
 # ---- the walk-lane ATTENTION TIER (item 3758f6cb; ruling f400d2c3): derived marks, no model ----
 ATTENTION_ACTOR = "capability:attention-tier"   # the actor every tier mark + dismissal carries (idempotency key)
-ATTENTION_SIGNALS = ("fa", "gap", "divergence", "numeral", "cut", "speaker")  # open set; `speaker` is opt-in
-ATTENTION_DEFAULT_SIGNALS = ("fa", "gap", "divergence", "numeral")   # cut-in-speech opt-in since evidence 974f5500 (4/19)
+ATTENTION_SIGNALS = ("fa", "gap", "numeral", "cut", "speaker")  # open set; `speaker` + `cut` are opt-in; `divergence` retired by ruling 328c48ae
+ATTENTION_DEFAULT_SIGNALS = ("fa", "gap", "numeral")   # cut-in-speech opt-in since evidence 974f5500 (4/19); stretched-word / unexplained-gap / asr-extra-words removed by 328c48ae (evidence 1dbbc512)
 ATTENTION_THRESHOLDS: Dict[str, float] = {
     "word_margin_s": 0.06,    # a boundary is INSIDE a word only past this margin from the word's edges (FA jitter; 0.08 missed a real cut — 974f5500)
     "tail_s": 0.6,            # audio after the last aligned word (or before the first) worth a listen
-    "stretch_s": 0.8,         # an aligned word this long absorbed untranscribed audio (breath, dropped filler)
-    "gap_s": 1.5,             # an inter-segment silence no event insert explains (a pause is not a finding)
     "gap_word_s": 0.15,       # a gap this wide with an aligned word INSIDE it = speech the fold mis-homed
     "overlap_s": 0.02,        # consecutive segments whose times cross by more than this
     "cut_gap_s": 0.12,        # a cut in continuous speech: gap below this ...

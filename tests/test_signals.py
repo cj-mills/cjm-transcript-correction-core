@@ -91,15 +91,17 @@ def test_speaker_turn_proposals_dominance_and_gaps():
 
 
 def test_attention_tier_signals_and_compose():
-    """The walk-lane attention tier (item 3758f6cb): each pure signal derives the mark rows
-    its class promises — mid-word boundary, trailing audio (overlap-clipped, so a
-    straddling word fakes no tail), speech inside a gap, a long unexplained gap, numeral
-    adjacency, cut in continuous speech (silenced by a nearby event insert), extra words
-    a second transcriber heard (fillers and runaways never mark), speaker change — and
-    `attention_marks` composes only the requested signals, sorted by time, deduplicated
-    by key, loud on an unknown signal."""
+    """The walk-lane attention tier (item 3758f6cb, narrowed by ruling 328c48ae on evidence
+    1dbbc512): each pure signal derives the mark rows its class promises — mid-word
+    boundary, trailing audio (overlap-clipped, so a straddling word fakes no tail), speech
+    inside a gap, numeral adjacency, cut in continuous speech (silenced by a nearby event
+    insert), speaker change — the three classes the second walk dismissed whenever they
+    stood alone (fa-stretched-word, unexplained-gap, asr-extra-words) derive NOTHING and
+    `divergence` is no longer a tier signal (the pure helper stays for other consumers),
+    and `attention_marks` composes only the requested signals, sorted by time,
+    deduplicated by key, loud on an unknown signal."""
     import pytest
-    from cjm_transcript_correction_core.signals import (ATTENTION_DEFAULT_SIGNALS,
+    from cjm_transcript_correction_core.signals import (ATTENTION_DEFAULT_SIGNALS, ATTENTION_SIGNALS,
                                                         attention_boundary_marks,
                                                         attention_divergence_marks,
                                                         attention_fa_marks, attention_marks,
@@ -133,15 +135,14 @@ def test_attention_tier_signals_and_compose():
     bc = {(r["mark_class"], r["anchor"]["boundary_after"], r["anchor"]["right_segment_id"]) for r in b}
     assert ("speech-in-gap", "b", "c") in bc                    # 'stray' lies wholly inside the 0.6 s gap
     assert not any(c == "speech-in-gap" and (l, r) == ("a", "b") for c, l, r in bc)   # 'kernel' straddles: mid-word's finding
-    assert ("unexplained-gap", "f", "g") in bc                  # 2.0 s of silence, no event insert
-    assert not any(c == "unexplained-gap" and (l, r) == ("b", "c") for c, l, r in bc)   # a 0.6 s pause is not a finding
+    assert not any(c == "unexplained-gap" for c, _, _ in bc)   # the 2.0 s silence before g no longer marks (ruling 328c48ae)
     assert ("numeral-adjacency", "b", "c") in bc                # '...128' | 'threads'
     assert ("cut-in-speech", "e", "f") in bc                    # 'sync' ends 8.95, 'the' starts 9.05, no breath
     assert not any(c == "cut-in-speech" and (l, r) == ("a", "b") for c, l, r in bc)
     b2 = attention_boundary_marks(segs, fa_words=words,
                                   events=[{"start": 8.97, "end": 9.02, "label": "inhale"},
                                           {"start": 10.2, "end": 11.9, "label": "background-noise"}])
-    assert not any(r["mark_class"] in ("cut-in-speech", "unexplained-gap") for r in b2)   # inserts explain both
+    assert not any(r["mark_class"] == "cut-in-speech" for r in b2)   # the inhale explains the cut
     b3 = attention_boundary_marks(segs, fa_words=words,
                                   events=[{"start": 4.15, "end": 4.45, "label": "inhale"}])
     assert not any(r["mark_class"] == "speech-in-gap" for r in b3)   # 'stray' is the breath the aligner absorbed
@@ -150,39 +151,35 @@ def test_attention_tier_signals_and_compose():
         [SpineSegment(id="p", index=0, text="we run", start_time=0.0, end_time=1.0),
          SpineSegment(id="q", index=1, text="performance", start_time=1.0, end_time=2.3)],
         [{"s": 0.1, "e": 0.3, "text": "we"}, {"s": 0.4, "e": 0.6, "text": "run"},
-         {"s": 0.7, "e": 1.9, "text": "performance"}])                      # 1.2 s: absorbed a breath + a dropped 'uh'
-    assert [r["mark_class"] for r in stretched] == ["fa-stretched-word"]
-    assert "missing word or breath" in stretched[0]["rationale"]
+         {"s": 0.7, "e": 1.9, "text": "performance"}])                      # 1.2 s across the boundary
+    assert [r["mark_class"] for r in stretched] == ["fa-mid-word-boundary"]   # a long word is just a word the boundary sits in
 
     d = attention_divergence_marks(segs, {"a": {"whisper": "we launch the colonel"},            # substitution: fidelity lane
                                           "c": {"whisper": "threads per block uh like"},         # fillers only
                                           "e": {"whisper": "and then sync the threads"},         # extra content words at the END edge
                                           "f": {"whisper": "the mighty grid"},                   # extra word MID-segment: fidelity lane
                                           "b": {"whisper": "with 128 128 128 128 128 128 128"}})  # runaway
-    assert [r["anchor"]["segment_id"] for r in d] == ["e"]
-    dg = attention_divergence_marks([SpineSegment(id="k", index=0, text="karpathy said", start_time=0.0, end_time=1.0)],
-                                    {"k": {"whisper": "carpet the said"}})
-    assert dg == []                                            # a lengthening mishearing is still a substitution
-    assert "threads" in d[0]["rationale"] and d[0]["mark_class"] == "asr-extra-words"
+    assert [r["anchor"]["segment_id"] for r in d] == ["e"]      # the pure helper still derives its rows ...
+    assert "divergence" not in ATTENTION_SIGNALS               # ... but the tier no longer composes them
 
     turns = [{"start": 0.0, "end": 4.5, "speaker": "S0"}, {"start": 4.5, "end": 13.0, "speaker": "S1"}]
     sp = attention_speaker_marks(segs, turns)
     assert [(r["anchor"]["boundary_after"], r["anchor"]["right_segment_id"]) for r in sp] == [("b", "c")]
 
-    rows = attention_marks(segs, fa_words=words, variants={"e": {"whisper": "and then sync the threads"}},
-                           turns=turns)
+    rows = attention_marks(segs, fa_words=words, turns=turns)
     assert "speaker" not in ATTENTION_DEFAULT_SIGNALS and "cut" not in ATTENTION_DEFAULT_SIGNALS
     assert not any(r["mark_class"] in ("speaker-change", "cut-in-speech") for r in rows)
-    assert {r["mark_class"] for r in rows} >= {"fa-mid-word-boundary", "speech-in-gap", "unexplained-gap",
-                                              "numeral-adjacency", "asr-extra-words"}
+    assert {r["mark_class"] for r in rows} == {"fa-mid-word-boundary", "speech-in-gap", "numeral-adjacency"}
     assert any(r["mark_class"] == "cut-in-speech"
                for r in attention_marks(segs, fa_words=words, signals=("cut",)))   # still there when asked for
     assert [r["t"] for r in rows] == sorted(r["t"] for r in rows)
     assert len({r["key"] for r in rows}) == len(rows)
     rows2 = attention_marks(segs, fa_words=words, turns=turns, signals=("gap", "speaker"))
-    assert {r["mark_class"] for r in rows2} == {"speech-in-gap", "unexplained-gap", "speaker-change"}
+    assert {r["mark_class"] for r in rows2} == {"speech-in-gap", "speaker-change"}
     with pytest.raises(ValueError):
         attention_marks(segs, signals=("fa", "nope"))
+    with pytest.raises(ValueError):
+        attention_marks(segs, signals=("divergence",))          # retired from the tier: unknown now
 
     fa_trail = attention_fa_marks([SpineSegment(id="t", index=0, text="hello", start_time=0.0, end_time=3.0)],
                                   [{"s": 0.1, "e": 0.5, "text": "hello"}])
