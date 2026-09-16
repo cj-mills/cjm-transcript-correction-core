@@ -22,7 +22,7 @@ from cjm_transcript_correction_core.journal import journal_correction_op, segmen
 from cjm_transcript_correction_core.models import (Correction, CorrectionRelations,
                                                    CorrectionSession, Entity, EXTRACTION_STATUSES,
                                                    ExtractionGate, SpineSegment)
-from cjm_transcript_graph_schema.schema import TranscriptGraphLabels
+from cjm_transcript_graph_schema.schema import SEGMENT_SUPERSEDED_BY_PROP, TranscriptGraphLabels
 
 # Stage 4: the typed query surface — importing the result classes IS the
 # host-side wire registration (F8); the tuple keeps these SIDE-EFFECT imports
@@ -181,12 +181,19 @@ def _spine_query(
     rendition_ids: List[str],  # The AudioRendition ids the spine hangs under
     **overrides,               # NodeQuery field overrides (where / count / limit / ...)
 ) -> NodeQuery:  # The source-spine read
-    """Segments PART_OF the chosen AudioRenditions (batched far-end), ordered by index."""
+    """Segments PART_OF the chosen AudioRenditions (batched far-end), ordered by index.
+
+    Carries the ONE reader predicate a chunk respine adds (ruling 0b4d5cfa (4)):
+    a segment stamped `superseded_by` left the live view — every spine read
+    through this query (loaders, listing, counts) filters it, and a caller's
+    own `where` predicates AND onto it rather than replacing it."""
+    where = [PropertyPredicate(SEGMENT_SUPERSEDED_BY_PROP, "is_null")] + list(overrides.pop("where", None) or [])
     base: Dict[str, Any] = dict(
         label=TranscriptGraphLabels.SEGMENT,
         related=RelationPredicate(SpineRelations.PART_OF, node_ids=list(rendition_ids)),
         order_by=OrderBy(prop="index"),
         project=list(_SPINE_PROJECTION),
+        where=where,
     )
     base.update(overrides)
     return NodeQuery(**base)
