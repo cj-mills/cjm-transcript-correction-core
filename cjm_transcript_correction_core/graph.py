@@ -1818,8 +1818,9 @@ async def list_speaker_entities(
     """Read the source-spanning entity registry (the picker's registry tier).
 
     The registry is people-scale, not segment-scale — one label read suffices;
-    the picker LAYERS it (DEC 4ec6a49c): this source's already-assigned
-    speakers first, then registry-wide, then mint-new."""
+    the picker LAYERS it (DEC 4ec6a49c, tiers re-ruled by 774dbe40): this
+    source's already-assigned speakers, then the collection's, then the rest of
+    the registry behind typed search, then mint-new."""
     res = await graph_task(queue, graph_id, "query_nodes",
                            query=NodeQuery(label="Entity").to_dict())
     out: List[Dict[str, Any]] = []
@@ -1829,6 +1830,48 @@ async def list_speaker_entities(
             continue
         out.append(d)
     out.sort(key=lambda d: ((d.get("properties") or {}).get("canonical_name") or "").lower())
+    return out
+
+
+async def speaker_assignment_sources(
+    queue: JobQueue,                            # Started job queue
+    graph_id: str,                              # Graph-storage capability id
+    source_ids: Optional[List[str]] = None,     # Restrict to these Sources' assignments (None = every speaker assignment on the graph)
+) -> Dict[str, List[str]]:  # entity_id -> the Source ids it is assigned in (each once, first-seen order)
+    """Where each speaker Entity has been assigned — the picker's COLLECTION
+    tier reads this over a source's siblings (DEC 774dbe40): an entity assigned
+    in N sibling Sources ranks by that recurrence breadth (the host-of proxy).
+
+    One property-filtered read over `speaker_assign` Corrections projected to
+    the payload (the `in` predicate over payload.source_id when `source_ids`
+    is given). Supersession is IGNORED on purpose: an entity once assigned in
+    a sibling stays a plausible collection speaker. The projected payload comes
+    back SERIALIZED from query_nodes (craft note 9882ee0d) — parsed here.
+    Scale note: this is one row per assignment op; a projected DISTINCT read
+    is the upgrade if a corpus ever makes it slow."""
+    where = [PropertyPredicate("payload.operation", "eq", "speaker_assign")]
+    if source_ids is not None:
+        if not source_ids:
+            return {}
+        where.append(PropertyPredicate("payload.source_id", "in", list(source_ids)))
+    q = NodeQuery(label="Correction", where=where, project=["payload"])
+    res = await graph_task(queue, graph_id, "query_nodes", query=q.to_dict())
+    out: Dict[str, List[str]] = {}
+    for r in (res.rows or []):
+        payload = r.get("payload")
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except ValueError:
+                continue
+        if not isinstance(payload, dict):
+            continue
+        eid, sid = payload.get("entity_id"), payload.get("source_id")
+        if not eid or not sid:
+            continue
+        seen = out.setdefault(str(eid), [])
+        if str(sid) not in seen:
+            seen.append(str(sid))
     return out
 
 

@@ -947,6 +947,74 @@ def parse_entity_input(
     return (s, prov) if s else None
 
 
+SPEAKER_TIERS = ("src", "coll", "reg")  # Picker tiers in slot order (DEC 774dbe40): this source's assigned speakers · the collection's · the rest of the registry (search-only)
+
+
+def layer_speaker_menu(
+    assigned: List[str],                # Entity ids assigned in THIS source, first-appearance order (the digit positions stay put)
+    collection_counts: Dict[str, int],  # Entity id -> how many sibling Sources of the holding collections it is assigned in
+    recents: List[str],                 # Entity ids picked this sitting, last-picked first
+    names: Dict[str, str],              # Entity id -> display name (the tie-break key)
+) -> List[Tuple[str, str]]:  # [(entity_id, tier)] over tiers "src" then "coll", UNTRUNCATED — the caller slices the digit budget
+    """Layer the assign-lane digit menu (pure; DEC 774dbe40). Tier 1 = the
+    source's assigned speakers in first-appearance order, positions STABLE
+    across picks (muscle memory — recents never reorder it: a pick makes the
+    entity source-assigned, so it joins tier 1 on its own). Tier 2 = entities
+    assigned in sibling Sources, ranked by recurrence breadth (the host-of
+    proxy), then last-picked, then name. Nothing else enters a digit slot —
+    the rest of the registry is reachable by `match_speaker_query` only."""
+    out: List[Tuple[str, str]] = [(e, "src") for e in assigned]
+    seen = set(assigned)
+    recent_rank = {e: i for i, e in enumerate(recents)}
+    coll = [e for e, n in collection_counts.items() if n > 0 and e not in seen]
+    coll.sort(key=lambda e: (-int(collection_counts[e]),
+                             recent_rank.get(e, len(recents)),
+                             (names.get(e) or "").lower()))
+    out.extend((e, "coll") for e in coll)
+    return out
+
+
+def match_speaker_query(
+    query: str,                      # The A-editor text as typed
+    entities: List[Dict[str, Any]],  # The registry (Entity node dicts: id + properties.canonical_name / provisional)
+    tiers: Dict[str, str],           # Entity id -> "src" | "coll" (absent = "reg")
+    recents: List[str],              # Entity ids picked this sitting, last-picked first
+    limit: int = 9,                  # Listing budget (the digit keys)
+) -> List[Tuple[str, str, str]]:  # [(entity_id, canonical_name, tier)] best first; [] for an empty or `?`-prefixed query
+    """Narrow the registry by a typed query (pure; DEC 774dbe40 (4)). Rank 0 =
+    every query token is a PREFIX of some name token ("sar" -> Mark Saroufim,
+    "m s" -> Mark Saroufim); rank 1 = the whole query is a substring of the
+    name; no edit-distance — the registry is people-scale. Ties break by tier
+    (src < coll < reg), then last-picked, then name. A `?`-prefixed line is the
+    provisional MINT grammar (DEC 484e2d74), never a search."""
+    q = (query or "").strip()
+    if not q or q.startswith("?"):
+        return []
+    q_l = q.lower()
+    q_tokens = q_l.split()
+    recent_rank = {e: i for i, e in enumerate(recents)}
+    tier_rank = {t: i for i, t in enumerate(SPEAKER_TIERS)}
+    scored: List[Tuple[Tuple[int, int, int, str], str, str, str]] = []
+    for d in entities:
+        eid = str(d.get("id") or "")
+        name = str((d.get("properties") or {}).get("canonical_name") or "")
+        if not eid or not name:
+            continue
+        n_l = name.lower()
+        n_tokens = n_l.split()
+        if all(any(t.startswith(qt) for t in n_tokens) for qt in q_tokens):
+            rank = 0
+        elif q_l in n_l:
+            rank = 1
+        else:
+            continue
+        tier = tiers.get(eid, "reg")
+        scored.append(((rank, tier_rank.get(tier, len(SPEAKER_TIERS)),
+                        recent_rank.get(eid, len(recents)), n_l), eid, name, tier))
+    scored.sort(key=lambda s: s[0])
+    return [(eid, name, tier) for _, eid, name, tier in scored[:limit]]
+
+
 def plan_chunk_split(
     segments: List,          # The walked spine (SpineSegment-shaped: id/text/start_time/end_time)
     index: int,              # Cursor position (the segment being split)
