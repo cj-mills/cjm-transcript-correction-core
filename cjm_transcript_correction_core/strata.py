@@ -41,6 +41,7 @@ from cjm_transcript_correction_core.models import RECOMMENDED_STRATUM_CLASSES, S
 
 FILTER_PACK_FORMAT = "cjm-transcript-correction-core/filter-pack"
 FILTER_PACK_VERSION = "0.1.0"
+FILTER_PACK_VERSION_LADDER = "0.2.0"   # A pack carrying any reading-ladder field (speakers / context / closed / marks)
 FILTER_PROPOSAL_SET_FORMAT = "cjm-transcript-correction-core/filtering-proposal-set"
 FILTER_PROPOSAL_SET_VERSION = "0.1.0"
 FILTER_LANE = "filter"   # The lane tag on the per-spine gate's watermark assertions
@@ -65,6 +66,24 @@ STRATUM_GLOSSES: Dict[str, str] = {
     "quotation": ("someone else's voice quoted verbatim — include the spoken 'quote' / 'end quote' "
                   "delimiters; a verify-against-source unit, distinct from the research-mark that "
                   "points at the source"),
+    # The live-lecture classes (the lecture-notes deliverable type's structure + exclusion
+    # strata; glossed here, NOT in the recommended slate — a pack names them via `vocabulary`).
+    "qa": ("a question-and-answer block — the Q&A tail, or an in-lecture question with its answer: "
+           "a STRUCTURE stratum (the span a notes deliverable renders questions and their answers "
+           "under), never content by itself"),
+    "logistics": ("stream / session housekeeping — 'can you hear me', screen-share fiddling, chat or "
+                  "link reminders, scheduling; the live-stream analogue of apparatus"),
+}
+
+# The MARK-family outlet (friction log pass 2: proposers kept inventing near-synonyms):
+# routed attention for the correction pass, never a stratum — the human accepts such a
+# row AS A MARK (class-family routing). A pack names these via `mark_vocabulary`.
+FILTER_MARK_GLOSSES: Dict[str, str] = {
+    "asr-error": ("a likely mis-transcription — a word the sentence cannot mean; give `replacement` "
+                  "only when CONTEXT supplies the fix"),
+    "proper-noun-suspect": "a name or domain term whose spelling is suspect",
+    "seam-suspect": ("a segment boundary that lands mid-phrase, or a line carrying the first words "
+                     "of the next sentence"),
 }
 
 
@@ -90,7 +109,7 @@ def select_span_segments(
 
 
 def _fmt_ts(seconds: float) -> str:  # mm:ss.s for the rendered pack
-    m, s = divmod(max(0.0, float(seconds)), 60.0)
+    m, s = divmod(round(max(0.0, float(seconds)), 1), 60.0)   # round FIRST: 59.96 is 01:00.0, never 00:60.0
     return f"{int(m):02d}:{s:04.1f}"
 
 
@@ -114,6 +133,10 @@ def build_filter_pack(
     window: Optional[Tuple[float, Optional[float]]] = None,  # (start, end) source seconds; None = whole spine
     strata: Optional[List[Dict[str, Any]]] = None,  # Active stratum correction dicts (rendered as context)
     vocabulary: Optional[List[str]] = None,  # Category slate (default: RECOMMENDED_STRATUM_CLASSES)
+    closed: bool = False,                    # True = a CLASS-SCOPED pass: only the named classes, no minting
+    mark_vocabulary: Optional[List[str]] = None,  # Mark-family outlet classes named in the brief (None = none)
+    speakers: Optional[Dict[str, Optional[str]]] = None,  # segment id -> speaker display name (None = the pack carries no speakers)
+    margin: int = 0,                         # Text segments of READ-ONLY context either side of the window
 ) -> Dict[str, Any]:  # The pack (JSON-serializable)
     """Build the proposer's input: one source window's text-bearing effective
     segments, numbered 0..n-1 in pack order, plus the vocabulary and the
@@ -123,21 +146,38 @@ def build_filter_pack(
     the pack keeps each row's segment id + spine index + times, so ingest maps
     positions back to spine identity without a graph read. Empty-text segments
     (silence chunks, wordless inserts) are left out — nothing to classify — so
-    a stratum spans text segments only."""
+    a stratum spans text segments only.
+
+    The reading-ladder additions (design 6752db0a) are all ADDITIVE: `speakers`
+    puts the assign lane's attribution on every row (a multi-speaker source's
+    strongest structural signal); `margin` keeps the neighbouring text segments
+    as un-numbered context a window proposer reads but cannot propose over (a
+    divided source needs no overlap, hence no dedup); `closed` + a narrowed
+    `vocabulary` make a class-scoped pass; `mark_vocabulary` names the mark-
+    family outlet. A pack built without them is byte-compatible with 0.1.0."""
     w_start = float(window[0]) if window and window[0] is not None else None
     w_end = float(window[1]) if window and window[1] is not None else None
+
+    def _row(s: SpineSegment) -> Dict[str, Any]:
+        st = float(s.start_time) if s.start_time is not None else None
+        en = float(s.end_time) if s.end_time is not None else None
+        return {"id": s.id, "index": s.index, "start": st, "end": en, "text": s.text,
+                **({"speaker": speakers.get(s.id)} if speakers is not None else {})}
+
     rows: List[Dict[str, Any]] = []
+    before: List[Dict[str, Any]] = []
+    after: List[Dict[str, Any]] = []
     for s in segments:
         if s.is_empty:
             continue
-        st = float(s.start_time) if s.start_time is not None else None
-        en = float(s.end_time) if s.end_time is not None else None
-        if w_start is not None and en is not None and en <= w_start:
+        r = _row(s)
+        if w_start is not None and r["end"] is not None and r["end"] <= w_start:
+            before.append(r)
             continue
-        if w_end is not None and st is not None and st >= w_end:
+        if w_end is not None and r["start"] is not None and r["start"] >= w_end:
+            after.append(r)
             continue
-        rows.append({"i": len(rows), "id": s.id, "index": s.index,
-                     "start": st, "end": en, "text": s.text})
+        rows.append({"i": len(rows), **r})
     timed_starts = [r["start"] for r in rows if r["start"] is not None]
     timed_ends = [r["end"] for r in rows if r["end"] is not None]
     win = {"start": (w_start if w_start is not None else (min(timed_starts) if timed_starts else 0.0)),
@@ -166,8 +206,63 @@ def build_filter_pack(
         "existing_strata": existing,
         "segments": rows,
     }
+    if closed:
+        pack["closed_vocabulary"] = True
+    if mark_vocabulary:
+        pack["mark_vocabulary"] = [{"category": c, "gloss": FILTER_MARK_GLOSSES.get(c, "")}
+                                   for c in mark_vocabulary]
+    if margin and margin > 0:
+        pack["context"] = {"before": before[-int(margin):], "after": after[:int(margin)]}
+    if closed or mark_vocabulary or speakers is not None or (margin and margin > 0):
+        pack["version"] = FILTER_PACK_VERSION_LADDER
     pack["digest"] = pack_digest(pack)
     return pack
+
+
+def plan_pack_windows(
+    segments: Sequence[SpineSegment],  # The EFFECTIVE spine, index order
+    count: int,                        # How many windows to cut the spine into
+    *,
+    speakers: Optional[Dict[str, Optional[str]]] = None,  # segment id -> speaker (turn boundaries preferred)
+    slack: float = 0.2,                # Search radius around each even cut, as a fraction of one window
+) -> List[Tuple[float, Optional[float]]]:  # `count` contiguous (start, end) windows; the last end is None
+    """Cut a spine into `count` windows of near-equal TEXT-segment count at
+    MECHANICAL seams (design 6752db0a (5)): within `slack` of each even cut the
+    nearest speaker turn wins, else the longest silence; no model chooses a
+    seam. A cut sits in the gap between two text segments, so the
+    windows tile the spine — every timed text segment lands in exactly one."""
+    n = int(count)
+    timed = [s for s in segments
+             if not s.is_empty and s.start_time is not None and s.end_time is not None]
+    if n < 1:
+        raise ValueError("count must be >= 1")
+    if n > max(1, len(timed)):
+        raise ValueError(f"cannot cut {len(timed)} text segments into {n} windows")
+    per = len(timed) / n
+    radius = max(1, int(per * float(slack)))
+    cuts: List[float] = []
+    lo_bound = 1
+    for k in range(1, n):
+        target = int(round(k * per))
+        cands = [j for j in range(max(lo_bound, target - radius), min(len(timed) - 1, target + radius) + 1)
+                 if float(timed[j].start_time) >= float(timed[j - 1].end_time)]
+        if not cands:   # overlapping neighbours all round — fall back to the even cut
+            cands = [min(max(lo_bound, target), len(timed) - 1)]
+
+        def _gap(j: int) -> float:
+            return float(timed[j].start_time) - float(timed[j - 1].end_time)
+
+        turns = [j for j in cands if speakers is not None
+                 and speakers.get(timed[j].id) != speakers.get(timed[j - 1].id)]
+        # a turn is already a seam — take the one nearest the even cut (windows stay
+        # comparable); with no turn in range the longest silence is the seam
+        j = (min(turns, key=lambda j: (abs(j - target), -_gap(j))) if turns
+             else max(cands, key=lambda j: (_gap(j), -abs(j - target))))
+        lo, hi = float(timed[j - 1].end_time), float(timed[j].start_time)
+        cuts.append(round((lo + hi) / 2.0, 4) if hi >= lo else hi)
+        lo_bound = j + 1
+    edges: List[Optional[float]] = [0.0] + cuts + [None]
+    return [(float(edges[i]), edges[i + 1]) for i in range(n)]
 
 
 def pack_digest(pack: Dict[str, Any]) -> str:  # "sha256:<hex>" over the content a proposer read
@@ -176,7 +271,12 @@ def pack_digest(pack: Dict[str, Any]) -> str:  # "sha256:<hex>" over the content
     pack id / timestamps."""
     body = {"source": pack.get("source"), "window": pack.get("window"),
             "segments": [[r["i"], r["id"], r["start"], r["end"], r["text"]]
+                         + ([r["speaker"]] if "speaker" in r else [])
                          for r in pack.get("segments") or []]}
+    ctx = pack.get("context")
+    if ctx:   # the read-only margins were READ too (absent key = a 0.1.0 digest, unchanged)
+        body["context"] = {side: [[r["id"], r["start"], r["end"], r["text"], r.get("speaker")]
+                                  for r in ctx.get(side) or []] for side in ("before", "after")}
     h = hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode("utf-8"))
     return f"sha256:{h.hexdigest()}"
 
@@ -210,6 +310,31 @@ consecutive pack lines:
 Rows only — no prose before or after, no code fences.
 """
 
+_OPEN_CATEGORY_RULE = """\
+* `category`: a class from the vocabulary above, or a NEW kebab-case class when none fits
+  (say why in the rationale). Do NOT propose the main topic — absence of a stratum IS
+  main-topic."""
+
+_CLOSED_CATEGORY_RULE = """\
+* `category`: ONLY a class named above — this is a CLASS-SCOPED pass: do not mint new
+  classes and do not raise anything outside the named ones (every other phenomenon
+  belongs to a different pass)."""
+
+
+def _render_pack_lines(rows: List[Dict[str, Any]], numbered: bool) -> List[str]:
+    """Transcript lines; a `— speaker —` rule wherever the attribution changes
+    (dense text: the name once per turn, never a per-line column)."""
+    out: List[str] = []
+    prev: Any = object()
+    for r in rows:
+        if "speaker" in r and r.get("speaker") != prev:
+            prev = r.get("speaker")
+            out.append(f"— {prev or '(unassigned)'} —")
+        st = _fmt_ts(r["start"]) if r.get("start") is not None else "--:--"
+        en = _fmt_ts(r["end"]) if r.get("end") is not None else "--:--"
+        out.append(f"{'[%d]' % r['i'] if numbered else '(ctx)'} {st}–{en}  {r['text']}")
+    return out
+
 
 def render_filter_pack(pack: Dict[str, Any]) -> str:  # The proposer brief (markdown)
     """Render a pack as the brief a proposer reads: identity + window, the class
@@ -228,15 +353,30 @@ def render_filter_pack(pack: Dict[str, Any]) -> str:  # The proposer brief (mark
         "",
         "## Task",
         "",
-        "Read the numbered transcript lines below and propose STRATA: runs of lines that",
-        "belong to one of the classes in the vocabulary. Everything you do not mark is",
-        "main-topic content. Prefer precise runs over generous ones; a run may be one line.",
-        "",
-        "## Vocabulary",
-        "",
     ]
+    closed = bool(pack.get("closed_vocabulary"))
+    if closed:
+        lines += ["Read the numbered transcript lines below and propose runs of lines for the classes",
+                  "named below — and ONLY those: this is a class-scoped pass, everything else is out",
+                  "of scope here. Prefer precise runs over generous ones; a run may be one line."]
+    else:
+        lines += ["Read the numbered transcript lines below and propose STRATA: runs of lines that",
+                  "belong to one of the classes in the vocabulary. Everything you do not mark is",
+                  "main-topic content. Prefer precise runs over generous ones; a run may be one line."]
+    roster = list(dict.fromkeys(r["speaker"] for r in pack.get("segments") or []
+                                if r.get("speaker")))
+    if roster:
+        lines += ["", "Speakers (from the human's assignment pass): " + " · ".join(roster)]
+    lines += ["", "## Vocabulary", ""]
     for v in pack.get("vocabulary") or []:
         lines.append(f"- `{v['category']}` — {v.get('gloss') or ''}".rstrip(" —"))
+    marks = pack.get("mark_vocabulary") or []
+    if marks:
+        lines += ["", "## Mark-family classes", "",
+                  "Routed ATTENTION for the correction pass, not strata — use these tokens as the",
+                  "`category` of a row (tier 2 unless certain) instead of inventing a near-synonym:", ""]
+        for v in marks:
+            lines.append(f"- `{v['category']}` — {v.get('gloss') or ''}".rstrip(" —"))
     existing = pack.get("existing_strata") or []
     lines += ["", "## Already asserted over this window", ""]
     if existing:
@@ -245,11 +385,18 @@ def render_filter_pack(pack: Dict[str, Any]) -> str:  # The proposer brief (mark
                          f"(by {e.get('actor') or '?'}) — do not re-propose")
     else:
         lines.append("- (none)")
-    lines += ["", OUTPUT_CONTRACT, "## Transcript", ""]
-    for r in pack.get("segments") or []:
-        st = _fmt_ts(r["start"]) if r.get("start") is not None else "--:--"
-        en = _fmt_ts(r["end"]) if r.get("end") is not None else "--:--"
-        lines.append(f"[{r['i']}] {st}–{en}  {r['text']}")
+    contract = (OUTPUT_CONTRACT.replace(_OPEN_CATEGORY_RULE, _CLOSED_CATEGORY_RULE)
+                if closed else OUTPUT_CONTRACT)
+    lines += ["", contract, "## Transcript", ""]
+    ctx = pack.get("context") or {}
+    if ctx.get("before"):
+        lines += ["### Context BEFORE the window — read-only, never propose over `(ctx)` lines", ""]
+        lines += _render_pack_lines(ctx["before"], numbered=False)
+        lines += ["", "### The window — propose over these numbered lines", ""]
+    lines += _render_pack_lines(pack.get("segments") or [], numbered=True)
+    if ctx.get("after"):
+        lines += ["", "### Context AFTER the window — read-only, never propose over `(ctx)` lines", ""]
+        lines += _render_pack_lines(ctx["after"], numbered=False)
     return "\n".join(lines) + "\n"
 
 
@@ -354,6 +501,7 @@ def write_filter_propset(
     out_root: Path,                       # Proposal-set root (<workspace>/proposals)
     proposer: Dict[str, Any],             # Provenance: {"kind": "claude-code-subagent" | "api" | ..., "name": ..., ...}
     ws: Any = None,                       # Resolved workspace (relativize_recorded) or None
+    extra: Optional[Dict[str, Any]] = None,  # Additive manifest fields (e.g. a merge's `merged_from`)
 ) -> Dict[str, Any]:  # {"set_id","set_dir","manifest_path","classes","counts","tier2_counts"}
     """Write one filtering proposal set: `<out_root>/<set_id>/manifest.json` +
     `proposals.jsonl` — the durable half of the derived-verdicts contract. The
@@ -390,12 +538,104 @@ def write_filter_propset(
         "files": {"proposals": "proposals.jsonl"},
         "counts": counts,
         "tier2_counts": tier2,
+        **dict(extra or {}),
     }
     manifest_path = set_dir / "manifest.json"
     manifest_path.write_text(json.dumps(relativize_recorded(manifest, ws), indent=2,
                                         ensure_ascii=False))
     return {"set_id": set_id, "set_dir": str(set_dir), "manifest_path": str(manifest_path),
             "classes": manifest["classes"], "counts": counts, "tier2_counts": tier2}
+
+
+def _index_iou(a: Tuple[int, int], b: Tuple[int, int]) -> float:  # IoU of two inclusive pack-line runs
+    inter = min(a[1], b[1]) - max(a[0], b[0]) + 1
+    if inter <= 0:
+        return 0.0
+    return inter / float((a[1] - a[0] + 1) + (b[1] - b[0] + 1) - inter)
+
+
+def merge_filter_proposals(
+    sets: List[Dict[str, Any]],  # load_filter_proposal_sets-shaped entries ({"manifest","proposals"}), any windows
+    pack: Dict[str, Any],        # The TARGET pack every row re-resolves against (normally the whole spine)
+    *,
+    iou: float = 0.9,            # Same-category pack-line IoU at/above which two rows are ONE proposal
+) -> List[Dict[str, Any]]:  # Proposal-set rows in target-pack coordinates, each carrying `origins`
+    """Fold several proposal sets over ONE spine into one walkable set (design
+    6752db0a (7) + (8)): N window sets become one set, and rival ARMS of an
+    experiment become one human walk. Each row re-resolves by SEGMENT ID into
+    the target pack's coordinates (loud when a segment is not in it — the spine
+    drifted or the pack is the wrong one); same-category rows whose runs agree
+    (IoU >= `iou`) collapse into one row whose `origins` name every contributing
+    (set, proposal, proposer, window, run, tier, confidence). The representative
+    is the most-agreed run, ties to the highest confidence; tier = the most
+    visible among the members. Rows that merely overlap stay separate — the
+    human's accepted span decides, and each origin set still benches on its own
+    against the live strata (the join is by span, so per-arm verdicts cost no
+    second walk)."""
+    pos = {r["id"]: r["i"] for r in pack.get("segments") or []}
+    flat: List[Dict[str, Any]] = []
+    for entry in sets:
+        m = entry.get("manifest") or {}
+        if (m.get("source") or {}).get("source_id") != (pack.get("source") or {}).get("source_id"):
+            raise ValueError(f"set {m.get('proposal_set_id')}: a different source than the target pack")
+        for p in entry.get("proposals") or []:
+            ids = list(p.get("segment_ids") or [])
+            missing = [i for i in ids if i not in pos]
+            if not ids or missing:
+                raise ValueError(f"set {m.get('proposal_set_id')} proposal {p.get('proposal_id')}: "
+                                 f"{len(missing) or 'all'} segment id(s) not in the target pack")
+            run = (min(pos[i] for i in ids), max(pos[i] for i in ids))
+            flat.append({"p": p, "run": run,
+                         "origin": {"set_id": m.get("proposal_set_id"),
+                                    "proposal_id": p.get("proposal_id"),
+                                    "proposer": (m.get("model") or {}).get("name"),
+                                    "window": m.get("window"),
+                                    "from_i": run[0], "to_i": run[1],
+                                    "tier": int(p.get("tier", 1)),
+                                    "confidence": p.get("confidence")}})
+    flat.sort(key=lambda f: (str(f["p"].get("category")), f["run"][0], f["run"][1]))
+    clusters: List[List[Dict[str, Any]]] = []
+    for f in flat:
+        home = next((c for c in reversed(clusters)
+                     if c[0]["p"].get("category") == f["p"].get("category")
+                     and _index_iou(c[0]["run"], f["run"]) >= float(iou)
+                     and f["origin"]["set_id"] not in {x["origin"]["set_id"] for x in c}), None)
+        if home is None:
+            clusters.append([f])
+        else:
+            home.append(f)
+    segs = pack.get("segments") or []
+    out: List[Dict[str, Any]] = []
+    for c in clusters:
+        votes: Dict[Tuple[int, int], int] = {}
+        for f in c:
+            votes[f["run"]] = votes.get(f["run"], 0) + 1
+        rep_f = max(c, key=lambda f: (votes[f["run"]], float(f["p"].get("confidence") or 0.0)))
+        p, (fi, ti) = rep_f["p"], rep_f["run"]
+        run = segs[fi:ti + 1]
+        starts = [s["start"] for s in run if s.get("start") is not None]
+        ends = [s["end"] for s in run if s.get("end") is not None]
+        fix = next((f["p"]["replacement"] for f in [rep_f] + c if f["p"].get("replacement")), None)
+        if fix is not None and fi != ti:
+            fix = None
+        out.append({
+            "proposal_id": str(uuid.uuid4()),
+            "category": p.get("category"), "label": p.get("category"),
+            "start_time": (round(min(starts), 4) if starts else None),
+            "end_time": (round(max(ends), 4) if ends else None),
+            "segment_ids": [s["id"] for s in run],
+            "tier": min(f["origin"]["tier"] for f in c),
+            "confidence": p.get("confidence"), "score": p.get("confidence"),
+            "rationale": p.get("rationale"),
+            **({"replacement": fix} if fix is not None else {}),
+            "evidence": {"pack_id": pack.get("pack_id"), "from_i": fi, "to_i": ti,
+                         "quote": (p.get("evidence") or {}).get("quote"),
+                         **({"text": str(run[0].get("text") or "")} if fix is not None else {})},
+            "origins": [f["origin"] for f in c],
+        })
+    out.sort(key=lambda r: (r["start_time"] if r["start_time"] is not None else 0.0,
+                            r["evidence"]["from_i"]))
+    return out
 
 
 def render_filter_propset_markdown(

@@ -13,12 +13,16 @@ from cjm_transcript_correction_core.graph import (build_stratum_correction,
                                                   corrections_to_edits,
                                                   latest_extraction_gates)
 from cjm_transcript_correction_core.models import RECOMMENDED_STRATUM_CLASSES, SpineSegment
-from cjm_transcript_correction_core.strata import (FILTER_LANE, FILTER_PACK_FORMAT,
+from cjm_transcript_correction_core.strata import (FILTER_LANE, FILTER_MARK_GLOSSES,
+                                                   FILTER_PACK_FORMAT,
+                                                   FILTER_PACK_VERSION,
+                                                   FILTER_PACK_VERSION_LADDER,
                                                    FILTER_PROPOSAL_SET_FORMAT,
                                                    active_strata, bench_filter_proposals,
                                                    build_filter_pack, exclude_strata,
-                                                   load_filter_proposal_sets, pack_digest,
-                                                   pending_filter_proposals,
+                                                   load_filter_proposal_sets,
+                                                   merge_filter_proposals, pack_digest,
+                                                   pending_filter_proposals, plan_pack_windows,
                                                    proposals_from_rows, render_filter_pack,
                                                    render_filter_propset_markdown,
                                                    select_span_segments,
@@ -112,6 +116,8 @@ def test_render_filter_pack_carries_brief_contract_and_lines():
     assert "## Output contract" in md and '"from_i"' in md
     assert "`apparatus` lines 0–0" in md and "do not re-propose" in md
     assert "[2] 00:06.0–00:08.5  By the way, I use Notion for this." in md
+    late = build_filter_pack("src", "t", None, [SpineSegment(id="x", index=0, text="late", start_time=59.96, end_time=119.99)])
+    assert "[0] 01:00.0–02:00.0  late" in render_filter_pack(late)   # never 00:60.0
     assert md.index("## Vocabulary") < md.index("## Output contract") < md.index("## Transcript")
 
 
@@ -415,3 +421,126 @@ def test_extraction_gate_lanes_fold_separately():
     assert main["h"]["annotated_through"] == 100.0        # the newer LANE row did not displace it
     assert lane["h"]["annotated_through"] == 40.0
     assert latest_extraction_gates(rows, lane="other") == {}
+
+
+# ---- the reading-ladder pack fields (design 6752db0a): speakers, margins, class-scoped passes ----
+
+SPEAKERS = {"s0": "Host", "s1": "Host", "s2": "Host", "s3": "Guest", "s4": "Guest", "s5": None}
+
+
+def test_pack_without_ladder_fields_stays_0_1_0():
+    pack = _pack()
+    assert pack["version"] == FILTER_PACK_VERSION
+    assert all("speaker" not in r for r in pack["segments"])
+    assert "context" not in pack and "closed_vocabulary" not in pack and "mark_vocabulary" not in pack
+
+
+def test_pack_rows_carry_speakers_and_the_brief_names_each_turn_once():
+    pack = _pack(speakers=SPEAKERS)
+    assert pack["version"] == FILTER_PACK_VERSION_LADDER
+    assert [r["speaker"] for r in pack["segments"]] == ["Host", "Host", "Guest", "Guest", None]
+    assert pack["digest"] != _pack()["digest"]            # the attribution was READ
+    assert pack["digest"] != _pack(speakers={**SPEAKERS, "s3": "Host"})["digest"]
+    md = render_filter_pack(pack)
+    assert "Speakers (from the human's assignment pass): Host · Guest" in md
+    body = md[md.index("## Transcript"):]
+    assert body.count("— Host —") == 1 and body.count("— Guest —") == 1
+    assert body.index("— Guest —") < body.index("[2] ") < body.index("— (unassigned) —") < body.index("[4] ")
+
+
+def test_pack_margin_keeps_unnumbered_read_only_context():
+    pack = _pack(window=(3.0, 9.0), margin=1, speakers=SPEAKERS)
+    assert [r["id"] for r in pack["segments"]] == ["s2", "s3", "s4"]
+    assert [r["id"] for r in pack["context"]["before"]] == ["s0"]   # s1 is wordless — never context
+    assert [r["id"] for r in pack["context"]["after"]] == ["s5"]
+    assert all("i" not in r for side in pack["context"].values() for r in side)
+    assert pack["digest"] != _pack(window=(3.0, 9.0), speakers=SPEAKERS)["digest"]
+    md = render_filter_pack(pack)
+    assert "(ctx) 00:00.0–00:03.0  Opening credits, read by the author." in md
+    assert "(ctx) 00:11.0–00:14.0  This episode is sponsored by X." in md
+    assert md.index("Context BEFORE") < md.index("[0] ") < md.index("Context AFTER")
+    # rows still validate against the numbered window only
+    with pytest.raises(ValueError):
+        validate_proposal_rows([{"category": "sponsor", "from_i": 3, "to_i": 3}], pack)
+
+
+def test_closed_vocabulary_pass_forbids_minting_and_names_the_mark_outlet():
+    pack = _pack(vocabulary=["disfluency"], closed=True, mark_vocabulary=["asr-error", "seam-suspect"])
+    assert [v["category"] for v in pack["vocabulary"]] == ["disfluency"]
+    assert pack["closed_vocabulary"] is True
+    assert [v["gloss"] for v in pack["mark_vocabulary"]] == [FILTER_MARK_GLOSSES["asr-error"],
+                                                             FILTER_MARK_GLOSSES["seam-suspect"]]
+    md = render_filter_pack(pack)
+    assert "class-scoped pass" in md and "NEW kebab-case class" not in md
+    assert "`tangent`" not in md and "## Mark-family classes" in md and "`seam-suspect`" in md
+    open_md = render_filter_pack(_pack())
+    assert "NEW kebab-case class" in open_md and "## Mark-family classes" not in open_md
+    assert {"qa", "logistics"} <= set(STRATUM_GLOSSES) and "qa" not in RECOMMENDED_STRATUM_CLASSES
+
+
+def _line(i, start, end, text="words"):
+    return SpineSegment(id=f"w{i}", index=i, text=text, start_time=start, end_time=end)
+
+
+def test_plan_pack_windows_tiles_the_spine_at_mechanical_seams():
+    # 12 lines, 1 s each; a long silence before w5, a speaker turn at w7
+    segs, t = [], 0.0
+    for i in range(12):
+        t += 3.0 if i == 5 else 0.2
+        segs.append(_line(i, t, t + 1.0))
+        t += 1.0
+    who = {f"w{i}": ("A" if i < 7 else "B") for i in range(12)}
+    assert plan_pack_windows(segs, 1) == [(0.0, None)]
+    gap_cut = plan_pack_windows(segs, 2, slack=0.4)
+    assert len(gap_cut) == 2 and gap_cut[0][1] == gap_cut[1][0] and gap_cut[1][1] is None
+    assert segs[4].end_time < gap_cut[0][1] < segs[5].start_time      # the longest silence near the middle
+    turn_cut = plan_pack_windows(segs, 2, speakers=who, slack=0.4)
+    assert segs[6].end_time < turn_cut[0][1] < segs[7].start_time     # a speaker turn outranks the silence
+    for windows in (gap_cut, turn_cut, plan_pack_windows(segs, 4, speakers=who)):
+        packed = [r["id"] for w in windows
+                  for r in build_filter_pack("src", "t", None, segs, window=w)["segments"]]
+        assert packed == [s.id for s in segs]                          # every line exactly once, in order
+    with pytest.raises(ValueError):
+        plan_pack_windows(segs, 0)
+    with pytest.raises(ValueError):
+        plan_pack_windows(segs, 13)
+
+
+def _set(tmp_path, pack, rows, name):
+    res = write_filter_propset(pack, proposals_from_rows(validate_proposal_rows(rows, pack), pack),
+                               out_root=tmp_path / "proposals",
+                               proposer={"kind": "claude-code-subagent", "name": name})
+    return [e for e in load_filter_proposal_sets(str(tmp_path), "src") if e["manifest"]["proposal_set_id"] == res["set_id"]][0]
+
+
+def test_merge_folds_window_sets_and_rival_arms_into_target_coordinates(tmp_path):
+    whole = _pack()
+    late = _pack(window=(6.0, 14.0))                                   # s3 s4 s5 -> i 0 1 2
+    arm_a = _set(tmp_path, whole, [
+        {"category": "sponsor", "from_i": 4, "to_i": 4, "tier": 1, "confidence": 0.9, "quote": "sponsored by X"},
+        {"category": "tangent", "from_i": 2, "to_i": 2, "tier": 2, "confidence": 0.4}], "whole")
+    arm_b = _set(tmp_path, late, [
+        {"category": "sponsor", "from_i": 2, "to_i": 2, "tier": 2, "confidence": 0.6},
+        {"category": "tangent", "from_i": 0, "to_i": 1, "tier": 1, "confidence": 0.7},   # overlaps, disagrees
+        {"category": "tool-mention", "from_i": 0, "to_i": 0, "tier": 1, "confidence": 0.8}], "late-window")
+    merged = merge_filter_proposals([arm_a, arm_b], whole)
+    by = {(r["category"], r["evidence"]["from_i"], r["evidence"]["to_i"]): r for r in merged}
+    assert set(by) == {("sponsor", 4, 4), ("tangent", 2, 2), ("tangent", 2, 3), ("tool-mention", 2, 2)}
+    agreed = by[("sponsor", 4, 4)]
+    assert [o["proposer"] for o in agreed["origins"]] == ["whole", "late-window"]
+    assert agreed["tier"] == 1 and agreed["segment_ids"] == ["s5"] and agreed["evidence"]["pack_id"] == whole["pack_id"]
+    assert agreed["proposal_id"] not in {o["proposal_id"] for o in agreed["origins"]}
+    assert by[("tangent", 2, 3)]["segment_ids"] == ["s3", "s4"] and len(by[("tangent", 2, 3)]["origins"]) == 1
+    assert [r["start_time"] for r in merged] == sorted(r["start_time"] for r in merged)
+    # each ORIGIN set still benches on its own against the live strata — no second walk
+    live = [_stratum("st", "sponsor", ["s5"], 11.0, 14.0, proposal_id=agreed["proposal_id"])]
+    for arm, window in ((arm_a, (0.0, None)), (arm_b, (6.0, None))):
+        verdicts = {v["category"]: v["verdict"] for v in
+                    bench_filter_proposals(arm["proposals"], live, window, watermark=99.0)["verdicts"]}
+        assert verdicts["sponsor"] == "accepted"
+    early = _set(tmp_path, whole, [{"category": "apparatus", "from_i": 0, "to_i": 0}], "early")
+    with pytest.raises(ValueError):                                    # a row the target pack cannot hold
+        merge_filter_proposals([early], late)
+    other = build_filter_pack("src2", "t", None, SEGS)
+    with pytest.raises(ValueError):
+        merge_filter_proposals([arm_a], other)

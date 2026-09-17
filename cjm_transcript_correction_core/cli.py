@@ -20,7 +20,8 @@ from cjm_context_graph_primitives.query import NodeQuery
 from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
 from cjm_substrate.core.workspace import relativize_recorded, resolve_workspace
-from cjm_transcript_correction_core.graph import (active_corrections, bench_event_proposals,
+from cjm_transcript_correction_core.graph import (active_corrections, active_speaker_assignments,
+                                                  bench_event_proposals,
                                                   commit_chunk_insert_correction,
                                                   commit_chunk_split_correction,
                                                   commit_extraction_gate, commit_mark_correction,
@@ -28,11 +29,12 @@ from cjm_transcript_correction_core.graph import (active_corrections, bench_even
                                                   commit_stratum_retraction, commit_text_correction,
                                                   correction_stats, extract_spine_dataset,
                                                   fa_words_for_transcript, labeled_insert_spans,
-                                                  list_source_spines, load_extraction_gates,
-                                                  load_source_corrections, load_source_segments,
-                                                  mark_anchor_segments, open_marks,
-                                                  project_effective_spine, set_session_status,
-                                                  skeleton_hash_for, start_session)
+                                                  list_source_spines, list_speaker_entities,
+                                                  load_extraction_gates, load_source_corrections,
+                                                  load_source_segments, mark_anchor_segments,
+                                                  open_marks, project_effective_spine,
+                                                  set_session_status, skeleton_hash_for,
+                                                  start_session)
 from cjm_transcript_correction_core.models import CorrectionConfig, DatasetManifest, new_dataset_id
 from cjm_transcript_correction_core.pipeline import (load_decomp_manifest, resolve_graph_db_path,
                                                      run_correction, run_review)
@@ -44,7 +46,8 @@ from cjm_transcript_correction_core.strata import (active_strata, bench_filter_p
                                                    build_filter_pack, FILTER_LANE,
                                                    FILTER_PACK_FORMAT, load_filter_proposal_sets,
                                                    materialized_fix_ids, materialized_mark_ids,
-                                                   pending_filter_proposals, proposals_from_rows,
+                                                   merge_filter_proposals, pending_filter_proposals,
+                                                   plan_pack_windows, proposals_from_rows,
                                                    render_filter_pack,
                                                    render_filter_propset_markdown,
                                                    select_span_segments, validate_proposal_rows,
@@ -376,6 +379,22 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
     fpack.add_argument("--window", nargs=2, type=float, default=None, metavar=("START", "END"),
                        help="Source-seconds window to pack (default: the whole spine) — the "
                             "partitioning seam for long sources")
+    fpack.add_argument("--split", type=int, default=None, metavar="N",
+                       help="Write N window packs that tile the spine, cut at mechanical seams "
+                            "(speaker turns, then the longest silence near each even cut)")
+    fpack.add_argument("--margin", type=int, default=0, metavar="LINES",
+                       help="Text segments of READ-ONLY context either side of a window "
+                            "(un-numbered; a proposer reads them but cannot propose over them)")
+    fpack.add_argument("--vocabulary", default=None, metavar="CLASS[,CLASS…]",
+                       help="The stratum classes this pack names (default: the recommended slate)")
+    fpack.add_argument("--closed", action="store_true",
+                       help="A CLASS-SCOPED pass: the brief forbids minting classes outside "
+                            "--vocabulary / --marks")
+    fpack.add_argument("--marks", default=None, metavar="CLASS[,CLASS…]",
+                       help="Mark-family outlet classes the brief names (e.g. "
+                            "asr-error,proper-noun-suspect,seam-suspect; default: none)")
+    fpack.add_argument("--no-speakers", action="store_true",
+                       help="Leave the assign lane's speaker attribution off the pack lines")
     fpack.add_argument("--out-dir", default=None,
                        help="Pack directory (default: <workspace>/packs)")
     fpack.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
@@ -400,6 +419,24 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
     fingest.add_argument("--out-dir", default=None,
                          help="Proposal-set root directory (default: <workspace>/proposals)")
     fingest.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
+
+    fmerge = sub.add_parser(
+        "filter-merge",
+        help="Fold several filtering proposal sets over ONE spine (window sets, rival "
+             "proposers) into one walkable set in a target pack's coordinates; rows keep "
+             "their origins (no graph writes)")
+    fmerge.add_argument("--pack", required=True,
+                        help="The TARGET pack json every row re-resolves against (the whole spine)")
+    fmerge.add_argument("--sets", required=True, nargs="+", metavar="SET_DIR",
+                        help="Proposal-set directories to fold (each holds manifest.json)")
+    fmerge.add_argument("--name", required=True, help="Name recorded as the merged set's proposer")
+    fmerge.add_argument("--iou", type=float, default=0.9,
+                        help="Same-category pack-line IoU at/above which two rows are one (default 0.9)")
+    fmerge.add_argument("--workspace", default=None,
+                        help="Workspace root (default: CJM_WORKSPACE env, else upward walk from cwd)")
+    fmerge.add_argument("--out-dir", default=None,
+                        help="Proposal-set root directory (default: <workspace>/proposals)")
+    fmerge.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
 
     fconfirm = sub.add_parser(
         "filter-confirm",
@@ -658,6 +695,8 @@ def main(
         return asyncio.run(filter_pack_command(args))
     if args.command == "filter-ingest":
         return filter_ingest_command(args)
+    if args.command == "filter-merge":
+        return filter_merge_command(args)
     if args.command == "filter-confirm":
         return asyncio.run(filter_confirm_command(args))
     raise SystemExit(f"unknown command: {args.command}")
@@ -1679,6 +1718,10 @@ def _short(value: Optional[str], n: int = 8) -> str:  # Display tail of an id
     return str(value or "")[-n:] if value else "-"
 
 
+def _class_list(value: Optional[str]) -> Optional[List[str]]:  # "a, b" -> ["a", "b"]; empty -> None
+    return [c.strip() for c in value.split(",") if c.strip()] or None if value else None
+
+
 async def filter_pack_command(
     args: argparse.Namespace,  # Parsed args for the `filter-pack` subcommand
 ) -> int:  # Process exit code
@@ -1702,26 +1745,44 @@ async def filter_pack_command(
         eff = project_effective_spine(segs, active)
         strata = active_strata(corrections, superseded)
         chash = await _source_content_hash(queue, cap, sid)
-        window = tuple(args.window) if args.window else None
-        pack = build_filter_pack(sid, title, skel, eff, content_hash=chash,
-                                 window=window, strata=strata)
+        speakers = None
+        assigned = {} if args.no_speakers else active_speaker_assignments(corrections, superseded)
+        if assigned:   # a source the assign lane never touched keeps the speaker-less pack
+            names = {e["id"]: (e.get("properties") or {}).get("canonical_name")
+                     for e in await list_speaker_entities(queue, cap, kind=None)}
+            speakers = {s.id: names.get((assigned.get(s.id) or {}).get("entity_id")) for s in eff}
     finally:
         await _close_graph_stack(manager, queue, cap)
+    if args.split and args.window:
+        raise SystemExit("--split plans its own windows — drop --window")
+    windows = (plan_pack_windows(eff, args.split, speakers=speakers) if args.split
+               else [tuple(args.window) if args.window else None])
+    packs = [build_filter_pack(sid, title, skel, eff, content_hash=chash, window=w, strata=strata,
+                               vocabulary=_class_list(args.vocabulary), closed=args.closed,
+                               mark_vocabulary=_class_list(args.marks), speakers=speakers,
+                               margin=args.margin) for w in windows]
+    if args.split:   # the tiling promise, checked: one window per timed text segment, none dropped
+        seen = [r["id"] for p in packs for r in p["segments"]]
+        want = [s.id for s in eff if not s.is_empty]
+        if sorted(seen) != sorted(want):
+            raise SystemExit(f"--split windows do not tile the spine ({len(seen)} packed vs "
+                             f"{len(want)} text segments — untimed text segments?); pack by --window")
     out_dir = (Path(args.out_dir) if args.out_dir
                else (ws.root / "packs" if ws is not None else Path("packs")))
     out_dir.mkdir(parents=True, exist_ok=True)
-    json_path = out_dir / f"{pack['pack_id']}.json"
-    md_path = out_dir / f"{pack['pack_id']}.md"
-    json_path.write_text(json.dumps(pack, indent=2, ensure_ascii=False))
-    md_path.write_text(render_filter_pack(pack))
-    w = pack["window"]
     print(f"source: {title or sid}  ({sid}) · spine {_spine_tag(skel)}")
-    print(f"pack {pack['pack_id']}: {len(pack['segments'])} text segments · window "
-          f"{w['start']:.1f}-{(w['end'] if w['end'] is not None else 0.0):.1f}s · "
-          f"{len(pack['existing_strata'])} strata already asserted")
-    print(f"  json  {json_path}")
-    print(f"  brief {md_path}")
-    print(f"next: hand the brief to a proposer; then filter-ingest --pack {json_path} "
+    for pack in packs:
+        json_path = out_dir / f"{pack['pack_id']}.json"
+        md_path = out_dir / f"{pack['pack_id']}.md"
+        json_path.write_text(json.dumps(pack, indent=2, ensure_ascii=False))
+        md_path.write_text(render_filter_pack(pack))
+        w = pack["window"]
+        print(f"pack {pack['pack_id']}: {len(pack['segments'])} text segments · window "
+              f"{w['start']:.1f}-{(w['end'] if w['end'] is not None else 0.0):.1f}s · "
+              f"{len(pack['existing_strata'])} strata already asserted")
+        print(f"  json  {json_path}")
+        print(f"  brief {md_path}")
+    print(f"next: hand each brief to a proposer; then filter-ingest --pack <pack json> "
           "--rows <its jsonl> --proposer <name>")
     return 0
 
@@ -1791,6 +1852,59 @@ def filter_ingest_command(
     t2 = " · ".join(f"{k}x{v}" for k, v in sorted(res["tier2_counts"].items())) or "none"
     print(f"tier-1: {t1}\ntier-2: {t2}")
     print(f"next: filter-confirm --source {src.get('source_id')} --skeleton {tag}")
+    return 0
+
+
+def filter_merge_command(
+    args: argparse.Namespace,  # Parsed args for the `filter-merge` subcommand
+) -> int:  # Process exit code
+    """Execute `filter-merge`: fold several proposal sets over one spine into
+    ONE set in the target pack's coordinates (window sets of a divided source;
+    rival arms of an experiment, walked once). Rows keep their `origins`, the
+    manifest its `merged_from` — each origin set still benches on its own. No
+    graph, no journal."""
+    ws = resolve_workspace(explicit=getattr(args, "workspace", None))
+    pack_path = Path(args.pack)
+    try:
+        pack = json.loads(pack_path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(f"cannot read pack {pack_path}: {e}")
+    if pack.get("format") != FILTER_PACK_FORMAT:
+        raise SystemExit(f"{pack_path} is not a filter pack (format {pack.get('format')!r})")
+    sets: List[Dict[str, Any]] = []
+    for d in args.sets:
+        mp = Path(d) / "manifest.json"
+        try:
+            m = json.loads(mp.read_text())
+            data = Path(d) / str((m.get("files") or {}).get("proposals") or "proposals.jsonl")
+            rows = [json.loads(line) for line in data.read_text().splitlines() if line.strip()]
+        except (OSError, json.JSONDecodeError) as e:
+            raise SystemExit(f"cannot read proposal set {d}: {e}")
+        sets.append({"manifest": m, "proposals": rows})
+    try:
+        proposals = merge_filter_proposals(sets, pack, iou=args.iou)
+    except ValueError as e:
+        raise SystemExit(f"merge refused: {e}")
+    out_root = (Path(args.out_dir) if args.out_dir
+                else (ws.root / "proposals" if ws is not None else None))
+    if out_root is None:
+        raise SystemExit("proposal sets land workspace-local — pass --out-dir or run "
+                         "inside a workspace (CJM_WORKSPACE)")
+    proposer = {"kind": "merge", "name": args.name,
+                **({"session": os.environ["CJM_SESSION"]} if os.environ.get("CJM_SESSION") else {})}
+    merged_from = [{"proposal_set_id": e["manifest"].get("proposal_set_id"),
+                    "proposer": e["manifest"].get("model"), "window": e["manifest"].get("window"),
+                    "pack": e["manifest"].get("pack"), "rows": len(e["proposals"])} for e in sets]
+    res = write_filter_propset(pack, proposals, out_root=out_root, proposer=proposer, ws=ws,
+                               extra={"merged_from": merged_from, "merge": {"iou": args.iou}})
+    manifest = json.loads(Path(res["manifest_path"]).read_text())
+    md_path = Path(res["set_dir"]) / "proposals.md"
+    md_path.write_text(render_filter_propset_markdown(manifest, proposals, pack))
+    agreed = sum(1 for p in proposals if len(p.get("origins") or []) > 1)
+    print(f"merged {sum(len(e['proposals']) for e in sets)} rows from {len(sets)} sets -> "
+          f"{len(proposals)} rows ({agreed} raised by more than one set)")
+    print(f"proposal set {res['set_id']} -> {res['set_dir']}")
+    print(f"  human view {md_path}")
     return 0
 
 
