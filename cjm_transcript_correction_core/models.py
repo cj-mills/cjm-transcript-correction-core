@@ -241,7 +241,8 @@ RECOMMENDED_STRATUM_CLASSES = (
     "tool-mention",   # off-hand tool / product / service mention worth research
     "sponsor",        # sponsor read / advertisement (products may still be research-worthy)
     "research-mark",  # a claim / citation / name a research pass should follow up
-    "disfluency",     # hesitations, false starts, repeats — detector training feedstock
+    "disfluency",     # a run CONTAINING hesitations / false starts / repeats — detector feedstock; content stays
+    "filler",         # a wholly elidable line / run — the clean read's exclusion class (finding 353394c8)
     "apparatus",      # credits, dedication, legal, acknowledgments, boilerplate (narrowed 2026-09-09: headers moved out)
     "quotation",      # someone else's voice quoted verbatim (ratified 2026-09-01: proposer-minted on LG ch04)
     # The boundary classes (user ruling 2026-09-09, item 2047cf1d): a notes deliverable renders

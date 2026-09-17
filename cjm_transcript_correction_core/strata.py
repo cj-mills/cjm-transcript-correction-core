@@ -54,7 +54,12 @@ STRATUM_GLOSSES: Dict[str, str] = {
     "tool-mention": "an off-hand mention of a tool / product / service worth pulling out for research",
     "sponsor": "a sponsor read or advertisement (products in it may still be research-worthy)",
     "research-mark": "a claim, citation, name, or reference a research pass should follow up",
-    "disfluency": "hesitations, false starts, repeats — timestamp-detector training feedstock",
+    "disfluency": ("a run that CONTAINS hesitations, false starts or repeats — timestamp-detector "
+                   "training feedstock; its content stays content (a wholly elidable line is `filler`)"),
+    "filler": ("a line or run that is ENTIRELY hesitation, an abandoned false start, a verbatim repeat "
+               "of what follows, or a bare acknowledgement that answers nothing ('Mhm.') — eliding it "
+               "loses NO content, and every reader above the raw spine never sees it; a line that "
+               "carries any content with a filler inside is NOT `filler`"),
     "apparatus": "publishing apparatus: credits, dedication, legal, acknowledgments, boilerplate — NOT a "
                  "read-aloud section title, cross-reference or segue (those have their own classes)",
     "section-header": ("a section title read aloud — the heading a notes deliverable renders under; the "

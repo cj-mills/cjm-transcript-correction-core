@@ -60,6 +60,9 @@ def test_recommended_stratum_classes_are_glossed_class_tokens():
     assert "main-topic" not in RECOMMENDED_STRATUM_CLASSES   # absence IS main-topic
     # quotation: proposer-minted on LG ch04 (8 block quotes), ratified by the user 2026-09-01
     assert "quotation" in RECOMMENDED_STRATUM_CLASSES and "delimiters" in STRATUM_GLOSSES["quotation"]
+    # finding 353394c8: disfluency marks content-bearing runs; filler is the wholly elidable class
+    assert "filler" in RECOMMENDED_STRATUM_CLASSES and "NO content" in STRATUM_GLOSSES["filler"]
+    assert "content stays" in STRATUM_GLOSSES["disfluency"]
 
 
 def test_select_span_segments_is_containment_over_text_segments():
