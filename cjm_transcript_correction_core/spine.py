@@ -444,6 +444,12 @@ class SpineView:
         self._recompute_overlay_ids()
 
     @property
+    def overlays(self) -> List[dict]:  # The ACTIVE speech overlays, load + local echoes (read-only by convention)
+        """Every active overlay on the source — what a span set's pending
+        worklist and verdicts derive from (the annotate lane's proposal mode)."""
+        return self._overlays
+
+    @property
     def overlay_count(self) -> int:  # Active speech overlays on this source
         """How many overlay samples this source carries (status-strip counter)."""
         return len(self._overlays)

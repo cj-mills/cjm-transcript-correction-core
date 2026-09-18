@@ -304,11 +304,19 @@ ANNOTATE_LANE_ACTIONS = frozenset({
     "annotate_pick", "annotate_editor", "annotate_audition", "overlay_remove",
     "overlay_nudge", "overlay_cycle", "nudge_step_down", "nudge_step_up",
     "next_overlay", "prev_overlay", "toggle_wordless_fold",
+    "span_accept", "span_next", "span_prev", "span_jump", "span_tier2", "span_set",
+    "span_watermark",
     "cycle_lane", "cycle_lane_prev", "cancel", "quit_app"})
+# The span_* verbs are the lane's PROPOSAL-DRIVEN MODE (DEC d52d105f): with a
+# span set bound to the open spine the lane walks it — a jump arms a proposal
+# as the ordinary word selection, so the hand gestures above refine it; with
+# none bound they report and the hand lane is unchanged.
 ANNOTATE_ONLY_ACTIONS = frozenset({
     "word_left", "word_right", "word_select", "annotate_quick", "annotate_pick",
     "annotate_editor", "annotate_audition", "overlay_remove", "overlay_nudge",
-    "overlay_cycle", "next_overlay", "prev_overlay"})
+    "overlay_cycle", "next_overlay", "prev_overlay",
+    "span_accept", "span_next", "span_prev", "span_jump", "span_tier2", "span_set",
+    "span_watermark"})
 # The FILTER lane (55bcc3c5, the filtering lane's HITL confirm): the walk +
 # audio vocabulary plus the confirm gestures — accept, span edit (mark the
 # run's start/end at the cursor, then accept over the CURRENT effective

@@ -642,6 +642,9 @@ def pending_span_proposals(
     default (dual-tier doctrine a475ccd6)."""
     recs = [r for r in (_overlay_record(c) for c in overlays) if r]
     by_pid = {r["proposal_id"] for r in recs if r["proposal_id"]}
+    by_seg: Dict[Any, List[Dict[str, Any]]] = {}   # the qt lane re-derives per gesture over hundreds of rows
+    for r in recs:
+        by_seg.setdefault(r["segment_id"], []).append(r)
     out: List[Dict[str, Any]] = []
     for p in sorted(proposals, key=lambda d: (float(d.get("start_time") or 0.0),
                                               int((d.get("anchor") or {}).get("char_start") or 0))):
@@ -650,10 +653,10 @@ def pending_span_proposals(
         if p.get("proposal_id") in by_pid:
             continue
         a = p.get("anchor") or {}
-        if any(r["segment_id"] == a.get("segment_id") and r["label"] == p.get("label")
+        if any(r["label"] == p.get("label")
                and _char_overlap(int(a.get("char_start") or 0), int(a.get("char_end") or 0),
                                  r["char_start"], r["char_end"]) > 0
-               for r in recs):
+               for r in by_seg.get(a.get("segment_id"), ())):
             continue
         out.append(p)
     return out
@@ -691,19 +694,25 @@ def bench_span_proposals(
 
     def join(ordered: List[Dict[str, Any]], no_match: str) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
         matches: Dict[int, Dict[str, Any]] = {}
+        carried: Dict[Any, List[int]] = {}   # proposal id -> unmatched keys, overlay order
+        seg_keys: Dict[Any, List[int]] = {}  # segment id -> unmatched keys, overlay order
+        for key, r in unmatched.items():
+            if r["proposal_id"]:
+                carried.setdefault(r["proposal_id"], []).append(key)
+            seg_keys.setdefault(r["segment_id"], []).append(key)
         for p in ordered:   # pass 0: exact proposal-id carry (the accept gesture records it)
-            for key, r in list(unmatched.items()):
-                if r["proposal_id"] and r["proposal_id"] == p.get("proposal_id"):
-                    matches[id(p)] = unmatched.pop(key)
-                    break
+            key = next((k for k in carried.get(p.get("proposal_id"), ()) if k in unmatched), None)
+            if key is not None:
+                matches[id(p)] = unmatched.pop(key)
         for same in (True, False):   # pass 1: same label best char IoU; pass 2: any label
             pairs: List[Tuple[float, int, int]] = []
             for p in ordered:
                 if id(p) in matches:
                     continue
                 sid, cs, ce = _span(p)
-                for key, r in unmatched.items():
-                    if r["segment_id"] != sid or (same and r["label"] != p.get("label")):
+                for key in seg_keys.get(sid, ()):
+                    r = unmatched.get(key)
+                    if r is None or (same and r["label"] != p.get("label")):
                         continue
                     iou = _char_iou(cs, ce, r["char_start"], r["char_end"])
                     if iou > 0.0:
@@ -746,6 +755,31 @@ def bench_span_proposals(
             "verdicts": v1 + v2, "missed": missed}
 
 
+def locate_span_tokens(
+    proposal: Dict[str, Any],  # A span set row (anchor + text_snapshot)
+    text: str,                 # The segment's CURRENT effective text
+    where: str = "the line",   # How refusals name the line (the snap passes "#<index>")
+) -> Tuple[int, int, int, int]:  # (char_start, char_end, first_token, last_token) on the current line
+    """Where a proposal's words sit on the CURRENT line, as a character range
+    AND a whole-token range — the one resolution the accept snap and the qt
+    lane's ARM step share (DEC d52d105f: a jump pre-loads the word selection
+    with the proposal's tokens, so the hand gestures refine it). The anchor
+    re-locates through `reanchor_span` (the snapshot is the truth, the offsets
+    its hint). Raises ValueError when the words are gone from the line or the
+    range no longer sits on token edges."""
+    a = dict(proposal.get("anchor") or {})
+    located = reanchor_span(a, text or "")
+    if located is None:
+        raise ValueError(f"words {a.get('text_snapshot')!r} are no longer on {where} ({text!r})")
+    cs, ce = located
+    tokens = segment_word_tokens(text or "")
+    starts = [i for i, t in enumerate(tokens) if t[0] == cs]
+    ends = [i for i, t in enumerate(tokens) if t[1] == ce]
+    if not starts or not ends or ends[0] < starts[0]:
+        raise ValueError(f"span {cs}:{ce} on {where} no longer sits on word edges")
+    return cs, ce, starts[0], ends[0]
+
+
 def snap_span_proposal(
     proposal: Dict[str, Any],                  # A span set row (anchor + text_snapshot)
     segment: SpineSegment,                     # The segment's CURRENT effective view
@@ -762,19 +796,11 @@ def snap_span_proposal(
     if a.get("segment_id") != segment.id:
         raise ValueError(f"proposal anchors segment {a.get('segment_id')}, not {segment.id}")
     text = segment.text or ""
-    located = reanchor_span(a, text)
-    if located is None:
-        raise ValueError(f"words {a.get('text_snapshot')!r} are no longer on #{segment.index} "
-                         f"({text!r})")
-    cs, ce = located
+    cs, ce, first, last = locate_span_tokens(proposal, text, where=f"#{segment.index}")
     tokens = segment_word_tokens(text)
-    starts = [i for i, t in enumerate(tokens) if t[0] == cs]
-    ends = [i for i, t in enumerate(tokens) if t[1] == ce]
-    if not starts or not ends or ends[0] < starts[0]:
-        raise ValueError(f"span {cs}:{ce} on #{segment.index} no longer sits on word edges")
     if segment.start_time is None or segment.end_time is None:
         raise ValueError(f"#{segment.index} has no audio times to snap against")
-    snapped = _spine().snap_word_span(tokens, starts[0], ends[0], float(segment.start_time),
+    snapped = _spine().snap_word_span(tokens, first, last, float(segment.start_time),
                              float(segment.end_time), len(text), fa_words)
     if snapped is None:
         raise ValueError(f"span on #{segment.index} refused by the snap (word range invalid)")

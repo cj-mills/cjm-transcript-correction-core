@@ -14,7 +14,8 @@ from cjm_transcript_correction_core.spans import (FILTERABLE_OVERLAY_LABELS, HES
                                                   SPAN_PROPOSAL_SET_FORMAT, bench_span_proposals,
                                                   build_span_pack, find_token_span, is_span_pack,
                                                   lexicon_span_rows, load_span_proposal_sets,
-                                                  overlay_label_slate, pending_span_proposals,
+                                                  locate_span_tokens, overlay_label_slate,
+                                                  pending_span_proposals,
                                                   render_span_pack, render_span_propset_markdown,
                                                   snap_span_proposal, span_proposals_from_rows,
                                                   validate_span_rows, write_span_propset)
@@ -270,6 +271,22 @@ def test_snap_span_proposal_snaps_from_fa_words_and_reanchors_after_an_edit():
         snap_span_proposal(rep, gone, FA)
     with pytest.raises(ValueError, match="anchors segment s0"):
         snap_span_proposal(rep, SEGS[2], FA)
+
+
+def test_locate_span_tokens_is_the_shared_arm_and_snap_resolution():
+    """The qt lane's ARM step and the accept snap resolve a proposal through ONE
+    function (DEC d52d105f): the character range AND the whole-token range on
+    the CURRENT line, re-anchored by snapshot, refusing when the words left."""
+    _pack, props = _props()
+    rep = props[1]   # word-repeat 'the the' on s0
+    cs, ce, first, last = locate_span_tokens(rep, SEGS[0].text)
+    assert SEGS[0].text[cs:ce] == "the the" and (first, last) == (4, 5)
+    cs2, _ce2, first2, last2 = locate_span_tokens(rep, "Um, so we now have the the data center.")
+    assert cs2 == 19 and (first2, last2) == (5, 6)
+    with pytest.raises(ValueError, match="no longer on the line"):
+        locate_span_tokens(rep, "Um, so we have the data center.")
+    with pytest.raises(ValueError, match="no longer on #7"):
+        locate_span_tokens(rep, "Um, so we have the data center.", where="#7")
 
 
 def test_overlay_correction_carries_proposal_provenance():

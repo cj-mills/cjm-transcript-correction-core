@@ -7,18 +7,30 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 ## Modules
 
 - **`cjm_transcript_correction_core.__init__`**
+- **`cjm_transcript_correction_core.cleanread`** — The clean read — L1 of the reading ladder (design 6752db0a; the subtraction
 - **`cjm_transcript_correction_core.cli`** — The CLI driver — the correction core's first (and currently only) frontend. run <decomp-manifest> corrects the committed spine in the decomp graph DB, pointing the graph worker at that shared DB via load-time config, with optional session resume/reopen; review runs the interactive text-correction loop (the cross-transcriber diff is intra-graph since stage 5).
 - **`cjm_transcript_correction_core.graph`** — The correction overlay's graph I/O: targeted (scale-shaped) reads of a committed spine via the graph-storage query action, construction of Correction / CorrectionSession nodes + CORRECTS / SUPERSEDES / DERIVED_FROM / REVIEWED edges, the in-core effective-spine projection (layer-0 + applied corrections), and commit through the job queue. Hand-rolled (revolution-1) = direct CR-18 spec material; append-only on layer-0 (never update/delete a Segment).
 - **`cjm_transcript_correction_core.journal`** — Live append-through for the correction verbs — the workflow journal's domain half.
 - **`cjm_transcript_correction_core.launch`** — The shared launch surface every correction shell drives through: the
 - **`cjm_transcript_correction_core.models`** — Overlay data shapes for the transcript-correction workflow: the Correction / CorrectionSession graph nodes + their relation registry, the read view of a committed spine segment, the worklist item, run configuration, and the correction run manifest (proto-bundle that chains decomp -> correction).
 - **`cjm_transcript_correction_core.pipeline`** — The headless correction workflow: load a decomp run manifest, resolve the shared graph DB, start/resume/reopen a CorrectionSession, recompute the worklist from deterministic signals + persisted review state, run the D14 empty-segment prune (first operation), and record a chainable correction run manifest — with a cheapest-form HITL approval seam.
+- **`cjm_transcript_correction_core.respine_transfer`** — The chunk-scoped transfer a chunk respine calls (work item 7a5e9c84; ruling 0b4d5cfa (5),
 - **`cjm_transcript_correction_core.signals`** — Pure deterministic Tier-1 signal functions (no capability calls): empty-segment detection, bidirectional boundary punctuation/capitalization heuristics, forced-alignment coverage flags, positional cross-transcriber diff, phonetic + edit-distance variant clustering, and the event-proposal overlay (leg 4: the finetuned detector's spans anchored onto the spine). The worklist is recomputed from these each session; revolution-1 builds ZERO new capabilities.
+- **`cjm_transcript_correction_core.spans`** — Spans — the overlay-proposal lane's domain half (design bbf8bafd, extending the
 - **`cjm_transcript_correction_core.spine`**
 - **`cjm_transcript_correction_core.state`** — Sidecar view-state + spine-picker helpers — the correction TUI's pure
 - **`cjm_transcript_correction_core.strata`** — Strata — the filtering lane's domain half (DECs 304fd984 + 9d4c0a38; work items
 
 ## API
+
+### `cjm_transcript_correction_core.cleanread`
+
+- `clean_read` _function_ — L1 — the clean read (pure). Kept lines in spine order; each carries its
+- `clean_read_pack_read` _function_ — The `read` record an L1 pack carries: the layer, the marker, the
+- `clean_read_segments` _function_ — Project the clean read back onto SpineSegments (clean text, same
+- `clean_read_summary` _function_
+- `repeat_survivor` _function_ — Locate the last repeating unit of a word-repeat span (pure): the
+- `subtract_spans` _function_ — Cut the ranges out of the text, leaving `marker` at each seam (pure).
 
 ### `cjm_transcript_correction_core.cli`
 
@@ -30,6 +42,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `extract_command` _function_ — Execute the `extract` subcommand: fold the gated overlay into a manifested dataset.
 - `filter_confirm_command` _function_ — Execute `filter-confirm`: the HEADLESS HITL worklist (bc8dbbdd pass-1
 - `filter_ingest_command` _function_ — Execute `filter-ingest`: validate proposer rows against their pack and
+- `filter_merge_command` _function_ — Execute `filter-merge`: fold several proposal sets over one spine into
 - `filter_pack_command` _function_ — Execute `filter-pack`: write one spine window's effective text-bearing
 - `gate_command` _function_ — Execute the `gate` subcommand: show or assert per-spine extraction gates.
 - `load_capabilities` _function_ — Discover manifests + load each capability, passing per-capability config (CR-2 caller-wins).
@@ -43,6 +56,11 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `run_command` _function_ — Execute the `run` subcommand: correct a decomp manifest's committed spine.
 - `run_extract` _function_ — The extract fold on an ALREADY-OPEN graph seat (flywheel build leg 2,
 - `scan_command` _function_ — Execute `scan-mishomed`: flag authoritative FA words stranded outside
+- `span_confirm_command` _function_ — Execute `span-confirm`: the HEADLESS HITL worklist over one span
+- `span_ingest_command` _function_ — Execute `span-ingest`: resolve a proposer's quoted-word rows against
+- `span_lexicon_command` _function_ — Execute `span-lexicon`: the pattern tier (design bbf8bafd (g)) — bare
+- `span_merge_command` _function_ — Execute `span-merge`: fold several span sets over one spine into ONE
+- `span_pack_command` _function_ — Execute `span-pack`: the filter pack's lines as a SPEECH-OVERLAY pack
 - `stats_command` _function_ — Execute the `stats` subcommand: flywheel accounting over the shared graph.
 - `transfer_command` _function_ — Execute `transfer-wordless`: replay wordless event inserts (and speaker-
 - `wordless_donors` _function_ — The EFFECTIVE wordless layer of a spine: labeled, effectively wordless
@@ -127,6 +145,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `set_session_status` _function_ — Update a session's status + updated_at.
 - `skeleton_hash_for` _function_ — Resolve a skeleton selector to the chosen spine's HASH (pure) — the gate's
 - `source_audio_segment_ids` _function_ — The Source's coarse spine (one small typed read; ordered by index).
+- `speaker_assignment_sources` _function_ — Where each speaker Entity has been assigned — the picker's COLLECTION
 - `speech_overlay_spans` _function_ — Fold the ACTIVE speech overlays into extraction-facing span records (pure).
 - `spine_where_for` _function_ — Resolve a skeleton selector against the observed spine set (pure).
 - `start_session` _function_ — Create + commit a new CorrectionSession node.
@@ -170,9 +189,18 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `run_correction` _function_ — Correct every source in a decomp run manifest (prune + worklist surfacing).
 - `run_review` _function_ — Interactive review pass over a decomp manifest's flagged worklist (text corrections).
 
+### `cjm_transcript_correction_core.respine_transfer`
+
+- `chunk_respine_transfer` _function_ — The registered chunk-scoped transfer (the entry point decomp-core discovers).
+- `group_speaker_rows` _function_ — Fold per-segment rows into turn-shaped commits (pure): contiguous same-entity
+- `live_neighbour` _function_ — The live segment right before the chunk — the flank a donor that starts before
+- `load_segments_by_ids` _function_ — Segments by id — the ONE read that bypasses the live predicate on purpose: the
+- `plan_speaker_carry` _function_ — Which new segment takes which speaker (pure; 4a7ec4f8 (2)/(3)): a segment whose
+- `speaker_spans` _function_ — The per-span speaker map the carry reads (pure).
+
 ### `cjm_transcript_correction_core.signals`
 
-- `attention_boundary_marks` _function_ — The boundary signals of the attention tier (item 3758f6cb signals 3 + the folded
+- `attention_boundary_marks` _function_ — The boundary signals of the attention tier (item 3758f6cb signals 1+3 and the folded
 - `attention_divergence_marks` _function_ — The two-transcriber disagreement signal of the attention tier (item 3758f6cb signal
 - `attention_fa_marks` _function_ — The forced-alignment signals of the attention tier (item 3758f6cb signal 1), pure.
 - `attention_marks` _function_ — Compose the attention tier (item 3758f6cb): every enabled signal's mark rows,
@@ -189,14 +217,36 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `speaker_turn_proposals` _function_ — Dominant diarization cluster per segment — the assign lane's proposal paint.
 - `variant_divergence` _function_ — Within-segment cross-transcriber divergence (stage 5: intra-graph).
 
+### `cjm_transcript_correction_core.spans`
+
+- `bench_span_proposals` _function_ — Derive the span verdicts (design bbf8bafd (f), the bench_filter_proposals
+- `build_span_pack` _function_ — Build the span proposer's input: the filter pack's numbered lines with
+- `find_token_span` _function_ — Resolve quoted words to WHOLE word tokens of a line (pure): the quote is
+- `is_span_pack` _function_
+- `lexicon_span_rows` _function_ — The LEXICON TIER (design bbf8bafd (g)): a bare um / uh token is a
+- `load_span_proposal_sets` _function_ — Every SPAN proposal set for a source (and optionally one spine), newest
+- `locate_span_tokens` _function_ — Where a proposal's words sit on the CURRENT line, as a character range
+- `merge_span_proposals` _function_ — Fold several SPAN sets over one spine into one walkable set — the
+- `overlay_label_slate` _function_ — The slate a span pack carries: every label with its gloss and whether a
+- `pending_span_proposals` _function_ — The headless worklist: proposals with NO active overlay carrying their id
+- `render_span_pack` _function_ — Render a span pack as the brief a proposer reads: identity + window, the
+- `render_span_propset_markdown` _function_ — Project a span set for a human: one line per proposal — tier, label,
+- `segment_word_tokens` _function_
+- `snap_span_proposal` _function_ — Resolve a proposal against the CURRENT line at accept (design bbf8bafd
+- `span_proposals_from_rows` _function_ — Resolve validated rows to span proposal-set rows: proposal id, label
+- `validate_span_rows` _function_ — Validate + resolve proposer rows against their span pack — loud on the
+- `write_span_propset` _function_ — Write one SPAN proposal set — the filter set's layout under the span
+
 ### `cjm_transcript_correction_core.spine`
 
 - `ChunkRef` _class_ — Where one Segment's VAD-chunk audio lives: the model-input WAV + the chunk-local span.
 - `SeamRef` _class_ — A source-coordinate audio span across one fine-spine boundary (the g/G
 - `SpineView` _class_ — One Source's effective correction spine, cursor-windowed for the TUI.
+- `layer_speaker_menu` _function_ — Layer the assign-lane digit menu (pure; DEC 774dbe40). Tier 1 = the
 - `list_sources` _function_ — Enumerate the graph's Source nodes (the discovery corpus, 2ce81638).
 - `load_source_slice` _function_ — Decode a source-coordinate slice of the ORIGINAL media to playable samples.
 - `match_sources` _function_ — The --source selector (pure; shared by direct open and the picker's seed).
+- `match_speaker_query` _function_ — Narrow the registry by a typed query (pure; DEC 774dbe40 (4)). Rank 0 =
 - `neighbor_word_bound` _function_ — The adjacent word's FA boundary facing an overlay span (pure).
 - `open_stack` _function_ — Bootstrap the graph capability stack, resolving the db path (2ce81638).
 - `parse_entity_input` _function_ — Parse the new-speaker editor line (pure). A leading `?` marks the entity
@@ -229,9 +279,11 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `load_filter_proposal_sets` _function_ — Every filtering proposal set for a source (and optionally one spine),
 - `materialized_fix_ids` _function_ — The fidelity-edit apply path's materialization: a proposer row whose
 - `materialized_mark_ids` _function_ — Class-family routing's other half: a proposer's mark-family row (an ASR
+- `merge_filter_proposals` _function_ — Fold several proposal sets over ONE spine into one walkable set (design
 - `new_pack_id` _function_ — Generate a unique, sortable pack id.
 - `pack_digest` _function_ — Digest the READ content (source binding + window + numbered segments) —
 - `pending_filter_proposals` _function_ — The headless worklist: proposals with NO live stratum carrying their id and
+- `plan_pack_windows` _function_ — Cut a spine into `count` windows of near-equal TEXT-segment count at
 - `proposals_from_rows` _function_ — Resolve validated rows to proposal-set rows: proposal id, category, source
 - `render_filter_pack` _function_ — Render a pack as the brief a proposer reads: identity + window, the class
 - `render_filter_propset_markdown` _function_ — Project a proposal set for a HUMAN to check against the source in the
