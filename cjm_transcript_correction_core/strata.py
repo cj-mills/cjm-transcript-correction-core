@@ -186,10 +186,14 @@ def build_filter_pack(
     mark_vocabulary: Optional[List[str]] = None,  # Mark-family outlet classes named in the brief (None = none)
     speakers: Optional[Dict[str, Optional[str]]] = None,  # segment id -> speaker display name (None = the pack carries no speakers)
     margin: int = 0,                         # Text segments of READ-ONLY context either side of the window
+    read: Optional[Dict[str, Any]] = None,   # The ladder layer the lines came from (None = L0; {"layer": "clean", ..., "gaps": {seg id: dropped_before}} = L1)
 ) -> Dict[str, Any]:  # The pack (JSON-serializable)
     """Build the proposer's input: one source window's text-bearing effective
     segments, numbered 0..n-1 in pack order, plus the vocabulary and the
-    existing strata over the same window.
+    existing strata over the same window. `read` records which ladder layer
+    the lines are (design 6752db0a): pass the clean read's segments AND its
+    summary so the pack says it is L1 and its digest differs from an L0 pack
+    over the same window.
 
     Pack position `i` is the proposer's coordinate (rows reference from_i/to_i);
     the pack keeps each row's segment id + spine index + times, so ingest maps
@@ -205,6 +209,11 @@ def build_filter_pack(
     `vocabulary` make a class-scoped pass; `mark_vocabulary` names the mark-
     family outlet. A pack built without them is byte-compatible with 0.1.0."""
     rows, before, after, win = _pack_rows(segments, window=window, speakers=speakers, margin=margin)
+    read = dict(read) if read else None
+    gaps = (read.pop("gaps", None) or {}) if read else {}
+    for r in rows:   # the clean read's line elisions ride the row they precede (rendered as a gap marker)
+        if gaps.get(r["id"]):
+            r["dropped_before"] = list(gaps[r["id"]])
     vocab = list(vocabulary) if vocabulary else list(RECOMMENDED_STRATUM_CLASSES)
     pos_by_id = {r["id"]: r["i"] for r in rows}
     existing: List[Dict[str, Any]] = []
@@ -237,6 +246,9 @@ def build_filter_pack(
     if margin and margin > 0:
         pack["context"] = {"before": before[-int(margin):], "after": after[:int(margin)]}
     if closed or mark_vocabulary or speakers is not None or (margin and margin > 0):
+        pack["version"] = FILTER_PACK_VERSION_LADDER
+    if read:
+        pack["read"] = dict(read)
         pack["version"] = FILTER_PACK_VERSION_LADDER
     pack["digest"] = pack_digest(pack)
     return pack
@@ -302,6 +314,8 @@ def pack_digest(pack: Dict[str, Any]) -> str:  # "sha256:<hex>" over the content
                                   for r in ctx.get(side) or []] for side in ("before", "after")}
     if pack.get("row_kind"):   # a span pack is a different READ of the same lines (absent = stratum, unchanged)
         body["row_kind"] = pack["row_kind"]
+    if pack.get("read"):       # an L1 pack reads different lines than L0 (absent = L0, unchanged)
+        body["read"] = (pack["read"] or {}).get("layer")
     h = hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode("utf-8"))
     return f"sha256:{h.hexdigest()}"
 
@@ -352,6 +366,10 @@ def _render_pack_lines(rows: List[Dict[str, Any]], numbered: bool) -> List[str]:
     out: List[str] = []
     prev: Any = object()
     for r in rows:
+        gap = r.get("dropped_before") or []
+        if gap:   # the clean read's visible line elisions (design 6752db0a (9): never hide a cut)
+            why = sorted({w for d in gap for w in (d.get("why") or [])})
+            out.append(f"(… {len(gap)} line(s) elided: {', '.join(why)} …)")
         if "speaker" in r and r.get("speaker") != prev:
             prev = r.get("speaker")
             out.append(f"— {prev or '(unassigned)'} —")
@@ -392,6 +410,12 @@ def render_filter_pack(pack: Dict[str, Any]) -> str:  # The proposer brief (mark
                                 if r.get("speaker")))
     if roster:
         lines += ["", "Speakers (from the human's assignment pass): " + " · ".join(roster)]
+    rd = pack.get("read") or {}
+    if rd.get("layer") == "clean":
+        lines += ["", f"These lines are the CLEAN READ (L1): {rd.get('lines_dropped', 0)} filler line(s) and "
+                      f"{rd.get('spans_cut', 0)} disfluent span(s) were elided mechanically — a `{rd.get('marker') or '[…]'}` "
+                      "marks each cut and `(… n lines elided …)` each gap. The elided material is NOT "
+                      "yours to classify; if a cut looks wrong, say so in a rationale."]
     lines += ["", "## Vocabulary", ""]
     for v in pack.get("vocabulary") or []:
         lines.append(f"- `{v['category']}` — {v.get('gloss') or ''}".rstrip(" —"))

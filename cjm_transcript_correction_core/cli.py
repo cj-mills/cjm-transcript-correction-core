@@ -20,6 +20,8 @@ from cjm_context_graph_primitives.query import NodeQuery
 from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
 from cjm_substrate.core.workspace import relativize_recorded, resolve_workspace
+from cjm_transcript_correction_core.cleanread import (clean_read, clean_read_pack_read,
+                                                      clean_read_segments)
 from cjm_transcript_correction_core.graph import (active_corrections, active_speaker_assignments,
                                                   active_speech_overlays, bench_event_proposals,
                                                   commit_chunk_insert_correction,
@@ -405,6 +407,10 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                             "asr-error,proper-noun-suspect,seam-suspect; default: none)")
     fpack.add_argument("--no-speakers", action="store_true",
                        help="Leave the assign lane's speaker attribution off the pack lines")
+    fpack.add_argument("--read", choices=("spine", "clean"), default="spine",
+                       help="Which ladder layer the lines are (design 6752db0a): `spine` = L0 as spoken; "
+                            "`clean` = L1, minus filler lines and the filterable overlay spans, with "
+                            "visible elisions — the layer a content-strata or Points pass reads")
     fpack.add_argument("--out-dir", default=None,
                        help="Pack directory (default: <workspace>/packs)")
     fpack.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
@@ -1872,6 +1878,11 @@ async def filter_pack_command(
             names = {e["id"]: (e.get("properties") or {}).get("canonical_name")
                      for e in await list_speaker_entities(queue, cap, kind=None)}
             speakers = {s.id: names.get((assigned.get(s.id) or {}).get("entity_id")) for s in eff}
+        read = None
+        if args.read == "clean":   # L1: the clean read's segments + its elision record ride the pack
+            lines = clean_read(eff, strata, active_speech_overlays(corrections, superseded))
+            read = clean_read_pack_read(lines)
+            eff = clean_read_segments(lines, eff)
     finally:
         await _close_graph_stack(manager, queue, cap)
     if args.split and args.window:
@@ -1881,7 +1892,7 @@ async def filter_pack_command(
     packs = [build_filter_pack(sid, title, skel, eff, content_hash=chash, window=w, strata=strata,
                                vocabulary=_class_list(args.vocabulary), closed=args.closed,
                                mark_vocabulary=_class_list(args.marks), speakers=speakers,
-                               margin=args.margin) for w in windows]
+                               margin=args.margin, read=read) for w in windows]
     if args.split:   # the tiling promise, checked: one window per timed text segment, none dropped
         seen = [r["id"] for p in packs for r in p["segments"]]
         want = [s.id for s in eff if not s.is_empty]
@@ -1891,7 +1902,9 @@ async def filter_pack_command(
     out_dir = (Path(args.out_dir) if args.out_dir
                else (ws.root / "packs" if ws is not None else Path("packs")))
     out_dir.mkdir(parents=True, exist_ok=True)
-    print(f"source: {title or sid}  ({sid}) · spine {_spine_tag(skel)}")
+    print(f"source: {title or sid}  ({sid}) · spine {_spine_tag(skel)}"
+          + (f" · CLEAN READ: {read['lines_kept']} lines kept · {read['lines_dropped']} dropped · "
+             f"{read['spans_cut']} spans cut" if read else ""))
     for pack in packs:
         json_path = out_dir / f"{pack['pack_id']}.json"
         md_path = out_dir / f"{pack['pack_id']}.md"
