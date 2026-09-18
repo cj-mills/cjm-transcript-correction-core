@@ -1150,3 +1150,56 @@ def test_spine_where_for_skips_retired_spines_and_default_spine_rule_c():
     except ValueError as e:
         assert "2 live spines" in str(e) and "legacy" not in str(e).split("(")[1]
     assert default_spine(rows4)["skeleton_hash"] == "sha256:n3wn3wn3w"  # no declaration: newest live
+
+
+def test_fa_words_join_keys_the_cache_on_the_folds_text_form(tmp_path):
+    """The forced-alignment cache is keyed on decomp-core's offset-preserving
+    `normalize_external_text` form of an external landing (finding efe88f17), while
+    the Transcript node keeps the paste verbatim — a paste with line breaks missed
+    the join (16 of 49 landings on the workflow graph, 2026-09-18). The join tries
+    the verbatim hash, then the fold form; a sibling transcript of the rendition is
+    the last resort."""
+    import asyncio
+    import hashlib
+    import json
+    import sqlite3
+    from types import SimpleNamespace
+    from cjm_substrate.core.queue import JobStatus
+    from cjm_transcript_correction_core.graph import _fold_text_form, fa_words_for_transcript
+
+    pasted = "All right.\nWell, uh I think\n\nwe can start."
+    folded = _fold_text_form(pasted)
+    assert folded == "All right. Well, uh I think \nwe can start." and len(folded) == len(pasted)
+    db = tmp_path / "forced_alignments.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE forced_alignments (id INTEGER PRIMARY KEY, audio_path TEXT, audio_hash TEXT, "
+                "text TEXT, text_hash TEXT, config_hash TEXT, items JSON, metadata JSON, created_at REAL)")
+    items = json.dumps([{"text": "All", "start_time": 0.1, "end_time": 0.3}])
+    con.execute("INSERT INTO forced_alignments VALUES (1, 'a.wav', 'h', ?, ?, 'c', ?, '{}', 1.0)",
+                (folded, "sha256:" + hashlib.sha256(folded.encode()).hexdigest(), items))
+    con.commit(); con.close()
+
+    nodes = {"t-ext": {"properties": {"text": pasted, "rendition_id": "r1"}},
+             "r1": {"properties": {"audio_segment_id": "a1"}},
+             "a1": {"properties": {"start": 100.0}}}
+
+    class FakeQueue:
+        def __init__(self):
+            self.submitted = []
+
+        async def submit(self, graph_id, **kw):
+            self.submitted.append(kw)
+            return str(len(self.submitted))
+
+        async def wait_for_job(self, jid):
+            kw = self.submitted[int(jid) - 1]
+            if kw.get("method") == "get_node":
+                result = nodes.get(kw["node_id"])
+            elif kw.get("method") == "query_nodes":
+                result = SimpleNamespace(rows=[])   # no siblings — the fold form must serve
+            else:
+                result = None
+            return SimpleNamespace(status=JobStatus.completed, result=result, error=None)
+
+    words = asyncio.run(fa_words_for_transcript(FakeQueue(), "g", "t-ext", db))
+    assert words == [{"s": 100.1, "e": 100.3, "text": "All"}]

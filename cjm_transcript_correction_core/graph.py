@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -2833,6 +2834,23 @@ def speech_overlay_spans(
     return out
 
 
+_NEWLINE_RUN_RE = re.compile(r"[\r\n]+")   # decomp-core alignment._NEWLINE_RUN_RE, verbatim
+
+
+def _fold_text_form(text: str) -> str:  # decomp-core's normalize_external_text, reproduced (same length)
+    """The fold's offset-preserving reading of an external landing's text
+    (decomp-core `normalize_external_text`, finding efe88f17): every newline
+    run becomes spaces, a run holding two or more newlines keeps ONE as its
+    last character. Reproduced here because correction-core never depends on
+    decomp-core; the forced-alignment cache is keyed on this form."""
+    def _run(m: "re.Match[str]") -> str:
+        run = m.group(0)
+        if run.count("\n") >= 2:
+            return " " * (len(run) - 1) + "\n"
+        return " " * len(run)
+    return _NEWLINE_RUN_RE.sub(_run, text)
+
+
 async def fa_words_for_transcript(
     queue: JobQueue,                    # Started job queue
     graph_id: str,                      # Graph-storage capability id
@@ -2850,13 +2868,18 @@ async def fa_words_for_transcript(
     the same rows). None on any missing link — callers degrade (the TUI falls
     back to char-fraction estimation), never crash.
 
-    SIBLING FALLBACK (span lane build, 2026-09-18): an ESCALATED chunk's
-    designated transcript (an external landing) was never force-aligned, so
-    its text hash misses the cache — but the chunk's ORIGINAL transcript on
-    the same rendition was. Its words are the same audio; `snap_word_span`
-    aligns by normalized token sequence exactly for text the alignment never
-    saw. So on a miss, every other Transcript of the rendition is tried,
-    newest first, and the first cache hit serves."""
+    THE KEY IS THE FOLD'S READING OF THE TEXT (2026-09-18): the decomposition
+    aligns an EXTERNAL landing (a pasted escalation) through decomp-core's
+    offset-preserving `normalize_external_text` (finding efe88f17: every
+    newline run -> spaces, a paragraph break keeps one newline), and the
+    aligner caches THAT string's hash — the Transcript node keeps the paste
+    verbatim. A paste with line breaks therefore missed here (16 of the 49
+    external landings on the workflow graph; the first span-lane accept on
+    the Bonus lecture landed 'estimated' for this reason). The lookup now
+    tries the verbatim hash, then the fold-normalized hash. LAST RESORT: a
+    SIBLING Transcript of the same rendition, newest first — same audio,
+    and `snap_word_span` aligns by normalized token sequence exactly for
+    text the alignment never saw."""
     async def _props(node_id: str) -> Dict[str, Any]:
         node = await graph_task(queue, graph_id, "get_node", node_id=node_id)
         if node is None:
@@ -2887,7 +2910,7 @@ async def fa_words_for_transcript(
         finally:
             fa.close()
 
-    row = _lookup(text)
+    row = _lookup(text) or _lookup(_fold_text_form(text))
     if not row:
         q = NodeQuery(label="Transcript", where=[PropertyPredicate("rendition_id", "eq", str(rid))],
                       project=["text", "asserted_at"])
@@ -2895,7 +2918,7 @@ async def fa_words_for_transcript(
         sibs = [r for r in (res.rows or []) if r.get("id") != str(transcript_id) and r.get("text")]
         sibs.sort(key=lambda r: float(r.get("asserted_at") or 0.0), reverse=True)
         for sib in sibs:
-            row = _lookup(str(sib["text"]))
+            row = _lookup(str(sib["text"])) or _lookup(_fold_text_form(str(sib["text"])))
             if row:
                 break
     if not row:
