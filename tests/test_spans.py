@@ -236,12 +236,43 @@ def test_bench_derives_the_span_verdicts_and_missed():
     assert by["hesitation-marker@s2"] == "rejected"
     assert by["false-start@s3"] == "edited"
     assert by["coincidental-repeat@s3"] == "unaccepted"
-    assert b["counts"]["tier1"] == {"accepted": 2, "edited": 1, "relabeled": 1, "rejected": 1, "unvisited": 0}
+    assert b["counts"]["tier1"] == {"accepted": 2, "edited": 1, "relabeled": 1, "covered": 0,
+                                    "rejected": 1, "unvisited": 0}
     assert b["rates"] == {"accepted": 0.4, "edited": 0.2, "relabeled": 0.2, "rejected": 0.2}
     assert [m["overlay_id"] for m in b["missed"]] == ["o5"]
     # no watermark = nothing visited: the unmatched tier-1 row reads unvisited, not rejected
     b2 = bench_span_proposals(props, overlays, (0.0, None))
     assert b2["counts"]["tier1"]["unvisited"] == 1 and b2["counts"]["tier1"]["rejected"] == 0
+
+
+def test_bench_reads_a_nested_same_label_row_as_covered_never_rejected():
+    """Finding 67c4af17: two same-label rows nest (the lexicon's 'Um' inside an
+    agent's 'Um, so'); ONE overlay lands and matches ONE proposal, and the
+    pending rule closes the other unseen. The bench must not call that row
+    rejected below the watermark — it is COVERED, carries the covering
+    overlay, and stays out of the rates; covered == closed-by-pending exactly."""
+    pack = _pack()
+    props = span_proposals_from_rows(validate_span_rows([
+        {"label": "hesitation-marker", "i": 0, "text": "Um"},
+        {"label": "hesitation-marker", "i": 0, "text": "Um, so"},
+        {"label": "hesitation-marker", "i": 1, "text": "uh"},
+    ], pack), pack)
+    overlays = [_overlay("o1", "s0", 0, 3, "Um,", "hesitation-marker", 0.0, 0.3,
+                         proposal_id=props[0]["proposal_id"])]
+    assert [p["anchor"]["text_snapshot"] for p in pending_span_proposals(props, overlays)] == ["uh,"]
+    b = bench_span_proposals(props, overlays, (0.0, None), watermark=13.0)
+    assert b["counts"]["tier1"] == {"accepted": 1, "edited": 0, "relabeled": 0, "covered": 1,
+                                    "rejected": 1, "unvisited": 0}
+    assert b["rates"] == {"accepted": 0.5, "edited": 0.0, "relabeled": 0.0, "rejected": 0.5}
+    row = next(v for v in b["verdicts"] if v["verdict"] == "covered")
+    assert row["text"] == "Um, so" and row["covered_by"] == "o1"
+    assert row["covered_by_proposal"] == props[0]["proposal_id"] and b["missed"] == []
+    # the WIDER row landing covers the narrower one the same way
+    wide = [_overlay("o2", "s0", 0, 6, "Um, so", "hesitation-marker", 0.0, 0.6,
+                     proposal_id=props[1]["proposal_id"])]
+    b2 = bench_span_proposals(props, wide, (0.0, None))
+    assert {v["text"]: v["verdict"] for v in b2["verdicts"]} == {
+        "Um,": "covered", "Um, so": "accepted", "uh,": "unvisited"}
 
 
 # ---- snap at accept ----

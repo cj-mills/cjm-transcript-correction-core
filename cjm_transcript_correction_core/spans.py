@@ -678,11 +678,21 @@ def bench_span_proposals(
     RELABELED. No match below the watermark = REJECTED; above it = UNVISITED.
     Tier-2 rows read 'unaccepted' instead of rejected. MISSED = active overlays
     inside the window no proposal matched. Rates are the tier-1 operating-
-    point contract."""
+    point contract.
+
+    COVERED (finding 67c4af17): an unmatched proposal that a same-label
+    overlay overlaps on its segment — the exact rule that closes it in
+    `pending_span_proposals`, so the worklist never offered it (a nested row:
+    the lexicon's 'uh' beside an agent's 'uh like', one overlay lands, it
+    matches ONE proposal). Neither accepted nor rejected: it carries the
+    covering overlay and stays OUT of the rates."""
     w0 = float(window[0])
     w1 = float(window[1]) if window[1] is not None else None
-    live = [r for r in (_overlay_record(c) for c in overlays)
-            if r and r["start"] >= w0 and (w1 is None or r["start"] < w1)]
+    recs = [r for r in (_overlay_record(c) for c in overlays) if r]
+    live = [r for r in recs if r["start"] >= w0 and (w1 is None or r["start"] < w1)]
+    cover_by_seg: Dict[Any, List[Dict[str, Any]]] = {}   # every active overlay, as pending sees them
+    for r in recs:
+        cover_by_seg.setdefault(r["segment_id"], []).append(r)
     unmatched = {id(r): r for r in live}
     rows = sorted(proposals or [], key=lambda d: float(d.get("start_time") or 0.0))
     tier1 = [p for p in rows if int(p.get("tier", 1)) == 1]
@@ -721,13 +731,22 @@ def bench_span_proposals(
                 if pid in matches or key not in unmatched:
                     continue
                 matches[pid] = unmatched.pop(key)
-        counts = {"accepted": 0, "edited": 0, "relabeled": 0, no_match: 0, "unvisited": 0}
+        counts = {"accepted": 0, "edited": 0, "relabeled": 0, "covered": 0, no_match: 0,
+                  "unvisited": 0}
         verdicts: List[Dict[str, Any]] = []
         for p in ordered:
             ps = float(p.get("start_time") or 0.0)
             m = matches.get(id(p))
             a = p.get("anchor") or {}
+            cover = None
             if m is None:
+                _sid, cs, ce = _span(p)
+                cover = next((r for r in cover_by_seg.get(a.get("segment_id"), ())
+                              if r["label"] == p.get("label")
+                              and _char_overlap(cs, ce, r["char_start"], r["char_end"]) > 0), None)
+            if cover is not None:
+                verdict = "covered"
+            elif m is None:
                 verdict = (no_match if (watermark is not None and ps < float(watermark))
                            else "unvisited")
             elif m["label"] != p.get("label"):
@@ -742,7 +761,9 @@ def bench_span_proposals(
                              "start_time": ps, "tier": int(p.get("tier", 1)),
                              "confidence": p.get("confidence"), "verdict": verdict,
                              **({"overlay_id": m["overlay_id"], "overlay_label": m["label"],
-                                 "overlay_text": m["text"]} if m else {})})
+                                 "overlay_text": m["text"]} if m else {}),
+                             **({"covered_by": cover["overlay_id"], "covered_by_text": cover["text"],
+                                 "covered_by_proposal": cover["proposal_id"]} if cover else {})})
         return counts, verdicts
 
     c1, v1 = join(tier1, "rejected")
