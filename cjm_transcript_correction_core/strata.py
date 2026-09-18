@@ -131,6 +131,47 @@ def new_pack_id() -> str:  # e.g. "pack_20260901_180000_1a2b3c4d"
     return f"pack_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
 
+def _pack_rows(
+    segments: List[SpineSegment],            # The EFFECTIVE spine (corrections applied), index order
+    *,
+    window: Optional[Tuple[float, Optional[float]]] = None,  # (start, end) source seconds; None = whole spine
+    speakers: Optional[Dict[str, Optional[str]]] = None,  # segment id -> speaker display name (None = no speakers)
+    margin: int = 0,                         # Kept for symmetry; the caller slices before/after by it
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:  # (rows, before, after, window)
+    """The numbered pack lines every pack kind shares (stratum packs and span
+    packs read the SAME lines): text-bearing segments inside the window,
+    numbered 0..n-1 in pack order, the text segments before / after it (the
+    read-only margins' feedstock), and the resolved window."""
+    w_start = float(window[0]) if window and window[0] is not None else None
+    w_end = float(window[1]) if window and window[1] is not None else None
+
+    def _row(s: SpineSegment) -> Dict[str, Any]:
+        st = float(s.start_time) if s.start_time is not None else None
+        en = float(s.end_time) if s.end_time is not None else None
+        return {"id": s.id, "index": s.index, "start": st, "end": en, "text": s.text,
+                **({"speaker": speakers.get(s.id)} if speakers is not None else {})}
+
+    rows: List[Dict[str, Any]] = []
+    before: List[Dict[str, Any]] = []
+    after: List[Dict[str, Any]] = []
+    for s in segments:
+        if s.is_empty:
+            continue
+        r = _row(s)
+        if w_start is not None and r["end"] is not None and r["end"] <= w_start:
+            before.append(r)
+            continue
+        if w_end is not None and r["start"] is not None and r["start"] >= w_end:
+            after.append(r)
+            continue
+        rows.append({"i": len(rows), **r})
+    timed_starts = [r["start"] for r in rows if r["start"] is not None]
+    timed_ends = [r["end"] for r in rows if r["end"] is not None]
+    win = {"start": (w_start if w_start is not None else (min(timed_starts) if timed_starts else 0.0)),
+           "end": (w_end if w_end is not None else (max(timed_ends) if timed_ends else None))}
+    return rows, before, after, win
+
+
 def build_filter_pack(
     source_id: str,                          # The Source node id
     title: str,                              # Display title (rendered; not identity)
@@ -163,33 +204,7 @@ def build_filter_pack(
     divided source needs no overlap, hence no dedup); `closed` + a narrowed
     `vocabulary` make a class-scoped pass; `mark_vocabulary` names the mark-
     family outlet. A pack built without them is byte-compatible with 0.1.0."""
-    w_start = float(window[0]) if window and window[0] is not None else None
-    w_end = float(window[1]) if window and window[1] is not None else None
-
-    def _row(s: SpineSegment) -> Dict[str, Any]:
-        st = float(s.start_time) if s.start_time is not None else None
-        en = float(s.end_time) if s.end_time is not None else None
-        return {"id": s.id, "index": s.index, "start": st, "end": en, "text": s.text,
-                **({"speaker": speakers.get(s.id)} if speakers is not None else {})}
-
-    rows: List[Dict[str, Any]] = []
-    before: List[Dict[str, Any]] = []
-    after: List[Dict[str, Any]] = []
-    for s in segments:
-        if s.is_empty:
-            continue
-        r = _row(s)
-        if w_start is not None and r["end"] is not None and r["end"] <= w_start:
-            before.append(r)
-            continue
-        if w_end is not None and r["start"] is not None and r["start"] >= w_end:
-            after.append(r)
-            continue
-        rows.append({"i": len(rows), **r})
-    timed_starts = [r["start"] for r in rows if r["start"] is not None]
-    timed_ends = [r["end"] for r in rows if r["end"] is not None]
-    win = {"start": (w_start if w_start is not None else (min(timed_starts) if timed_starts else 0.0)),
-           "end": (w_end if w_end is not None else (max(timed_ends) if timed_ends else None))}
+    rows, before, after, win = _pack_rows(segments, window=window, speakers=speakers, margin=margin)
     vocab = list(vocabulary) if vocabulary else list(RECOMMENDED_STRATUM_CLASSES)
     pos_by_id = {r["id"]: r["i"] for r in rows}
     existing: List[Dict[str, Any]] = []
@@ -285,6 +300,8 @@ def pack_digest(pack: Dict[str, Any]) -> str:  # "sha256:<hex>" over the content
     if ctx:   # the read-only margins were READ too (absent key = a 0.1.0 digest, unchanged)
         body["context"] = {side: [[r["id"], r["start"], r["end"], r["text"], r.get("speaker")]
                                   for r in ctx.get(side) or []] for side in ("before", "after")}
+    if pack.get("row_kind"):   # a span pack is a different READ of the same lines (absent = stratum, unchanged)
+        body["row_kind"] = pack["row_kind"]
     h = hashlib.sha256(json.dumps(body, sort_keys=True, ensure_ascii=False).encode("utf-8"))
     return f"sha256:{h.hexdigest()}"
 
@@ -417,7 +434,10 @@ def validate_proposal_rows(
     in-range inclusive run, tier in {1, 2}, confidence in [0, 1], no same-class
     overlap between rows, and — for a row carrying `replacement` (the
     fidelity-edit apply path) — a ONE-line run whose replacement is a non-empty
-    string that differs from the line as packed."""
+    string that differs from the line as packed. A SPAN pack (row_kind = span)
+    is refused: its rows are overlay spans, ingested by the span lane."""
+    if pack.get("row_kind"):
+        raise ValueError(f"a {pack['row_kind']} pack's rows are not strata — use span-ingest")
     n = len(pack.get("segments") or [])
     segs = pack.get("segments") or []
     out: List[Dict[str, Any]] = []
@@ -510,12 +530,17 @@ def write_filter_propset(
     proposer: Dict[str, Any],             # Provenance: {"kind": "claude-code-subagent" | "api" | ..., "name": ..., ...}
     ws: Any = None,                       # Resolved workspace (relativize_recorded) or None
     extra: Optional[Dict[str, Any]] = None,  # Additive manifest fields (e.g. a merge's `merged_from`)
+    set_format: str = FILTER_PROPOSAL_SET_FORMAT,   # The manifest format string (a span set carries its own)
+    set_version: str = FILTER_PROPOSAL_SET_VERSION,  # Its version
+    lane: str = FILTER_LANE,                 # The lane tag recorded in config
+    vocabulary: Optional[List[str]] = None,  # The slate recorded in config (default: the pack's stratum vocabulary)
 ) -> Dict[str, Any]:  # {"set_id","set_dir","manifest_path","classes","counts","tier2_counts"}
     """Write one filtering proposal set: `<out_root>/<set_id>/manifest.json` +
     `proposals.jsonl` — the durable half of the derived-verdicts contract. The
     manifest binds the SOURCE (id + content hash + skeleton), the WINDOW, the
     PROPOSER and the PACK DIGEST it read, so the bench join and the provenance
-    pane can name exactly what was proposed, by whom, over what."""
+    pane can name exactly what was proposed, by whom, over what. The layout is
+    shared by the span lane under its OWN format string (design bbf8bafd (d))."""
     started = time.time()
     set_id = (f"propset_{time.strftime('%Y%m%d_%H%M%S', time.localtime(started))}"
               f"_{uuid.uuid4().hex[:8]}")
@@ -531,12 +556,13 @@ def write_filter_propset(
         bucket[p["category"]] = bucket.get(p["category"], 0) + 1
     src = dict(pack.get("source") or {})
     manifest = {
-        "format": FILTER_PROPOSAL_SET_FORMAT,
-        "version": FILTER_PROPOSAL_SET_VERSION,
+        "format": set_format,
+        "version": set_version,
         "proposal_set_id": set_id,
         "created_at": started,
-        "config": {"lane": FILTER_LANE,
-                   "vocabulary": [v["category"] for v in (pack.get("vocabulary") or [])]},
+        "config": {"lane": lane,
+                   "vocabulary": (list(vocabulary) if vocabulary is not None
+                                  else [v["category"] for v in (pack.get("vocabulary") or [])])},
         "model": dict(proposer),
         "pack": {"pack_id": pack.get("pack_id"), "digest": pack.get("digest"),
                  "segments": len(pack.get("segments") or [])},
@@ -730,10 +756,12 @@ def load_filter_proposal_sets(
     ws_root: str,                         # Workspace root (sets live under <root>/proposals/)
     source_id: str,                       # Source node id to match
     skeleton_hash: Optional[str] = None,  # Restrict to sets bound to this spine (None = any)
+    set_format: str = FILTER_PROPOSAL_SET_FORMAT,  # Which set kind to list (a span set is never a stratum set)
 ) -> List[Dict[str, Any]]:  # [{"manifest","path","proposals"}] newest first; malformed sets skipped
     """Every filtering proposal set for a source (and optionally one spine),
     newest first — several coexist by design (proposers, windows, generations),
-    so the caller picks; `latest` = index 0."""
+    so the caller picks; `latest` = index 0. Format-gated: the stratum lane's
+    loader never offers a span set for stratum accepts (design bbf8bafd (d))."""
     root = Path(ws_root) / "proposals"
     if not root.is_dir():
         return []
@@ -743,7 +771,7 @@ def load_filter_proposal_sets(
             m = json.loads(mp.read_text())
         except (OSError, json.JSONDecodeError):
             continue
-        if m.get("format") != FILTER_PROPOSAL_SET_FORMAT:
+        if m.get("format") != set_format:
             continue
         src = m.get("source") or {}
         if src.get("source_id") != source_id:

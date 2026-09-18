@@ -2669,6 +2669,8 @@ def build_speech_overlay_correction(
     supersedes_id: Optional[str] = None,  # Prior overlay this one replaces (re-annotate)
     actor: str = "human",                 # Actor ("human" | "capability:<name>" for detector propsets)
     note: Optional[str] = None,           # Optional free-text note
+    proposal_id: Optional[str] = None,    # The span proposal this overlay accepts (design bbf8bafd (e))
+    proposal_set_id: Optional[str] = None,  # Its proposal set (provenance beside the id)
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:  # (correction node dict, edge dicts)
     """Build a NON-MUTATING speech-overlay Correction (check fc42614d, DEC 4e05a066).
 
@@ -2697,7 +2699,9 @@ def build_speech_overlay_correction(
                "anchor": dict(anchor), "label": lab,
                "start_time": s, "end_time": e, "text": text,
                "words": [dict(w) for w in (words or [])],
-               "snap": snap or "estimated"}
+               "snap": snap or "estimated",
+               **({"proposal_id": proposal_id} if proposal_id else {}),
+               **({"proposal_set_id": proposal_set_id} if proposal_set_id else {})}
     node = build_correction_node("annotation", session_id, payload, actor=actor,
                                  rationale=note).to_graph_node()
     edges = [make_edge(node.id, sid, CorrectionRelations.CORRECTS) for sid in seg_ids]
@@ -2722,14 +2726,19 @@ async def commit_speech_overlay_correction(
     actor: str = "human",                 # Actor
     note: Optional[str] = None,           # Optional note
     journal_path: Optional[str] = None,   # Sidecar journal — append the op on success (None = unjournaled)
+    proposal_id: Optional[str] = None,    # The span proposal this overlay accepts (None = hand-annotated)
+    proposal_set_id: Optional[str] = None,  # Its proposal set
 ) -> str:  # The new overlay Correction node id
     """Commit a speech overlay (node + CORRECTS [+ SUPERSEDES]).
 
     NO review marker: like a mark, an overlay is annotation, not a review
-    decision — the walked-past state stays exactly as the operator left it."""
+    decision — the walked-past state stays exactly as the operator left it.
+    An accept from a span set carries the proposal id + set id on the payload
+    (the derived-verdict carry, design bbf8bafd (e))."""
     node, edges = build_speech_overlay_correction(
         source_id, anchor, label, start_time, end_time, text, session_id,
-        words=words, snap=snap, supersedes_id=supersedes_id, actor=actor, note=note)
+        words=words, snap=snap, supersedes_id=supersedes_id, actor=actor, note=note,
+        proposal_id=proposal_id, proposal_set_id=proposal_set_id)
     await commit_nodes_edges(queue, graph_id, [node], edges)
     if journal_path:
         journal_correction_op(journal_path, "speech-overlay", actor=actor,
@@ -2739,7 +2748,9 @@ async def commit_speech_overlay_correction(
                                     "end_time": float(end_time), "text": text,
                                     "words": [dict(w) for w in (words or [])],
                                     "snap": snap or "estimated", "note": note,
-                                    "supersedes_id": supersedes_id},
+                                    "supersedes_id": supersedes_id,
+                                    "proposal_id": proposal_id,
+                                    "proposal_set_id": proposal_set_id},
                               anchor=await segment_anchor(queue, graph_id,
                                                           mark_anchor_segments(anchor)),
                               nodes=[node], edges=edges, op_id=node["id"])
@@ -2837,7 +2848,15 @@ async def fa_words_for_transcript(
     read of a local durable artifact; if the cache schema ever moves, the v2
     path is an align call through the capability seam, which cache-hits to
     the same rows). None on any missing link — callers degrade (the TUI falls
-    back to char-fraction estimation), never crash."""
+    back to char-fraction estimation), never crash.
+
+    SIBLING FALLBACK (span lane build, 2026-09-18): an ESCALATED chunk's
+    designated transcript (an external landing) was never force-aligned, so
+    its text hash misses the cache — but the chunk's ORIGINAL transcript on
+    the same rendition was. Its words are the same audio; `snap_word_span`
+    aligns by normalized token sequence exactly for text the alignment never
+    saw. So on a miss, every other Transcript of the rendition is tried,
+    newest first, and the first cache hit serves."""
     async def _props(node_id: str) -> Dict[str, Any]:
         node = await graph_task(queue, graph_id, "get_node", node_id=node_id)
         if node is None:
@@ -2858,13 +2877,27 @@ async def fa_words_for_transcript(
     path = Path(fa_cache_db)
     if not path.is_file():
         return None
-    th = "sha256:" + hashlib.sha256(text.encode()).hexdigest()
-    fa = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
-    try:
-        row = fa.execute("SELECT items FROM forced_alignments WHERE text_hash=? "
-                         "ORDER BY created_at DESC LIMIT 1", (th,)).fetchone()
-    finally:
-        fa.close()
+
+    def _lookup(t: str) -> Optional[Any]:
+        th = "sha256:" + hashlib.sha256(t.encode()).hexdigest()
+        fa = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            return fa.execute("SELECT items FROM forced_alignments WHERE text_hash=? "
+                              "ORDER BY created_at DESC LIMIT 1", (th,)).fetchone()
+        finally:
+            fa.close()
+
+    row = _lookup(text)
+    if not row:
+        q = NodeQuery(label="Transcript", where=[PropertyPredicate("rendition_id", "eq", str(rid))],
+                      project=["text", "asserted_at"])
+        res = await graph_task(queue, graph_id, "query_nodes", query=q.to_dict())
+        sibs = [r for r in (res.rows or []) if r.get("id") != str(transcript_id) and r.get("text")]
+        sibs.sort(key=lambda r: float(r.get("asserted_at") or 0.0), reverse=True)
+        for sib in sibs:
+            row = _lookup(str(sib["text"]))
+            if row:
+                break
     if not row:
         return None
     return [{"s": float(base) + float(w["start_time"]),

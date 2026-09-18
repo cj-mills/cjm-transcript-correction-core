@@ -226,6 +226,12 @@ RECOMMENDED_OVERLAY_LABELS = (
     "hesitation-marker",   # um / uh / you-know spans (the e713a9ce detector's primary class)
     "false-start",         # speaker restarts mid-utterance (self-correction span)
     "word-repeat",         # repeated words / stutters
+    # Grown by the data-center drive (386 active overlays, read 2026-09-17, design
+    # bbf8bafd): one more FILTERABLE label and the two KEEP labels a clean read must
+    # never subtract (spans.OVERLAY_GLOSSES states the boundary).
+    "discourse-marker",    # 'you know' / 'right' / 'so' as pacing, not logic
+    "emphasis-repeat",     # KEEP: 'much, much larger' — rhetorical, content
+    "coincidental-repeat", # KEEP: 'that that' — both words content
 )
 
 # The RECOMMENDED stratum-class slate (DECs 304fd984 + 9d4c0a38 — the filtering

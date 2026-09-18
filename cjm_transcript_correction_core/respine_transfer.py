@@ -25,9 +25,8 @@ strands them on the operator's explicit say-so)."""
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
-from cjm_context_graph_layer.grammar import SpineRelations
 from cjm_context_graph_layer.ops import graph_task
-from cjm_context_graph_primitives.query import NodeQuery, PropertyPredicate, RelationPredicate
+from cjm_context_graph_primitives.query import NodeQuery, PropertyPredicate
 from cjm_transcript_correction_core.graph import (_row_to_spine_segment, _SPINE_PROJECTION,
                                                   active_speaker_assignments,
                                                   commit_chunk_insert_correction,

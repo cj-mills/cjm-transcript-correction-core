@@ -21,11 +21,14 @@ from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
 from cjm_substrate.core.workspace import relativize_recorded, resolve_workspace
 from cjm_transcript_correction_core.graph import (active_corrections, active_speaker_assignments,
-                                                  bench_event_proposals,
+                                                  active_speech_overlays, bench_event_proposals,
                                                   commit_chunk_insert_correction,
                                                   commit_chunk_split_correction,
                                                   commit_extraction_gate, commit_mark_correction,
-                                                  commit_mark_dismissal, commit_stratum_correction,
+                                                  commit_mark_dismissal,
+                                                  commit_speech_overlay_correction,
+                                                  commit_speech_overlay_removal,
+                                                  commit_stratum_correction,
                                                   commit_stratum_retraction, commit_text_correction,
                                                   correction_stats, extract_spine_dataset,
                                                   fa_words_for_transcript, labeled_insert_spans,
@@ -42,6 +45,13 @@ from cjm_transcript_correction_core.signals import (ATTENTION_ACTOR, ATTENTION_D
                                                     attention_marks, ATTENTION_SIGNALS,
                                                     ATTENTION_THRESHOLDS, EVENT_PROPOSAL_SET_FORMAT,
                                                     load_event_proposal_set)
+from cjm_transcript_correction_core.spans import (bench_span_proposals, build_span_pack,
+                                                  is_span_pack, LEXICON_ACTOR, lexicon_span_rows,
+                                                  load_span_proposal_sets, pending_span_proposals,
+                                                  render_span_pack, render_span_propset_markdown,
+                                                  snap_span_proposal, SPAN_LANE,
+                                                  span_proposals_from_rows, validate_span_rows,
+                                                  write_span_propset)
 from cjm_transcript_correction_core.strata import (active_strata, bench_filter_proposals,
                                                    build_filter_pack, FILTER_LANE,
                                                    FILTER_PACK_FORMAT, load_filter_proposal_sets,
@@ -511,6 +521,109 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                           help="CorrectionSession purpose (None = genuine; \"feature-test\" "
                                "= excludable from flywheel datasets)")
     fconfirm.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
+
+    # ---- the span lane (design bbf8bafd): sub-line disfluency as agent-PROPOSED
+    # speech overlays, human-refined — the filter lane's seam over the annotate
+    # lane's record: span-pack -> proposer -> span-ingest -> span-confirm ----------
+    spack = sub.add_parser(
+        "span-pack",
+        help="Write one spine window's lines as a SPEECH-OVERLAY pack (row_kind span): the "
+             "overlay label slate with glosses, the overlays already active, the quote-the-"
+             "words contract (json + the markdown brief)")
+    _add_graph_read_args(spack)
+    spack.add_argument("--source", required=True,
+                       help="Source node id or title substring (exactly one match)")
+    spack.add_argument("--rendition", default=None,
+                       help="Which AudioRendition spine when a source has more than one")
+    spack.add_argument("--skeleton", default=None,
+                       help="Which SKELETON spine (\"legacy\" or a hash prefix); default: auto")
+    spack.add_argument("--window", nargs=2, type=float, default=None, metavar=("START", "END"),
+                       help="Source-seconds window to pack (default: the whole spine)")
+    spack.add_argument("--split", type=int, default=None, metavar="N",
+                       help="Write N window packs that tile the spine, cut at mechanical seams")
+    spack.add_argument("--margin", type=int, default=0, metavar="LINES",
+                       help="Text segments of READ-ONLY context either side of a window")
+    spack.add_argument("--labels", default=None, metavar="LABEL[,LABEL…]",
+                       help="The overlay labels this pack names (default: the four filterable "
+                            "labels + the two keep labels)")
+    spack.add_argument("--no-speakers", action="store_true",
+                       help="Leave the assign lane's speaker attribution off the pack lines")
+    spack.add_argument("--out-dir", default=None, help="Pack directory (default: <workspace>/packs)")
+    spack.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
+
+    slex = sub.add_parser(
+        "span-lexicon",
+        help="The LEXICON TIER: mint a span proposal set of bare um / uh tokens by pattern "
+             "(tier 1, no model; its own capability actor) from a span pack — no graph writes")
+    slex.add_argument("--pack", required=True, help="The span pack json")
+    slex.add_argument("--workspace", default=None,
+                      help="Workspace root (default: CJM_WORKSPACE env, else upward walk from cwd)")
+    slex.add_argument("--out-dir", default=None,
+                      help="Proposal-set root directory (default: <workspace>/proposals)")
+    slex.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
+
+    singest = sub.add_parser(
+        "span-ingest",
+        help="Resolve a proposer's quoted-word rows against their span pack (whole-token "
+             "match; nth disambiguates; refusals name the row) and mint a SPAN proposal set "
+             "(its own format — never offered to the stratum lane; no graph writes)")
+    singest.add_argument("--pack", required=True, help="The span pack json the proposer read")
+    singest.add_argument("--rows", required=True,
+                         help="The proposer's output: JSONL rows (or a JSON array); code "
+                              "fences and blank lines are tolerated")
+    singest.add_argument("--proposer", required=True,
+                         help="Proposer name recorded as provenance")
+    singest.add_argument("--proposer-kind", default="claude-code-subagent",
+                         help="Proposer kind (claude-code-subagent | api | local-model | human)")
+    singest.add_argument("--model", default=None, help="Model identity when known")
+    singest.add_argument("--workspace", default=None,
+                         help="Workspace root (default: CJM_WORKSPACE env, else upward walk from cwd)")
+    singest.add_argument("--out-dir", default=None,
+                         help="Proposal-set root directory (default: <workspace>/proposals)")
+    singest.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
+
+    sconfirm = sub.add_parser(
+        "span-confirm",
+        help="The headless HITL worklist over a span proposal set: list pending spans + "
+             "derived verdicts; --accept/--accept-tier1/--accept-all commit speech overlays "
+             "snapped at accept from the forced alignment (accept IS the overlay op), "
+             "--relabel accepts under another label, --remove supersedes an active overlay, "
+             "--watermark asserts the lane's annotated_through — all journaled")
+    _add_graph_read_args(sconfirm)
+    sconfirm.add_argument("--source", required=True,
+                          help="Source node id or title substring (exactly one match)")
+    sconfirm.add_argument("--rendition", default=None,
+                          help="Which AudioRendition spine when a source has more than one")
+    sconfirm.add_argument("--skeleton", default=None,
+                          help="Which SKELETON spine (\"legacy\" or a hash prefix); default: auto")
+    sconfirm.add_argument("--set", default=None,
+                          help="Span set id or prefix (default: the newest set bound to this source + spine)")
+    sconfirm.add_argument("--fa-cache-db", default=None,
+                          help="Forced-alignment cache db (default: the workspace's qwen3 aligner "
+                               "cache); absent = times stay char-fraction estimates, stamped so")
+    sconfirm.add_argument("--accept", action="append", default=None, metavar="PROPOSAL",
+                          help="Accept one pending span by id prefix (repeatable)")
+    sconfirm.add_argument("--accept-tier1", action="store_true",
+                          help="Accept EVERY pending tier-1 span (the explicit human batch-accept)")
+    sconfirm.add_argument("--accept-all", action="store_true",
+                          help="Accept every pending span, audition tier included")
+    sconfirm.add_argument("--relabel", action="append", default=None, metavar="PROPOSAL:LABEL",
+                          help="Accept one pending span under a DIFFERENT label (repeatable)")
+    sconfirm.add_argument("--remove", action="append", default=None, metavar="OVERLAY",
+                          help="Remove an active overlay by id prefix (supersede; repeatable)")
+    sconfirm.add_argument("--watermark", default=None,
+                          help="Assert the span lane's annotated_through (source seconds, "
+                               "\"end\", or \"none\") — absence below it derives rejects")
+    sconfirm.add_argument("--tier2", action="store_true",
+                          help="Show the audition tier in the pending list")
+    sconfirm.add_argument("--markdown", action="store_true",
+                          help="(Re)write <set-dir>/proposals.md — the human view of the set")
+    sconfirm.add_argument("--actor", default="human", help="Actor recorded on the ops")
+    sconfirm.add_argument("--note", default=None, help="Note recorded on removals")
+    sconfirm.add_argument("--purpose", default=None,
+                          help="CorrectionSession purpose (None = genuine; \"feature-test\" "
+                               "= excludable from flywheel datasets)")
+    sconfirm.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
     return parser
 
 
@@ -699,6 +812,14 @@ def main(
         return filter_merge_command(args)
     if args.command == "filter-confirm":
         return asyncio.run(filter_confirm_command(args))
+    if args.command == "span-pack":
+        return asyncio.run(span_pack_command(args))
+    if args.command == "span-lexicon":
+        return span_lexicon_command(args)
+    if args.command == "span-ingest":
+        return span_ingest_command(args)
+    if args.command == "span-confirm":
+        return asyncio.run(span_confirm_command(args))
     raise SystemExit(f"unknown command: {args.command}")
 
 
@@ -2245,6 +2366,324 @@ async def filter_confirm_command(
                                  actor=args.actor)
         print(f"session {_short(sess.id)} completed · {done} accepted · journal "
               f"{jp or 'none'}")
+    finally:
+        await _close_graph_stack(manager, queue, cap)
+    return 0
+
+
+async def span_pack_command(
+    args: argparse.Namespace,  # Parsed args for the `span-pack` subcommand
+) -> int:  # Process exit code
+    """Execute `span-pack`: the filter pack's lines as a SPEECH-OVERLAY pack
+    (design bbf8bafd (c)) — `<out-dir>/<pack_id>.json` + `.md`. Reads only."""
+    ws, manager, queue = await _open_graph_stack(args)
+    cap = args.graph_capability
+    try:
+        sid, title, _media = await resolve_source_node(queue, cap, args.source)
+        segs = await load_source_segments(queue, cap, sid, rendition_selector=args.rendition,
+                                          skeleton_selector=args.skeleton)
+        if not segs:
+            raise SystemExit("empty spine (0 segments)")
+        spines = await list_source_spines(queue, cap, sid, rendition_selector=args.rendition)
+        skel = skeleton_hash_for(spines, args.skeleton)
+        corrections, superseded = await load_source_corrections(queue, cap, sid)
+        active = [c for c in corrections
+                  if c["id"] not in superseded and c.get("status") != "proposed"]
+        eff = project_effective_spine(segs, active)
+        overlays = active_speech_overlays(corrections, superseded)
+        chash = await _source_content_hash(queue, cap, sid)
+        speakers = None
+        assigned = {} if args.no_speakers else active_speaker_assignments(corrections, superseded)
+        if assigned:
+            names = {e["id"]: (e.get("properties") or {}).get("canonical_name")
+                     for e in await list_speaker_entities(queue, cap, kind=None)}
+            speakers = {s.id: names.get((assigned.get(s.id) or {}).get("entity_id")) for s in eff}
+    finally:
+        await _close_graph_stack(manager, queue, cap)
+    if args.split and args.window:
+        raise SystemExit("--split plans its own windows — drop --window")
+    windows = (plan_pack_windows(eff, args.split, speakers=speakers) if args.split
+               else [tuple(args.window) if args.window else None])
+    packs = [build_span_pack(sid, title, skel, eff, content_hash=chash, window=w, overlays=overlays,
+                             labels=_class_list(args.labels), speakers=speakers, margin=args.margin)
+             for w in windows]
+    if args.split:
+        seen = [r["id"] for pk in packs for r in pk["segments"]]
+        want = [s.id for s in eff if not s.is_empty]
+        if sorted(seen) != sorted(want):
+            raise SystemExit(f"--split windows do not tile the spine ({len(seen)} packed vs "
+                             f"{len(want)} text segments); pack by --window")
+    out_dir = (Path(args.out_dir) if args.out_dir
+               else (ws.root / "packs" if ws is not None else Path("packs")))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    print(f"source: {title or sid}  ({sid}) · spine {_spine_tag(skel)} · "
+          f"{len(overlays)} active overlays on the source")
+    for pack in packs:
+        json_path = out_dir / f"{pack['pack_id']}.json"
+        md_path = out_dir / f"{pack['pack_id']}.md"
+        json_path.write_text(json.dumps(pack, indent=2, ensure_ascii=False))
+        md_path.write_text(render_span_pack(pack))
+        w = pack["window"]
+        print(f"pack {pack['pack_id']}: {len(pack['segments'])} lines · window "
+              f"{w['start']:.1f}-{(w['end'] if w['end'] is not None else 0.0):.1f}s · "
+              f"{len(pack['existing_overlays'])} overlays already annotated")
+        print(f"  json  {json_path}")
+        print(f"  brief {md_path}")
+    print("next: span-lexicon --pack <pack json> for the bare um/uh tier; hand each brief to a "
+          "proposer, then span-ingest --pack <pack json> --rows <its jsonl> --proposer <name>")
+    return 0
+
+
+def _load_span_pack(path: Path) -> Dict[str, Any]:  # Read + gate a span pack json
+    try:
+        pack = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(f"cannot read pack {path}: {e}")
+    if not is_span_pack(pack):
+        raise SystemExit(f"{path} is not a span pack (format {pack.get('format')!r}, "
+                         f"row_kind {pack.get('row_kind')!r}) — span-pack writes one")
+    return pack
+
+
+def _write_span_set(args: argparse.Namespace, pack: Dict[str, Any], rows: List[Dict[str, Any]],
+                    proposer: Dict[str, Any]) -> int:  # Shared tail of span-lexicon / span-ingest
+    ws = resolve_workspace(explicit=getattr(args, "workspace", None))
+    try:
+        valid = validate_span_rows(rows, pack)
+    except ValueError as e:
+        raise SystemExit(f"rows rejected: {e}")
+    proposals = span_proposals_from_rows(valid, pack)
+    out_root = (Path(args.out_dir) if args.out_dir
+                else (ws.root / "proposals" if ws is not None else None))
+    if out_root is None:
+        raise SystemExit("proposal sets land workspace-local — pass --out-dir or run "
+                         "inside a workspace (CJM_WORKSPACE)")
+    if os.environ.get("CJM_SESSION"):
+        proposer = {**proposer, "session": os.environ["CJM_SESSION"]}
+    res = write_span_propset(pack, proposals, out_root=out_root, proposer=proposer, ws=ws)
+    src = pack.get("source") or {}
+    tag = _spine_tag(src.get("skeleton_hash"))
+    md_path = Path(res["set_dir"]) / "proposals.md"
+    manifest = json.loads(Path(res["manifest_path"]).read_text())
+    md_path.write_text(render_span_propset_markdown(manifest, proposals, pack))
+    print(f"source: {src.get('title') or src.get('source_id')} · spine {tag} · "
+          f"pack {pack.get('pack_id')}")
+    print(f"span set {res['set_id']} -> {res['set_dir']}")
+    print(f"  human view {md_path}")
+    t1 = " · ".join(f"{k}x{v}" for k, v in sorted(res["counts"].items())) or "none"
+    t2 = " · ".join(f"{k}x{v}" for k, v in sorted(res["tier2_counts"].items())) or "none"
+    print(f"tier-1: {t1}\ntier-2: {t2}")
+    print(f"next: span-confirm --source {src.get('source_id')} --skeleton {tag}")
+    return 0
+
+
+def span_lexicon_command(
+    args: argparse.Namespace,  # Parsed args for the `span-lexicon` subcommand
+) -> int:  # Process exit code
+    """Execute `span-lexicon`: the pattern tier (design bbf8bafd (g)) — bare
+    um / uh tokens as tier-1 hesitation markers under the lexicon actor, a set
+    of its own that benches on its own. No graph, no journal."""
+    pack = _load_span_pack(Path(args.pack))
+    rows = lexicon_span_rows(pack)
+    print(f"lexicon: {len(rows)} bare hesitation token(s) over {len(pack.get('segments') or [])} lines")
+    return _write_span_set(args, pack, rows, {"kind": "lexicon", "name": LEXICON_ACTOR})
+
+
+def span_ingest_command(
+    args: argparse.Namespace,  # Parsed args for the `span-ingest` subcommand
+) -> int:  # Process exit code
+    """Execute `span-ingest`: resolve a proposer's quoted-word rows against
+    their span pack (whole-token match, nth disambiguates, refusals name the
+    row) and write the span proposal set. No graph, no journal — nothing is
+    decided here, and no character offset ever comes from the model."""
+    pack = _load_span_pack(Path(args.pack))
+    rows = _read_proposer_rows(Path(args.rows))
+    proposer = {"kind": args.proposer_kind, "name": args.proposer,
+                **({"model": args.model} if args.model else {})}
+    return _write_span_set(args, pack, rows, proposer)
+
+
+async def span_confirm_command(
+    args: argparse.Namespace,  # Parsed args for the `span-confirm` subcommand
+) -> int:  # Process exit code
+    """Execute `span-confirm`: the HEADLESS HITL worklist over one span
+    proposal set (design bbf8bafd (e)/(f)). Without gestures it LISTS: the
+    pending tier-1 spans, the active overlays over the window, the lane's
+    watermark and the derived verdicts — nothing written. With gestures it
+    commits, journal-first: accept = the speech-overlay op, re-anchored on the
+    CURRENT line and snapped from the forced alignment, carrying the proposal
+    id + set id; --relabel accepts under another label; --remove supersedes an
+    active overlay; --watermark asserts the span lane's annotated_through."""
+    ws, manager, queue = await _open_graph_stack(args)
+    cap = args.graph_capability
+    try:
+        sid, title, _media = await resolve_source_node(queue, cap, args.source)
+        spines = await list_source_spines(queue, cap, sid, rendition_selector=args.rendition)
+        skel = skeleton_hash_for(spines, args.skeleton)
+        if ws is None:
+            raise SystemExit("proposal sets are workspace-local — run inside a workspace "
+                             "(CJM_WORKSPACE or --workspace)")
+        sets = load_span_proposal_sets(str(ws.root), sid, skeleton_hash=skel)
+        if not sets:
+            print(f"no span proposal set for {title or sid} · spine {_spine_tag(skel)} "
+                  f"under {ws.root / 'proposals'} — run span-pack + span-lexicon / a proposer + span-ingest")
+            return 1
+        chosen = (_pick_by_prefix([s["manifest"] for s in sets], "proposal_set_id", args.set,
+                                  "span set") if args.set else sets[0]["manifest"])
+        pset = next(s for s in sets if s["manifest"] is chosen)
+        m, proposals = pset["manifest"], pset["proposals"]
+        set_id = m.get("proposal_set_id")
+        corrections, superseded = await load_source_corrections(queue, cap, sid)
+        overlays = active_speech_overlays(corrections, superseded)
+        gates = await load_extraction_gates(queue, cap, sid, lane=SPAN_LANE)
+        gate = gates.get(skel) or {}
+        watermark = gate.get("annotated_through")
+        window = (float((m.get("window") or {}).get("start") or 0.0),
+                  (m.get("window") or {}).get("end"))
+        gestures = bool(args.accept or args.accept_tier1 or args.accept_all or args.relabel
+                        or args.remove or args.watermark is not None)
+        pending_all = pending_span_proposals(proposals, overlays, show_tier2=True)
+        print(f"source: {title or sid}  ({sid}) · spine {_spine_tag(skel)}")
+        print(f"set {set_id} · proposer {(m.get('model') or {}).get('kind')}:"
+              f"{(m.get('model') or {}).get('name')} · window "
+              f"{window[0]:.1f}-{(window[1] if window[1] is not None else 0.0):.1f}s"
+              + (f" · {len(sets)} sets (newest shown; --set picks)" if len(sets) > 1 else ""))
+        print(f"lane watermark: {('%.1fs' % float(watermark)) if watermark is not None else 'none'}"
+              f" · active overlays on the source: {len(overlays)}")
+        if args.markdown:
+            pack_path = ws.root / "packs" / f"{(m.get('pack') or {}).get('pack_id')}.json"
+            pack = None
+            if pack_path.is_file():
+                try:
+                    pack = json.loads(pack_path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    pack = None
+            md_path = Path(pset["path"]).parent / "proposals.md"
+            md_path.write_text(render_span_propset_markdown(m, proposals, pack))
+            print(f"human view: {md_path}" + ("" if pack else "  (pack not found — quotes only)"))
+        if not gestures:
+            shown = [p for p in pending_all if args.tier2 or int(p.get("tier", 1)) == 1]
+            hidden_t2 = sum(1 for p in pending_all if int(p.get("tier", 1)) == 2)
+            print(f"pending: {len(shown)} shown"
+                  + (f" · tier-2 {hidden_t2} hidden (--tier2 shows)" if hidden_t2 and not args.tier2 else ""))
+            for p in shown:
+                a = p.get("anchor") or {}
+                tier = "??" if int(p.get("tier", 1)) == 2 else "? "
+                conf = p.get("confidence")
+                print(f"  {tier}{_short(p.get('proposal_id'))}  {p.get('label'):>19}  "
+                      f"{float(p.get('start_time') or 0):8.1f}s  #{p.get('index')}"
+                      + (f"  c={conf:.2f}" if isinstance(conf, (int, float)) else "")
+                      + f'  "{a.get("text_snapshot")}"')
+                if p.get("rationale"):
+                    for wrapped in textwrap.wrap(str(p["rationale"]), width=100):
+                        print(f"        {wrapped}")
+            b = bench_span_proposals(proposals, overlays, window, watermark=watermark)
+            for tier_key, label in (("tier1", "tier-1"), ("tier2", "tier-2")):
+                c = b["counts"][tier_key]
+                if tier_key == "tier2" and not any(c.values()):
+                    continue
+                print(f"derived verdicts ({label}): " + " · ".join(f"{k} {v}" for k, v in c.items())
+                      + (("  rates " + " ".join(f"{k}={v}" for k, v in b["rates"].items()))
+                         if b["rates"] and tier_key == "tier1" else "")
+                      + (f" · missed {len(b['missed'])}" if b["missed"] and tier_key == "tier1" else ""))
+            print("gestures: --accept <id> · --relabel <id>:<label> · --accept-tier1 · --accept-all "
+                  "· --remove <overlay> · --watermark <sec|end|none>")
+            return 0
+
+        db = _resolve_graph_db(args, manager, cap, ws)
+        jp = sidecar_journal_path(db)
+        fa_cache = (Path(args.fa_cache_db) if args.fa_cache_db
+                    else (ws.substrate_data_dir / "data" / "cjm-capability-qwen3-forced-aligner"
+                          / "forced_alignments.db"))
+        if not fa_cache.is_file():
+            print(f"forced alignment: cache not found ({fa_cache}) — spans land as 'estimated' "
+                  "(nudge-grade; --fa-cache-db to snap)")
+            fa_cache = None
+        sess = await start_session(queue, cap, [sid], journal_path=jp, purpose=args.purpose,
+                                   actor=args.actor)
+        to_accept: List[Tuple[Dict[str, Any], Optional[str]]] = []
+        if args.accept_all:
+            to_accept = [(p, None) for p in pending_all]
+        elif args.accept_tier1:
+            to_accept = [(p, None) for p in pending_all if int(p.get("tier", 1)) == 1]
+        for pref in (args.accept or []):
+            p = _pick_by_prefix(pending_all, "proposal_id", pref, "pending span")
+            if all(q is not p for q, _ in to_accept):
+                to_accept.append((p, None))
+        for spec in (args.relabel or []):
+            pref, _, lab = spec.partition(":")
+            if not lab.strip() or not lab.strip()[:1].isalnum():
+                raise SystemExit(f"--relabel needs PROPOSAL:LABEL, got {spec!r}")
+            p = _pick_by_prefix(pending_all, "proposal_id", pref, "pending span")
+            to_accept = [(q, l) for q, l in to_accept if q is not p] + [(p, lab.strip())]
+        done = 0
+        if to_accept:
+            # The CURRENT effective view — the pack froze the lines; the walk lane may
+            # have edited them since (re-anchor by snapshot, or refuse).
+            segs_now = await load_source_segments(queue, cap, sid, rendition_selector=args.rendition,
+                                                  skeleton_selector=args.skeleton)
+            active_now = [c for c in corrections
+                          if c["id"] not in superseded and c.get("status") != "proposed"]
+            eff_by_id = {s.id: s for s in project_effective_spine(segs_now, active_now)}
+            fa_words_cache: Dict[str, Optional[List[Dict[str, Any]]]] = {}
+            for p, lab in to_accept:
+                seg = eff_by_id.get((p.get("anchor") or {}).get("segment_id"))
+                if seg is None:
+                    raise SystemExit(f"--accept {_short(p.get('proposal_id'))}: its segment is no "
+                                     f"longer on the live spine")
+                tid = getattr(seg, "text_from", None)
+                fa_words = None
+                if fa_cache is not None and tid:
+                    if tid not in fa_words_cache:
+                        fa_words_cache[tid] = await fa_words_for_transcript(queue, cap, tid, fa_cache)
+                    fa_words = fa_words_cache[tid]
+                try:
+                    rec = snap_span_proposal(p, seg, fa_words, label=lab)
+                except ValueError as e:
+                    raise SystemExit(f"--accept {_short(p.get('proposal_id'))} refused: {e}")
+                note = p.get("rationale")
+                if lab:
+                    note = f"relabeled from {p.get('label')} by {args.actor}: {note or ''}".strip()
+                oid = await commit_speech_overlay_correction(
+                    queue, cap, sid, rec["anchor"], rec["label"], rec["start_time"], rec["end_time"],
+                    rec["text"], sess.id, words=rec["words"], snap=rec["snap"], actor=args.actor,
+                    note=note, journal_path=jp, proposal_id=p.get("proposal_id"),
+                    proposal_set_id=set_id)
+                done += 1
+                print(f"{'relabeled' if lab else 'accepted'} {_short(p.get('proposal_id'))} -> overlay "
+                      f"{_short(oid)} {rec['label']} {rec['start_time']:.2f}-{rec['end_time']:.2f}s "
+                      f"({rec['snap']}) #{seg.index} \"{rec['text']}\"")
+        for pref in (args.remove or []):
+            c = _pick_by_prefix(overlays, "id", pref, "active overlay")
+            rid = await commit_speech_overlay_removal(queue, cap, sid, c["id"], sess.id,
+                                                      actor=args.actor, note=args.note,
+                                                      journal_path=jp)
+            print(f"removed overlay {_short(c['id'])} "
+                  f"({(c.get('payload') or {}).get('label')} \"{(c.get('payload') or {}).get('text')}\") "
+                  f"via {_short(rid)}")
+        if args.watermark is not None:
+            wm_arg = str(args.watermark).strip().lower()
+            wm: Optional[float]
+            if wm_arg == "end":
+                segs = await load_source_segments(queue, cap, sid,
+                                                  rendition_selector=args.rendition,
+                                                  skeleton_selector=args.skeleton)
+                ends = [float(s.end_time) for s in segs if s.end_time is not None]
+                if not ends:
+                    raise SystemExit("--watermark end: the spine has no timed segments")
+                wm = max(ends)
+            elif wm_arg == "none":
+                wm = None
+            else:
+                wm = float(args.watermark)
+            gid = await commit_extraction_gate(
+                queue, cap, sid, skel, str(gate.get("extraction_status") or "in_progress"),
+                wm, session_id=sess.id, actor=args.actor, journal_path=jp, lane=SPAN_LANE)
+            print(f"lane watermark asserted: annotated_through "
+                  f"{('%.1fs' % wm) if wm is not None else 'none'} ({_short(gid)})")
+        await set_session_status(queue, cap, sess.id, "completed", journal_path=jp,
+                                 actor=args.actor)
+        print(f"session {_short(sess.id)} completed · {done} accepted · journal {jp or 'none'}")
     finally:
         await _close_graph_stack(manager, queue, cap)
     return 0
