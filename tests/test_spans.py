@@ -283,3 +283,55 @@ def test_overlay_correction_carries_proposal_provenance():
         "src", {"kind": "span", "segment_id": "s0", "char_start": 15, "char_end": 22,
                 "text_snapshot": "the the"}, "word-repeat", 0.9, 1.3, "the the", "sess")
     assert "proposal_id" not in node2["properties"]["payload"]   # a hand overlay is byte-compatible
+
+
+# ---- merge (window sets + the lexicon tier -> one walk) ----
+
+def test_merge_span_sets_collapses_the_same_words_and_keeps_origins(tmp_path):
+    from cjm_transcript_correction_core.spans import merge_span_proposals
+    whole = _pack()
+    w1 = _pack(window=(0.0, 4.4))     # s0
+    w2 = _pack(window=(4.4, None))    # s2, s3
+    lex = _pack()
+    s1 = span_proposals_from_rows(validate_span_rows(
+        [{"label": "hesitation-marker", "i": 0, "text": "um", "confidence": 0.7},
+         {"label": "word-repeat", "i": 0, "text": "the the", "confidence": 0.9}], w1), w1)
+    s2 = span_proposals_from_rows(validate_span_rows(
+        [{"label": "discourse-marker", "i": 0, "text": "You know,", "tier": 2},
+         {"label": "hesitation-marker", "i": 0, "text": "uh"},
+         {"label": "false-start", "i": 1, "text": "I think we—"}], w2), w2)
+    s3 = span_proposals_from_rows(validate_span_rows(lexicon_span_rows(lex), lex), lex)   # Um + uh, c=1.0
+    sets = [{"manifest": {"proposal_set_id": f"set{k}", "source": {"source_id": "src"},
+                          "model": {"name": n}, "window": pk["window"]}, "proposals": rows}
+            for k, (n, pk, rows) in enumerate([("w1", w1, s1), ("w2", w2, s2), ("lexicon", lex, s3)])]
+    merged = merge_span_proposals(sets, whole)
+    assert [(p["label"], p["evidence"]["i"], p["anchor"]["text_snapshot"]) for p in merged] == [
+        ("hesitation-marker", 0, "Um,"), ("word-repeat", 0, "the the"),
+        ("discourse-marker", 1, "You know,"), ("hesitation-marker", 1, "uh,"),
+        ("false-start", 2, "I think we—")]
+    um = merged[0]
+    assert sorted(o["set_id"] for o in um["origins"]) == ["set0", "set2"]   # window set + lexicon agree
+    assert um["confidence"] == 1.0 and um["tier"] == 1                       # the lexicon's confidence represents
+    assert merged[2]["tier"] == 2 and len(merged[2]["origins"]) == 1
+    assert all(p["evidence"]["pack_id"] == whole["pack_id"] for p in merged)   # target-pack coordinates
+    # every merged row round-trips through the contract (a re-quote of the same words)
+    assert [p["anchor"]["char_start"] for p in merged] == [0, 15, 0, 34, 0]
+    # a set from another source, or a line whose text no longer matches the anchor, refuses loudly
+    with pytest.raises(ValueError, match="different source"):
+        merge_span_proposals([{"manifest": {"proposal_set_id": "x", "source": {"source_id": "other"}},
+                               "proposals": s1}], whole)
+    drifted = build_span_pack("src", "Episode", "sha256:skel", [
+        SpineSegment(id="s0", index=0, text="Um, so we now have the the data center.", start_time=0.0, end_time=4.0)])
+    with pytest.raises(ValueError, match="reads differently than the anchor's snapshot"):
+        merge_span_proposals(sets[:1], drifted)
+
+
+def test_merge_keeps_repeated_words_disambiguated():
+    from cjm_transcript_correction_core.spans import merge_span_proposals
+    pack = build_span_pack("src", "t", None, [
+        SpineSegment(id="a", index=0, text="much, much larger, much more.", start_time=0.0, end_time=2.0)])
+    rows = span_proposals_from_rows(validate_span_rows(
+        [{"label": "emphasis-repeat", "i": 0, "text": "much", "nth": 3}], pack), pack)
+    merged = merge_span_proposals([{"manifest": {"proposal_set_id": "s", "source": {"source_id": "src"}},
+                                    "proposals": rows}], pack)
+    assert merged[0]["anchor"]["char_start"] == 19 and merged[0]["evidence"]["nth"] == 3

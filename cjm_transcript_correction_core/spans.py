@@ -450,6 +450,98 @@ def load_span_proposal_sets(
                                      set_format=SPAN_PROPOSAL_SET_FORMAT)
 
 
+def merge_span_proposals(
+    sets: List[Dict[str, Any]],  # load_span_proposal_sets-shaped entries ({"manifest","proposals"}), any windows
+    pack: Dict[str, Any],        # The TARGET span pack every row re-resolves against (normally the whole spine)
+    *,
+    iou: float = 1.0,            # Same-label, same-line character IoU at/above which two rows are ONE (1.0 = the same words)
+) -> List[Dict[str, Any]]:  # Span proposal-set rows in target-pack coordinates, each carrying `origins`
+    """Fold several SPAN sets over one spine into one walkable set — the
+    merge_filter_proposals dual (design 6752db0a (7) + (8)): N window sets
+    become one set, rival arms one walk. Each row re-resolves by SEGMENT ID
+    into the target pack's line (loud when the line is not there, or its
+    text differs from the anchor's snapshot at the recorded offsets — the
+    spine drifted or the pack is the wrong one); same-label rows on the same
+    line whose character ranges agree (IoU >= `iou`; the default 1.0 = the
+    same words, since a span IS its words) collapse into one row whose
+    `origins` name every contributor. Representative = the most-agreed
+    range, ties to the highest confidence; tier = the most visible member.
+    Overlapping-but-different rows stay separate: the human's accept decides,
+    and each origin set still benches on its own by character overlap."""
+    lines = {r["id"]: r for r in pack.get("segments") or []}
+    flat: List[Dict[str, Any]] = []
+    for entry in sets:
+        m = entry.get("manifest") or {}
+        if (m.get("source") or {}).get("source_id") != (pack.get("source") or {}).get("source_id"):
+            raise ValueError(f"set {m.get('proposal_set_id')}: a different source than the target pack")
+        for p in entry.get("proposals") or []:
+            a = p.get("anchor") or {}
+            line = lines.get(a.get("segment_id"))
+            if line is None:
+                raise ValueError(f"set {m.get('proposal_set_id')} proposal {p.get('proposal_id')}: "
+                                 f"segment {a.get('segment_id')} is not in the target pack")
+            cs, ce = int(a.get("char_start") or 0), int(a.get("char_end") or 0)
+            if str(line.get("text") or "")[cs:ce] != str(a.get("text_snapshot") or ""):
+                raise ValueError(f"set {m.get('proposal_set_id')} proposal {p.get('proposal_id')}: "
+                                 f"line {line['i']} reads differently than the anchor's snapshot "
+                                 f"({a.get('text_snapshot')!r} at {cs}:{ce})")
+            flat.append({"p": p, "i": line["i"], "range": (cs, ce),
+                         "origin": {"set_id": m.get("proposal_set_id"),
+                                    "proposal_id": p.get("proposal_id"),
+                                    "proposer": (m.get("model") or {}).get("name"),
+                                    "window": m.get("window"),
+                                    "i": line["i"], "char_start": cs, "char_end": ce,
+                                    "tier": int(p.get("tier", 1)),
+                                    "confidence": p.get("confidence")}})
+    flat.sort(key=lambda f: (str(f["p"].get("label")), f["i"], f["range"]))
+    clusters: List[List[Dict[str, Any]]] = []
+    for f in flat:
+        home = next((c for c in reversed(clusters)
+                     if c[0]["p"].get("label") == f["p"].get("label") and c[0]["i"] == f["i"]
+                     and _char_iou(*c[0]["range"], *f["range"]) >= float(iou)
+                     and f["origin"]["set_id"] not in {x["origin"]["set_id"] for x in c}), None)
+        if home is None:
+            clusters.append([f])
+        else:
+            home.append(f)
+    out: List[Dict[str, Any]] = []
+    for c in clusters:
+        votes: Dict[Tuple[int, int], int] = {}
+        for f in c:
+            votes[f["range"]] = votes.get(f["range"], 0) + 1
+        rep = max(c, key=lambda f: (votes[f["range"]], float(f["p"].get("confidence") or 0.0)))
+        p = rep["p"]
+        row = validate_span_rows([{"label": p.get("label"), "i": rep["i"],
+                                   "text": (p.get("anchor") or {}).get("text_snapshot"),
+                                   "nth": _nth_of(lines_text=str((pack.get("segments") or [])[rep["i"]].get("text") or ""),
+                                                  text=str((p.get("anchor") or {}).get("text_snapshot") or ""),
+                                                  char_start=rep["range"][0]),
+                                   "tier": min(f["origin"]["tier"] for f in c),
+                                   "confidence": p.get("confidence"),
+                                   "rationale": p.get("rationale")}], pack)
+        merged = span_proposals_from_rows(row, pack)[0]
+        merged["origins"] = [f["origin"] for f in c]
+        out.append(merged)
+    out.sort(key=lambda r: (r["start_time"] if r["start_time"] is not None else 0.0,
+                            r["evidence"]["i"], r["anchor"]["char_start"]))
+    return out
+
+
+def _nth_of(lines_text: str, text: str, char_start: int) -> Optional[int]:  # Which occurrence starts at char_start
+    """The 1-based occurrence of `text` (as whole tokens) whose first token
+    starts at `char_start` — so a merged row re-states the SAME words a
+    proposer quoted, disambiguated the way the contract disambiguates."""
+    tokens = segment_word_tokens(lines_text)
+    q = [_norm_token(t) for t in text.split() if _norm_token(t)]
+    norm = [_norm_token(t) for _, _, t in tokens]
+    k = len(q)
+    hits = [i for i in range(0, len(norm) - k + 1) if norm[i:i + k] == q]
+    for n, i in enumerate(hits, start=1):
+        if tokens[i][0] == char_start:
+            return n if len(hits) > 1 else None
+    return None
+
+
 def render_span_propset_markdown(
     manifest: Dict[str, Any],                 # The span set's manifest
     proposals: List[Dict[str, Any]],          # Its rows

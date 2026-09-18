@@ -49,9 +49,10 @@ from cjm_transcript_correction_core.signals import (ATTENTION_ACTOR, ATTENTION_D
                                                     load_event_proposal_set)
 from cjm_transcript_correction_core.spans import (bench_span_proposals, build_span_pack,
                                                   is_span_pack, LEXICON_ACTOR, lexicon_span_rows,
-                                                  load_span_proposal_sets, pending_span_proposals,
-                                                  render_span_pack, render_span_propset_markdown,
-                                                  snap_span_proposal, SPAN_LANE,
+                                                  load_span_proposal_sets, merge_span_proposals,
+                                                  pending_span_proposals, render_span_pack,
+                                                  render_span_propset_markdown, snap_span_proposal,
+                                                  SPAN_LANE, SPAN_PROPOSAL_SET_FORMAT,
                                                   span_proposals_from_rows, validate_span_rows,
                                                   write_span_propset)
 from cjm_transcript_correction_core.strata import (active_strata, bench_filter_proposals,
@@ -588,6 +589,25 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                          help="Proposal-set root directory (default: <workspace>/proposals)")
     singest.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
 
+    smerge = sub.add_parser(
+        "span-merge",
+        help="Fold several span proposal sets over ONE spine (window sets, rival proposers, "
+             "the lexicon tier) into one walkable set in a target pack's coordinates; rows "
+             "keep their origins (no graph writes)")
+    smerge.add_argument("--pack", required=True,
+                        help="The TARGET span pack json every row re-resolves against (the whole spine)")
+    smerge.add_argument("--sets", required=True, nargs="+", metavar="SET_DIR",
+                        help="Span-set directories to fold (each holds manifest.json)")
+    smerge.add_argument("--name", required=True, help="Name recorded as the merged set's proposer")
+    smerge.add_argument("--iou", type=float, default=1.0,
+                        help="Same-label, same-line character IoU at/above which two rows are one "
+                             "(default 1.0 = the same words)")
+    smerge.add_argument("--workspace", default=None,
+                        help="Workspace root (default: CJM_WORKSPACE env, else upward walk from cwd)")
+    smerge.add_argument("--out-dir", default=None,
+                        help="Proposal-set root directory (default: <workspace>/proposals)")
+    smerge.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
+
     sconfirm = sub.add_parser(
         "span-confirm",
         help="The headless HITL worklist over a span proposal set: list pending spans + "
@@ -824,6 +844,8 @@ def main(
         return span_lexicon_command(args)
     if args.command == "span-ingest":
         return span_ingest_command(args)
+    if args.command == "span-merge":
+        return span_merge_command(args)
     if args.command == "span-confirm":
         return asyncio.run(span_confirm_command(args))
     raise SystemExit(f"unknown command: {args.command}")
@@ -2514,6 +2536,57 @@ def span_ingest_command(
     proposer = {"kind": args.proposer_kind, "name": args.proposer,
                 **({"model": args.model} if args.model else {})}
     return _write_span_set(args, pack, rows, proposer)
+
+
+def span_merge_command(
+    args: argparse.Namespace,  # Parsed args for the `span-merge` subcommand
+) -> int:  # Process exit code
+    """Execute `span-merge`: fold several span sets over one spine into ONE
+    set in the target pack's coordinates (the filter-merge dual). Rows keep
+    their `origins`, the manifest its `merged_from`; each origin set still
+    benches on its own. No graph, no journal."""
+    ws = resolve_workspace(explicit=getattr(args, "workspace", None))
+    pack = _load_span_pack(Path(args.pack))
+    sets: List[Dict[str, Any]] = []
+    for d in args.sets:
+        mp = Path(d) / "manifest.json"
+        try:
+            m = json.loads(mp.read_text())
+            data = Path(d) / str((m.get("files") or {}).get("proposals") or "proposals.jsonl")
+            rows = [json.loads(line) for line in data.read_text().splitlines() if line.strip()]
+        except (OSError, json.JSONDecodeError) as e:
+            raise SystemExit(f"cannot read proposal set {d}: {e}")
+        if m.get("format") != SPAN_PROPOSAL_SET_FORMAT:
+            raise SystemExit(f"{d} is not a span set (format {m.get('format')!r})")
+        sets.append({"manifest": m, "proposals": rows})
+    try:
+        proposals = merge_span_proposals(sets, pack, iou=args.iou)
+    except ValueError as e:
+        raise SystemExit(f"merge refused: {e}")
+    out_root = (Path(args.out_dir) if args.out_dir
+                else (ws.root / "proposals" if ws is not None else None))
+    if out_root is None:
+        raise SystemExit("proposal sets land workspace-local — pass --out-dir or run "
+                         "inside a workspace (CJM_WORKSPACE)")
+    proposer = {"kind": "merge", "name": args.name,
+                **({"session": os.environ["CJM_SESSION"]} if os.environ.get("CJM_SESSION") else {})}
+    merged_from = [{"proposal_set_id": e["manifest"].get("proposal_set_id"),
+                    "proposer": e["manifest"].get("model"), "window": e["manifest"].get("window"),
+                    "pack": e["manifest"].get("pack"), "rows": len(e["proposals"])} for e in sets]
+    res = write_span_propset(pack, proposals, out_root=out_root, proposer=proposer, ws=ws,
+                             extra={"merged_from": merged_from, "merge": {"iou": args.iou}})
+    manifest = json.loads(Path(res["manifest_path"]).read_text())
+    md_path = Path(res["set_dir"]) / "proposals.md"
+    md_path.write_text(render_span_propset_markdown(manifest, proposals, pack))
+    agreed = sum(1 for p in proposals if len(p.get("origins") or []) > 1)
+    print(f"merged {sum(len(e['proposals']) for e in sets)} rows from {len(sets)} sets -> "
+          f"{len(proposals)} rows ({agreed} raised by more than one set)")
+    t1 = " · ".join(f"{k}x{v}" for k, v in sorted(res["counts"].items())) or "none"
+    t2 = " · ".join(f"{k}x{v}" for k, v in sorted(res["tier2_counts"].items())) or "none"
+    print(f"tier-1: {t1}\ntier-2: {t2}")
+    print(f"span set {res['set_id']} -> {res['set_dir']}")
+    print(f"  human view {md_path}")
+    return 0
 
 
 async def span_confirm_command(
