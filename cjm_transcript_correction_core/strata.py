@@ -59,7 +59,10 @@ STRATUM_GLOSSES: Dict[str, str] = {
     "filler": ("a line or run that is ENTIRELY hesitation, an abandoned false start, a verbatim repeat "
                "of what follows, or a bare acknowledgement that answers nothing ('Mhm.') — eliding it "
                "loses NO content, and every reader above the raw spine never sees it; a line that "
-               "carries any content with a filler inside is NOT `filler`"),
+               "carries any content with a filler inside is NOT `filler` — a connective that does "
+               "logical work ('and' joining two conditions, 'but', 'because') is content, a bare "
+               "sentence-opener ('And', 'So', 'Okay') is not; when in doubt it is NOT filler (the "
+               "word-grain disfluency pass takes the disfluent words)"),
     "apparatus": "publishing apparatus: credits, dedication, legal, acknowledgments, boilerplate — NOT a "
                  "read-aloud section title, cross-reference or segue (those have their own classes)",
     "section-header": ("a section title read aloud — the heading a notes deliverable renders under; the "
@@ -798,6 +801,12 @@ def exclude_strata(
     return [s for s in segments if not (drop & set(idx.get(s.id, [])))]
 
 
+TOUCH_TOLERANCE = 0.005   # Seconds: below this two spans TOUCH, they do not overlap (a rounded proposal
+
+
+                          # time beside an unrounded stratum time once hid a tier-1 row — finding 2026-09-17)
+
+
 def _overlap(a0: float, a1: float, b0: float, b1: float) -> float:  # Seconds of overlap
     return max(0.0, min(a1, b1) - max(a0, b0))
 
@@ -860,7 +869,7 @@ def pending_filter_proposals(
         if p.get("proposal_id") in by_pid:
             continue
         ps, pe = float(p.get("start_time") or 0.0), float(p.get("end_time") or 0.0)
-        if any(cat == p.get("category") and _overlap(ps, pe, s0, s1) > 0.0
+        if any(cat == p.get("category") and _overlap(ps, pe, s0, s1) > TOUCH_TOLERANCE
                for cat, s0, s1 in spans):
             continue
         out.append(p)
@@ -929,7 +938,7 @@ def bench_filter_proposals(
                     if same and r["category"] != p.get("category"):
                         continue
                     iou = _iou(ps, pe, r["start"], r["end"])
-                    if iou > 0.0:
+                    if iou > 0.0 and _overlap(ps, pe, r["start"], r["end"]) > TOUCH_TOLERANCE:
                         pairs.append((iou, id(p), key))
             for _iou_v, pid, key in sorted(pairs, key=lambda t: -t[0]):
                 if pid in matches or key not in unmatched:

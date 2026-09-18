@@ -547,3 +547,18 @@ def test_merge_folds_window_sets_and_rival_arms_into_target_coordinates(tmp_path
     other = build_filter_pack("src2", "t", None, SEGS)
     with pytest.raises(ValueError):
         merge_filter_proposals([arm_a], other)
+
+
+def test_touching_spans_do_not_hide_or_match_a_neighbour():
+    # finding 2026-09-17: proposal times are rounded to 4 decimals at ingest while an accepted
+    # stratum keeps the segment's unrounded time — a 0.00003 s phantom overlap hid a tier-1 row
+    pack = _pack()
+    rows = validate_proposal_rows([{"category": "filler", "from_i": 2, "to_i": 2, "tier": 1},
+                                   {"category": "filler", "from_i": 3, "to_i": 3, "tier": 1}], pack)
+    props = proposals_from_rows(rows, pack)                      # s3 = 6.0-8.5, s4 = 8.5-11.0
+    live = [_stratum("st", "filler", ["s3"], 6.0, 8.50003)]      # the accepted neighbour, unrounded
+    pend = pending_filter_proposals(props, live)
+    assert [p["evidence"]["from_i"] for p in pend] == [3]         # the touching row stays visible
+    b = bench_filter_proposals(props, live, (0.0, None), watermark=99.0)
+    assert sorted(v["verdict"] for v in b["verdicts"]) == ["accepted", "rejected"]   # never 'edited' off a touch
+    assert b["missed"] == []
