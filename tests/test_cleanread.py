@@ -71,6 +71,18 @@ def test_subtract_spans_leaves_a_visible_marker_and_tidies_seams():
         "so we have the data center."
 
 
+def test_subtract_spans_keeps_a_scope_operator_the_source_wrote():
+    # user-caught on the first content-strata walk: `uh thrust::reduce` reached a proposer as
+    # `[…] thrust:reduce` — the seam tidy collapsed ADJACENT colons, and a row flagged the "typo"
+    assert subtract_spans("uh thrust::reduce kernel", [(0, 2)]) == "[…] thrust::reduce kernel"
+    assert subtract_spans("uh thrust::reduce kernel", [(0, 2)], marker="") == "thrust::reduce kernel"
+    assert subtract_spans("so std::vector, um, std::string", [(16, 19)], marker="") == "so std::vector, std::string"
+    assert subtract_spans("um ::max is global", [(0, 2)], marker="") == "::max is global"
+    # the seams it exists for still close
+    assert subtract_spans("a, um, b", [(3, 5)], marker="") == "a, b"
+    assert subtract_spans("um, so we go", [(0, 2)], marker="") == "so we go"
+
+
 def test_clean_read_subtracts_twice_with_visible_elisions():
     lines = clean_read(SEGS, STRATA, OVERLAYS)
     assert [ln["id"] for ln in lines] == ["s2", "s3", "s6"]

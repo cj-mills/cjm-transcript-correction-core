@@ -111,9 +111,13 @@ def _cut_ranges(
 
 def _tidy(s: str) -> str:  # Whitespace + punctuation seams after a cut
     s = re.sub(r"\s+", " ", s).strip()
+    # ", ," -> "," — a cut's seam always leaves WHITESPACE between the two marks, so the rule
+    # demands it and runs BEFORE the space-before-punctuation rule closes that gap: a `::`
+    # the source wrote (thrust::reduce) is adjacent and never a seam (finding: the clean
+    # read handed a proposer `thrust:reduce`).
+    s = re.sub(r"([,;:])(?:\s+[,;:])+", r"\1", s)
     s = re.sub(r"\s+([,.;:?!])", r"\1", s)          # "larger, than" — a space before punctuation
-    s = re.sub(r"([,;:])(?:\s*[,;:])+", r"\1", s)    # ", ," -> ","
-    s = re.sub(r"^[,;:]\s*", "", s)                  # a leading comma left by a cut at the line start
+    s = re.sub(r"^[,;:](?![,;:])\s*", "", s)         # a leading comma left by a cut at the line start (never a leading `::`)
     return s
 
 
