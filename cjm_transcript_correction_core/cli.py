@@ -20,8 +20,8 @@ from cjm_context_graph_primitives.query import NodeQuery
 from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
 from cjm_substrate.core.workspace import relativize_recorded, resolve_workspace
-from cjm_transcript_correction_core.cleanread import (clean_read, clean_read_pack_read,
-                                                      clean_read_segments)
+from cjm_transcript_correction_core.cleanread import (clean_read, CLEAN_READ_EXCLUDE_STRATA,
+                                                      clean_read_pack_read, clean_read_segments)
 from cjm_transcript_correction_core.graph import (active_corrections, active_speaker_assignments,
                                                   active_speech_overlays, bench_event_proposals,
                                                   commit_chunk_insert_correction,
@@ -555,6 +555,9 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
                             "labels + the two keep labels)")
     spack.add_argument("--no-speakers", action="store_true",
                        help="Leave the assign lane's speaker attribution off the pack lines")
+    spack.add_argument("--include-elided", action="store_true",
+                       help="Pack the accepted filler lines as PROPOSABLE (default: context only — "
+                            "the clean read drops them whole; use for a dataset-purposed pass)")
     spack.add_argument("--out-dir", default=None, help="Pack directory (default: <workspace>/packs)")
     spack.add_argument("-v", "--verbose", action="store_true", help="DEBUG-level logging")
 
@@ -2426,6 +2429,14 @@ async def span_pack_command(
                   if c["id"] not in superseded and c.get("status") != "proposed"]
         eff = project_effective_spine(segs, active)
         overlays = active_speech_overlays(corrections, superseded)
+        # The clean read's own order (finding ec370add): lines an accepted line-level
+        # stratum already elides ride the pack as CONTEXT ONLY, never proposable.
+        elided: Optional[Dict[str, str]] = None
+        if not args.include_elided:
+            elided = {seg_id: str((c.get("payload") or {}).get("category"))
+                      for c in active_strata(corrections, superseded)
+                      if (c.get("payload") or {}).get("category") in CLEAN_READ_EXCLUDE_STRATA
+                      for seg_id in ((c.get("payload") or {}).get("segment_ids") or [])}
         chash = await _source_content_hash(queue, cap, sid)
         speakers = None
         assigned = {} if args.no_speakers else active_speaker_assignments(corrections, superseded)
@@ -2440,7 +2451,8 @@ async def span_pack_command(
     windows = (plan_pack_windows(eff, args.split, speakers=speakers) if args.split
                else [tuple(args.window) if args.window else None])
     packs = [build_span_pack(sid, title, skel, eff, content_hash=chash, window=w, overlays=overlays,
-                             labels=_class_list(args.labels), speakers=speakers, margin=args.margin)
+                             labels=_class_list(args.labels), speakers=speakers, margin=args.margin,
+                             context_only=elided)
              for w in windows]
     if args.split:
         seen = [r["id"] for pk in packs for r in pk["segments"]]
@@ -2459,9 +2471,12 @@ async def span_pack_command(
         json_path.write_text(json.dumps(pack, indent=2, ensure_ascii=False))
         md_path.write_text(render_span_pack(pack))
         w = pack["window"]
+        ctx_only = sum(1 for r in pack["segments"] if r.get("context_only"))
         print(f"pack {pack['pack_id']}: {len(pack['segments'])} lines · window "
               f"{w['start']:.1f}-{(w['end'] if w['end'] is not None else 0.0):.1f}s · "
-              f"{len(pack['existing_overlays'])} overlays already annotated")
+              f"{len(pack['existing_overlays'])} overlays already annotated"
+              + (f" · {ctx_only} context-only ({', '.join(pack.get('context_only_strata') or [])})"
+                 if ctx_only else ""))
         print(f"  json  {json_path}")
         print(f"  brief {md_path}")
     print("next: span-lexicon --pack <pack json> for the bare um/uh tier; hand each brief to a "

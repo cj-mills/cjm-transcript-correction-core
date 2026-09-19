@@ -123,13 +123,26 @@ def build_span_pack(
     labels: Optional[Sequence[str]] = None,  # The label slate (default: the filterable + keep slate)
     speakers: Optional[Dict[str, Optional[str]]] = None,  # segment id -> speaker display name (None = no speakers)
     margin: int = 0,                         # Text segments of READ-ONLY context either side of the window
+    context_only: Optional[Dict[str, str]] = None,  # segment id -> the accepted stratum class that ELIDES the line
 ) -> Dict[str, Any]:  # The pack (JSON-serializable)
     """Build the span proposer's input: the filter pack's numbered lines with
     `row_kind` = span, the overlay label slate (glossed, keep-flagged) and the
     overlays already active over the window. The same source binding, window
     and digest regime as a stratum pack — `filter-ingest` refuses it by
-    row_kind, `span-ingest` requires it."""
+    row_kind, `span-ingest` requires it.
+
+    `context_only` (finding ec370add, user-caught): the clean read drops the
+    accepted filler lines FIRST and subtracts spans only inside the lines that
+    remain, so the span pack follows the same order — a line an accepted
+    line-level stratum already elides stays in the pack, NUMBERED and readable
+    (a false start often runs through one), but is marked `context_only`:
+    the brief says so, the lexicon skips it, `validate_span_rows` refuses a
+    row on it. None = every line proposable (a dataset-purposed pass)."""
     rows, before, after, win = _pack_rows(segments, window=window, speakers=speakers, margin=margin)
+    marked = sorted({context_only[r["id"]] for r in rows if r["id"] in (context_only or {})})
+    for r in rows:
+        if r["id"] in (context_only or {}):
+            r["context_only"] = context_only[r["id"]]
     pos_by_id = {r["id"]: r["i"] for r in rows}
     existing: List[Dict[str, Any]] = []
     for c in (overlays or []):
@@ -158,6 +171,8 @@ def build_span_pack(
     }
     if margin and margin > 0:
         pack["context"] = {"before": before[-int(margin):], "after": after[:int(margin)]}
+    if marked:
+        pack["context_only_strata"] = marked
     pack["digest"] = pack_digest(pack)
     return pack
 
@@ -220,6 +235,14 @@ def render_span_pack(pack: Dict[str, Any]) -> str:  # The proposer brief (markdo
         "ENTIRELY filler ('Um', 'Okay.') is not yours — the filler stratum pass takes whole lines;",
         "propose only spans INSIDE lines that also carry content.",
     ]
+    if pack.get("context_only_strata"):
+        lines += [
+            "",
+            "Lines marked `(▣" + " / ▣".join(pack["context_only_strata"]) + " · context only)` were already",
+            "classified by the human as WHOLLY elidable: every later reader drops them. They stay here",
+            "so you can follow a thought that runs through one, but a row on such a line is REFUSED —",
+            "never propose over them.",
+        ]
     roster = list(dict.fromkeys(r["speaker"] for r in pack.get("segments") or []
                                 if r.get("speaker")))
     if roster:
@@ -309,6 +332,10 @@ def validate_span_rows(
             raise ValueError(f"row {k}: i must be an integer pack line number")
         if not (0 <= i < len(segs)):
             raise ValueError(f"row {k}: line {i} outside the pack (0..{len(segs) - 1})")
+        if segs[i].get("context_only"):
+            raise ValueError(f"row {k}: line {i} is an accepted {segs[i]['context_only']} line "
+                             "(context only) — the clean read drops it whole; propose spans only "
+                             "on the lines it keeps")
         text = str(raw.get("text") or "").strip()
         nth = raw.get("nth")
         if nth is not None:
@@ -405,6 +432,8 @@ def lexicon_span_rows(
     lex = {_norm_token(t) for t in lexicon}
     out: List[Dict[str, Any]] = []
     for line in pack.get("segments") or []:
+        if line.get("context_only"):
+            continue   # an accepted filler line: elided whole by stratum, never an overlay's (ec370add)
         toks = segment_word_tokens(str(line.get("text") or ""))
         if toks and all(_norm_token(t) in lex for _a, _b, t in toks):
             continue   # a WHOLLY elidable line is the filler stratum's (design bbf8bafd (a)), not an overlay

@@ -193,6 +193,29 @@ def test_lexicon_rows_propose_bare_hesitations_with_nth_and_validate():
     assert [(v["char_start"], v["char_end"]) for v in valid] == [(0, 3), (4, 7), (12, 15)]
 
 
+def test_span_pack_marks_accepted_filler_lines_context_only():
+    """Finding ec370add (user-caught): the clean read drops accepted filler lines
+    FIRST, so the span pack follows the same order — such a line stays numbered
+    and readable but is CONTEXT ONLY: the brief says so, the lexicon skips it,
+    a proposer row on it is refused with its row number; None = all proposable."""
+    segs = [SpineSegment(id="a", index=0, text="Okay, um, so.", start_time=0.0, end_time=1.0),
+            SpineSegment(id="b", index=1, text="Um, the kernel is, uh, fast.", start_time=1.0, end_time=3.0)]
+    pack = build_span_pack("src", "t", None, segs, context_only={"a": "filler"})
+    assert [r.get("context_only") for r in pack["segments"]] == ["filler", None]
+    assert pack["context_only_strata"] == ["filler"] and [r["i"] for r in pack["segments"]] == [0, 1]
+    brief = render_span_pack(pack)
+    assert "[0] 00:00.0–00:01.0  (▣filler · context only) Okay, um, so." in brief
+    assert "a row on such a line is REFUSED" in brief
+    assert [(r["i"], r["text"]) for r in lexicon_span_rows(pack)] == [(1, "Um,"), (1, "uh,")]
+    with pytest.raises(ValueError, match=r"row 1: line 0 is an accepted filler line \(context only\)"):
+        validate_span_rows([{"label": "hesitation-marker", "i": 0, "text": "um"}], pack)
+    assert len(validate_span_rows([{"label": "hesitation-marker", "i": 1, "text": "uh"}], pack)) == 1
+    # the marking is digest-covered, and absent = the old pack, every line proposable
+    plain = build_span_pack("src", "t", None, segs)
+    assert "context_only_strata" not in plain and "context only" not in render_span_pack(plain)
+    assert [(r["i"], r["text"]) for r in lexicon_span_rows(plain)][0] == (0, "um,")
+
+
 # ---- pending + bench ----
 
 def _props():

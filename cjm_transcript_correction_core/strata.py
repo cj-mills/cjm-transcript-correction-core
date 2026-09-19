@@ -375,7 +375,8 @@ def _render_pack_lines(rows: List[Dict[str, Any]], numbered: bool) -> List[str]:
             out.append(f"— {prev or '(unassigned)'} —")
         st = _fmt_ts(r["start"]) if r.get("start") is not None else "--:--"
         en = _fmt_ts(r["end"]) if r.get("end") is not None else "--:--"
-        out.append(f"{'[%d]' % r['i'] if numbered else '(ctx)'} {st}–{en}  {r['text']}")
+        co = f"(▣{r['context_only']} · context only) " if r.get("context_only") else ""
+        out.append(f"{'[%d]' % r['i'] if numbered else '(ctx)'} {st}–{en}  {co}{r['text']}")
     return out
 
 
