@@ -259,6 +259,25 @@ RECOMMENDED_STRATUM_CLASSES = (
     "transition",       # a closing segue or hand-off into the next unit
 )
 
+# NAMED class slates (ruling c5b6cf42): a deliverable type's content pass names the
+# SAME classes on every source, so the pass recipe carries a slate name instead of a
+# retyped class list (`filter-pack --slate live-lecture`). A slate is a starting
+# vocabulary, never a schema: `--vocabulary` / `--marks` still override it per run,
+# and a stratum keeps committing under any letter-led class token.
+#   live-lecture — a talk with slides and interleaved chat Q&A (GPU MODE): one `qa`
+#   block per question-plus-answer, slide-DRIVING folds into `logistics`, `visual-ref`
+#   flags content that depends on what is shown (the video sibling's demand signal);
+#   NO code class (code is a Point kind) and none of the book boundary classes but
+#   `transition`, the seam a synthesized section structure can be cut at.
+STRATUM_SLATES: Dict[str, Dict[str, Any]] = {
+    "recommended": {"classes": RECOMMENDED_STRATUM_CLASSES, "marks": ()},
+    "live-lecture": {
+        "classes": ("qa", "logistics", "visual-ref", "tangent", "transition",
+                    "tool-mention", "research-mark"),
+        "marks": ("asr-error", "proper-noun-suspect"),
+    },
+}
+
 # The shell-shared gesture vocabulary (1052ce38 wart 2 re-homed, spine
 # absorption follow-through): these were stranded as Textual App CLASS
 # ATTRIBUTES, so the Qt shell carried COPIES (importing them would have

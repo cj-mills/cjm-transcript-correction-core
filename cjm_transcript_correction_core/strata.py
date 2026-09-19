@@ -37,7 +37,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from cjm_substrate.core.workspace import relativize_recorded
-from cjm_transcript_correction_core.models import RECOMMENDED_STRATUM_CLASSES, SpineSegment
+from cjm_transcript_correction_core.models import (RECOMMENDED_STRATUM_CLASSES, SpineSegment,
+                                                   STRATUM_SLATES)
 
 FILTER_PACK_FORMAT = "cjm-transcript-correction-core/filter-pack"
 FILTER_PACK_VERSION = "0.1.0"
@@ -69,18 +70,32 @@ STRATUM_GLOSSES: Dict[str, str] = {
                        "chapter's own number-and-title readout counts (it is suppressed as the unit title)"),
     "cross-reference": ("an in-book pointer to another chapter or page ('See Chapter 19 for more') — "
                         "how-to-read-this-book framing, never a heading, never content"),
-    "transition": ("a closing segue or hand-off into the next unit ('To see how, let's look at…') — "
-                   "never a heading, never content; the seam a section boundary can be cut at"),
+    "transition": ("a closing segue or hand-off into the next unit ('To see how, let's look at…'; in a "
+                   "live lecture 'Moving on, …' or one presenter handing over to the next) — never a "
+                   "heading, never content; the seam a section boundary can be cut at"),
     "quotation": ("someone else's voice quoted verbatim — include the spoken 'quote' / 'end quote' "
                   "delimiters; a verify-against-source unit, distinct from the research-mark that "
                   "points at the source"),
     # The live-lecture classes (the lecture-notes deliverable type's structure + exclusion
-    # strata; glossed here, NOT in the recommended slate — a pack names them via `vocabulary`).
-    "qa": ("a question-and-answer block — the Q&A tail, or an in-lecture question with its answer: "
-           "a STRUCTURE stratum (the span a notes deliverable renders questions and their answers "
-           "under), never content by itself"),
-    "logistics": ("stream / session housekeeping — 'can you hear me', screen-share fiddling, chat or "
-                  "link reminders, scheduling; the live-stream analogue of apparatus"),
+    # strata; glossed here, NOT in the recommended slate — a pack names them via the
+    # `live-lecture` slate of models.STRATUM_SLATES, ruling c5b6cf42, or `vocabulary`).
+    "qa": ("a question-and-answer block — ONE stratum per question WITH its answer: the run starts at "
+           "the question as asked or relayed ('Chris is asking: …') and ends where the speaker resumes "
+           "the talk; in a live lecture these sit scattered through the content, not only in a tail. A "
+           "STRUCTURE stratum (the span a notes deliverable renders the question and its answers "
+           "under) — the answer stays content. A bare 'any questions?' or 'does that answer it?' with "
+           "no actual question is `logistics`"),
+    "logistics": ("stream / session housekeeping — 'can you hear me', screen-share fiddling, slide-"
+                  "DRIVING ('next slide', 'can you advance the slide for me'), chat or link reminders, "
+                  "scheduling, a prompt for questions that draws none, sign-off thanks; the live-stream "
+                  "analogue of apparatus. A line that says what is ON the slide is `visual-ref`, never "
+                  "logistics"),
+    "visual-ref": ("a line or run whose meaning depends on something SHOWN — a slide, a diagram, code "
+                   "on screen ('on this slide you can see…', 'the left kernel', 'the code on the "
+                   "right'). It STAYS CONTENT (never excluded): it tells a notes drafter the point is "
+                   "visually dependent, and it is the demand signal for the source's video sibling. "
+                   "Mark the deictic line(s) only, not the whole explanation that follows; slide-"
+                   "DRIVING ('next slide') is `logistics`"),
 }
 
 # The MARK-family outlet (friction log pass 2: proposers kept inventing near-synonyms):
@@ -124,6 +139,20 @@ def _fmt_ts(seconds: float) -> str:  # mm:ss.s for the rendered pack
 def _is_class_token(value: str) -> bool:  # Same rule as mark classes: letter/digit-led, non-empty
     v = (value or "").strip()
     return bool(v) and v[:1].isalnum()
+
+
+def resolve_slate(
+    name: str,  # A models.STRATUM_SLATES key (e.g. "live-lecture")
+) -> Tuple[List[str], List[str]]:  # (stratum classes, mark-family outlet classes)
+    """Resolve a NAMED class slate (ruling c5b6cf42) to the two vocabularies a
+    pack takes: a deliverable type's content pass names the same classes on
+    every source, so its recipe carries the slate name. An unknown name raises
+    ValueError naming the known slates — never a silent fall back to the
+    recommended slate, which would hand a proposer the wrong classes."""
+    slate = STRATUM_SLATES.get((name or "").strip())
+    if slate is None:
+        raise ValueError(f"unknown slate {name!r} (known: {', '.join(sorted(STRATUM_SLATES))})")
+    return list(slate["classes"]), list(slate["marks"])
 
 
 def new_pack_id() -> str:  # e.g. "pack_20260901_180000_1a2b3c4d"
@@ -187,6 +216,7 @@ def build_filter_pack(
     speakers: Optional[Dict[str, Optional[str]]] = None,  # segment id -> speaker display name (None = the pack carries no speakers)
     margin: int = 0,                         # Text segments of READ-ONLY context either side of the window
     read: Optional[Dict[str, Any]] = None,   # The ladder layer the lines came from (None = L0; {"layer": "clean", ..., "gaps": {seg id: dropped_before}} = L1)
+    slate: Optional[str] = None,             # The NAMED slate the vocabularies came from (provenance only; None = typed by hand / the default)
 ) -> Dict[str, Any]:  # The pack (JSON-serializable)
     """Build the proposer's input: one source window's text-bearing effective
     segments, numbered 0..n-1 in pack order, plus the vocabulary and the
@@ -238,6 +268,8 @@ def build_filter_pack(
         "existing_strata": existing,
         "segments": rows,
     }
+    if slate:   # which named slate the pass ran under (the recipe's handle; the digest covers READ content only)
+        pack["slate"] = slate
     if closed:
         pack["closed_vocabulary"] = True
     if mark_vocabulary:
@@ -245,7 +277,7 @@ def build_filter_pack(
                                    for c in mark_vocabulary]
     if margin and margin > 0:
         pack["context"] = {"before": before[-int(margin):], "after": after[:int(margin)]}
-    if closed or mark_vocabulary or speakers is not None or (margin and margin > 0):
+    if slate or closed or mark_vocabulary or speakers is not None or (margin and margin > 0):
         pack["version"] = FILTER_PACK_VERSION_LADDER
     if read:
         pack["read"] = dict(read)

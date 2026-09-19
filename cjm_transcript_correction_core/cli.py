@@ -62,7 +62,7 @@ from cjm_transcript_correction_core.strata import (active_strata, bench_filter_p
                                                    merge_filter_proposals, pending_filter_proposals,
                                                    plan_pack_windows, proposals_from_rows,
                                                    render_filter_pack,
-                                                   render_filter_propset_markdown,
+                                                   render_filter_propset_markdown, resolve_slate,
                                                    select_span_segments, validate_proposal_rows,
                                                    write_filter_propset)
 
@@ -398,8 +398,13 @@ def build_parser() -> argparse.ArgumentParser:  # Configured CLI parser
     fpack.add_argument("--margin", type=int, default=0, metavar="LINES",
                        help="Text segments of READ-ONLY context either side of a window "
                             "(un-numbered; a proposer reads them but cannot propose over them)")
+    fpack.add_argument("--slate", default=None, metavar="NAME",
+                       help="A NAMED class slate (models.STRATUM_SLATES, e.g. `live-lecture`): supplies "
+                            "--vocabulary AND --marks so a type's content pass names the same classes "
+                            "on every source; an explicit --vocabulary / --marks overrides its half")
     fpack.add_argument("--vocabulary", default=None, metavar="CLASS[,CLASS…]",
-                       help="The stratum classes this pack names (default: the recommended slate)")
+                       help="The stratum classes this pack names (default: --slate, else the "
+                            "recommended slate)")
     fpack.add_argument("--closed", action="store_true",
                        help="A CLASS-SCOPED pass: the brief forbids minting classes outside "
                             "--vocabulary / --marks")
@@ -1881,6 +1886,15 @@ async def filter_pack_command(
     segments as a proposer pack — `<out-dir>/<pack_id>.json` (what ingest
     resolves against) + `<pack_id>.md` (the brief a proposer reads). Reads
     only; the pack is the read-trace every proposal from it cites."""
+    slate_classes: Optional[List[str]] = None
+    slate_marks: Optional[List[str]] = None
+    if args.slate:   # resolved BEFORE the graph opens: an unknown slate never costs a worker spawn
+        try:
+            slate_classes, slate_marks = resolve_slate(args.slate)
+        except ValueError as e:
+            raise SystemExit(str(e))
+    vocabulary = _class_list(args.vocabulary) or slate_classes
+    marks = _class_list(args.marks) or (slate_marks or None)
     ws, manager, queue = await _open_graph_stack(args)
     cap = args.graph_capability
     try:
@@ -1915,9 +1929,9 @@ async def filter_pack_command(
     windows = (plan_pack_windows(eff, args.split, speakers=speakers) if args.split
                else [tuple(args.window) if args.window else None])
     packs = [build_filter_pack(sid, title, skel, eff, content_hash=chash, window=w, strata=strata,
-                               vocabulary=_class_list(args.vocabulary), closed=args.closed,
-                               mark_vocabulary=_class_list(args.marks), speakers=speakers,
-                               margin=args.margin, read=read) for w in windows]
+                               vocabulary=vocabulary, closed=args.closed,
+                               mark_vocabulary=marks, speakers=speakers,
+                               margin=args.margin, read=read, slate=args.slate) for w in windows]
     if args.split:   # the tiling promise, checked: one window per timed text segment, none dropped
         seen = [r["id"] for p in packs for r in p["segments"]]
         want = [s.id for s in eff if not s.is_empty]

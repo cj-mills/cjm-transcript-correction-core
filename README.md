@@ -287,6 +287,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `proposals_from_rows` _function_ — Resolve validated rows to proposal-set rows: proposal id, category, source
 - `render_filter_pack` _function_ — Render a pack as the brief a proposer reads: identity + window, the class
 - `render_filter_propset_markdown` _function_ — Project a proposal set for a HUMAN to check against the source in the
+- `resolve_slate` _function_ — Resolve a NAMED class slate (ruling c5b6cf42) to the two vocabularies a
 - `select_span_segments` _function_ — The span-EDIT gesture's resolver (agreed 2026-09-01 on the ch04 confirm
 - `strata_index` _function_ — Segment-keyed view of the live strata (the consumer query's index).
 - `validate_proposal_rows` _function_ — Validate + normalize proposer rows against their pack — loud on the first

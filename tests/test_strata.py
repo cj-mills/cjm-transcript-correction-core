@@ -12,7 +12,8 @@ from cjm_transcript_correction_core.graph import (build_stratum_correction,
                                                   build_text_correction,
                                                   corrections_to_edits,
                                                   latest_extraction_gates)
-from cjm_transcript_correction_core.models import RECOMMENDED_STRATUM_CLASSES, SpineSegment
+from cjm_transcript_correction_core.models import (RECOMMENDED_STRATUM_CLASSES, SpineSegment,
+                                                   STRATUM_SLATES)
 from cjm_transcript_correction_core.strata import (FILTER_LANE, FILTER_MARK_GLOSSES,
                                                    FILTER_PACK_FORMAT,
                                                    FILTER_PACK_VERSION,
@@ -24,7 +25,7 @@ from cjm_transcript_correction_core.strata import (FILTER_LANE, FILTER_MARK_GLOS
                                                    merge_filter_proposals, pack_digest,
                                                    pending_filter_proposals, plan_pack_windows,
                                                    proposals_from_rows, render_filter_pack,
-                                                   render_filter_propset_markdown,
+                                                   render_filter_propset_markdown, resolve_slate,
                                                    select_span_segments,
                                                    STRATUM_GLOSSES, validate_proposal_rows,
                                                    write_filter_propset)
@@ -479,6 +480,27 @@ def test_closed_vocabulary_pass_forbids_minting_and_names_the_mark_outlet():
     open_md = render_filter_pack(_pack())
     assert "NEW kebab-case class" in open_md and "## Mark-family classes" not in open_md
     assert {"qa", "logistics"} <= set(STRATUM_GLOSSES) and "qa" not in RECOMMENDED_STRATUM_CLASSES
+
+
+def test_live_lecture_slate_names_glossed_classes_and_rides_the_pack():
+    classes, marks = resolve_slate("live-lecture")
+    assert classes == list(STRATUM_SLATES["live-lecture"]["classes"])
+    assert "visual-ref" in classes and "transition" in classes
+    # ruling c5b6cf42: one qa block (no question / answer classes), no code class, no book boundary classes
+    assert not {"question", "answer", "code", "section-header", "cross-reference", "sponsor"} & set(classes)
+    assert all(STRATUM_GLOSSES.get(c) for c in classes)          # a slate never names an unglossed class
+    assert all(FILTER_MARK_GLOSSES.get(m) for m in marks)
+    assert "`logistics`" in STRATUM_GLOSSES["visual-ref"] and "`visual-ref`" in STRATUM_GLOSSES["logistics"]
+    assert resolve_slate("recommended") == (list(RECOMMENDED_STRATUM_CLASSES), [])
+    with pytest.raises(ValueError, match="live-lecture"):        # the refusal names the known slates
+        resolve_slate("lecture")
+    pack = _pack(vocabulary=classes, closed=True, mark_vocabulary=marks, slate="live-lecture")
+    assert pack["slate"] == "live-lecture" and pack["version"] == FILTER_PACK_VERSION_LADDER
+    assert [v["category"] for v in pack["vocabulary"]] == classes
+    assert pack["digest"] == _pack(vocabulary=classes, closed=True, mark_vocabulary=marks)["digest"]
+    assert "slate" not in _pack() and _pack()["version"] == FILTER_PACK_VERSION
+    md = render_filter_pack(pack)
+    assert "`visual-ref`" in md and "`sponsor`" not in md
 
 
 def _line(i, start, end, text="words"):
