@@ -91,7 +91,13 @@ OVERLAY_GLOSSES: Dict[str, str] = {
                     "'the the', 'we, we'; quote the WHOLE repeated run, including the surviving "
                     "instance"),
     "false-start": ("words the speaker abandons and restarts — 'I think we— what we found was'; "
-                    "quote ONLY the abandoned words, never the restart"),
+                    "quote ONLY the abandoned words, never the restart. An abandoned FRAGMENT is ONE "
+                    "false-start ('Um, not like' before a fresh sentence), not its filler words one by "
+                    "one. A CUED SELF-REPAIR ('…is known at compile time, uh sorry, at runtime…') has "
+                    "two parts and BOTH are rows: the cue ('uh sorry,') AND the retracted words ('at "
+                    "compile time,') — even when the retracted words read fluently or sit on an "
+                    "EARLIER line; leaving them is the worst miss, because a reader then meets the "
+                    "withdrawn claim with no sign it was withdrawn"),
     "emphasis-repeat": ("a KEEP label: a repeat that is rhetorical emphasis — 'much, much larger', "
                         "'no, no, no' — subtracting it would change meaning; propose it so the "
                         "boundary is explicit, it is never filtered"),

@@ -272,7 +272,7 @@ RECOMMENDED_STRATUM_CLASSES = (
 STRATUM_SLATES: Dict[str, Dict[str, Any]] = {
     "recommended": {"classes": RECOMMENDED_STRATUM_CLASSES, "marks": ()},
     "live-lecture": {
-        "classes": ("qa", "logistics", "visual-ref", "tangent", "transition",
+        "classes": ("qa", "logistics", "visual-ref", "unit-opener", "tangent", "transition",
                     "tool-mention", "research-mark"),
         "marks": ("asr-error", "proper-noun-suspect"),
     },

@@ -96,6 +96,12 @@ STRATUM_GLOSSES: Dict[str, str] = {
                    "visually dependent, and it is the demand signal for the source's video sibling. "
                    "Mark the deictic line(s) only, not the whole explanation that follows; slide-"
                    "DRIVING ('next slide') is `logistics`"),
+    "unit-opener": ("the speaker's OWN statement of the next unit's topic — 'the first thing we should "
+                    "talk about is…', 'another technique is kernel fusion', 'the final change is "
+                    "benchmarking', 'let's recap thread scopes'. It STAYS CONTENT (never excluded): it "
+                    "is the heading signal the audio itself carries, the line a synthesized section "
+                    "opens on and can be named from. Mark the announcing line(s) only; a segue that "
+                    "names no topic ('Moving on', a hand-off) is `transition`"),
 }
 
 # The MARK-family outlet (friction log pass 2: proposers kept inventing near-synonyms):

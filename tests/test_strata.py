@@ -486,6 +486,7 @@ def test_live_lecture_slate_names_glossed_classes_and_rides_the_pack():
     classes, marks = resolve_slate("live-lecture")
     assert classes == list(STRATUM_SLATES["live-lecture"]["classes"])
     assert "visual-ref" in classes and "transition" in classes
+    assert "unit-opener" in classes and "`transition`" in STRATUM_GLOSSES["unit-opener"]   # datum 59c6a09a rulings
     # ruling c5b6cf42: one qa block (no question / answer classes), no code class, no book boundary classes
     assert not {"question", "answer", "code", "section-header", "cross-reference", "sponsor"} & set(classes)
     assert all(STRATUM_GLOSSES.get(c) for c in classes)          # a slate never names an unglossed class
