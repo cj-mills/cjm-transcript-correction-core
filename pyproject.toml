@@ -16,6 +16,9 @@ classifiers = [
 ]
 dependencies = ['cjm_substrate>=0.0.61', 'cjm_context_graph_primitives>=0.0.15', 'cjm-capability-primitives>=0.0.12', 'cjm-context-graph-layer>=0.0.11', 'cjm-transcript-graph-schema>=0.0.11', 'numpy']
 
+[project.optional-dependencies]
+test = ['soundfile', 'pytest']
+
 [project.urls]
 Repository = "https://github.com/cj-mills/cjm-transcript-correction-core"
 
