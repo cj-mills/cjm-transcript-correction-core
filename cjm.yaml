@@ -22,8 +22,10 @@ runtime:
 # Project-local data directory
 data_dir: ./.cjm
 
-# Capabilities configuration file
-capabilities_config: ./capabilities_test.yaml
+# Capabilities configuration file — the PUBLIC yaml (PyPI specs with floors, ruling 8299fb9d;
+# projected by `cjm-ctl derive-public-capabilities`). The dev yaml with checkout paths is
+# the override: `--capabilities capabilities_test.yaml` on install-all / refresh.
+capabilities_config: ./capabilities.yaml
 
 # Shared model storage: the system-tier model cache (DEC d123510a — one cache,
 # opt-in per project; workspace = data/runs/config, system cache = models)
