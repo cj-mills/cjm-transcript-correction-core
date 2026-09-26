@@ -1,0 +1,19 @@
+# PUBLIC capabilities yaml — PROJECTED from capabilities_test.yaml by `cjm-ctl derive-public-capabilities` (ruling 8299fb9d: one channel, PyPI specs with
+# floors, env_file = the capability repo's raw environment.yml). Regenerate after every
+# publish window; the dev yaml with checkout paths stays the --capabilities override.
+capabilities:
+- name: sqlite-graph
+  env_name: test-sqlite-graph
+  env_file: https://raw.githubusercontent.com/cj-mills/cjm-capability-graph-sqlite/main/environment.yml
+  package: cjm-capability-graph-sqlite>=0.0.28
+  interface_libs:
+  - cjm-context-graph-primitives>=0.0.15
+  adapters:
+  - lib: cjm-graph-storage-adapter-interface>=0.0.8
+    impl: cjm_graph_storage_adapter_interface.generic:GenericGraphStorageAdapter
+- name: sys-mon-nvidia
+  env_name: test-sys-mon
+  env_file: https://raw.githubusercontent.com/cj-mills/cjm-capability-monitor-nvidia/main/environment.yml
+  package: cjm-capability-monitor-nvidia>=0.0.25
+  interface_libs:
+  - cjm-capability-primitives>=0.0.12
