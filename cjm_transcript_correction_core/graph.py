@@ -14,6 +14,7 @@ from cjm_context_graph_layer.edits import (project_effective_spine as layer_proj
 from cjm_context_graph_layer.grammar import make_edge, OverlayRelations, SpineRelations
 from cjm_context_graph_layer.ops import extend_graph, graph_task
 from cjm_context_graph_primitives.graph import GraphNode
+from cjm_context_graph_primitives.journal import op_clocked
 from cjm_context_graph_primitives.locators import locator_from_dict
 from cjm_context_graph_primitives.query import (EdgeQuery, EdgeQueryResult, NodeQuery,
                                                 NodeQueryResult, OrderBy, PropertyPredicate,
@@ -336,6 +337,7 @@ async def commit_nodes_edges(
     return {"nodes": res.nodes_added, "edges": res.edges_added}
 
 
+@op_clocked
 async def start_session(
     queue: JobQueue,   # Started job queue
     graph_id: str,     # Graph-storage capability id
@@ -367,6 +369,7 @@ async def get_session(
     return node.to_dict() if isinstance(node, GraphNode) else node
 
 
+@op_clocked
 async def set_session_status(
     queue: JobQueue,  # Started job queue
     graph_id: str,    # Graph-storage capability id
@@ -392,6 +395,7 @@ async def set_session_status(
                               nodes=[], edges=[])
 
 
+@op_clocked
 async def record_review_markers(
     queue: JobQueue,                   # Started job queue
     graph_id: str,                     # Graph-storage capability id
@@ -603,6 +607,7 @@ def build_text_correction(
     return node.to_dict(), edges
 
 
+@op_clocked
 async def commit_text_correction(
     queue: JobQueue,                       # Started job queue
     graph_id: str,                         # Graph-storage capability id
@@ -826,6 +831,7 @@ def build_reject_review(
     return node.to_dict(), edges
 
 
+@op_clocked
 async def commit_boundary_shift_correction(
     queue: JobQueue,                       # Started job queue
     graph_id: str,                         # Graph-storage capability id
