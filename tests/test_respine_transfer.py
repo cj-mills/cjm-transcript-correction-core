@@ -6,11 +6,10 @@ import asyncio
 import importlib.metadata
 from types import SimpleNamespace
 
-from cjm_transcript_graph_schema.schema import SEGMENT_SUPERSEDED_BY_PROP
-
 from cjm_transcript_correction_core import respine_transfer as RT
 from cjm_transcript_correction_core.graph import _spine_query
 from cjm_transcript_correction_core.models import SpineSegment
+from cjm_transcript_graph_schema.schema import SEGMENT_SUPERSEDED_BY_PROP
 
 
 def _seg(i, s, e, sid=None):

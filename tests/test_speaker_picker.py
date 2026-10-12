@@ -2,6 +2,7 @@
 slots from two tiers (this source's assigned speakers, then the collection's),
 the rest of the registry behind typed search, and the graph read that feeds the
 collection tier (speaker_assign Corrections over the sibling Sources)."""
+
 import asyncio
 import json
 from types import SimpleNamespace

@@ -2,21 +2,15 @@
 
 Projected from the graph notebook's two pure-check cells at the golden-reference flip
 (no runtime; graph I/O paths are exercised by the e2e harnesses in tests_manual/)."""
-from cjm_transcript_correction_core.graph import (
-    active_corrections,
-    build_boundary_shift_correction,
-    build_mark_correction,
-    build_prune_amendment,
-    build_prune_correction,
-    build_reject_review,
-    build_text_correction,
-    corrections_to_edits,
-    LEGACY_SKELETON,
-    open_marks,
-    project_effective_spine,
-    reanchor_span,
-    spine_where_for,
-)
+
+from cjm_transcript_correction_core.graph import (active_corrections,
+                                                  build_boundary_shift_correction,
+                                                  build_mark_correction, build_prune_amendment,
+                                                  build_prune_correction, build_reject_review,
+                                                  build_text_correction, corrections_to_edits,
+                                                  LEGACY_SKELETON, open_marks,
+                                                  project_effective_spine, reanchor_span,
+                                                  spine_where_for)
 from cjm_transcript_correction_core.models import SpineSegment
 
 SEGS = [

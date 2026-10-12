@@ -1,15 +1,10 @@
 """Tests for cjm_transcript_correction_core.models — correction overlay data shapes.
 
 Projected from the models notebook's smoke-check cell at the golden-reference flip."""
-from cjm_transcript_correction_core.models import (
-    Correction,
-    CorrectionManifest,
-    CorrectionRelations,
-    CorrectionSession,
-    SpineSegment,
-    WorklistItem,
-    new_run_id,
-)
+
+from cjm_transcript_correction_core.models import (Correction, CorrectionManifest,
+                                                   CorrectionRelations, CorrectionSession,
+                                                   new_run_id, SpineSegment, WorklistItem)
 
 
 def test_correction_graph_node_mapping():

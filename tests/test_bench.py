@@ -1,12 +1,12 @@
 """Tests for the leg-4 proposal plumbing — proposal-set discovery, spine
 anchoring, and the reserved-tail verdict join (all pure / filesystem-only;
 DECs 8e05b87b + 8cf12c22: verdicts DERIVE, never stored)."""
+
 import json
 
 from cjm_transcript_correction_core.graph import bench_event_proposals
 from cjm_transcript_correction_core.models import SpineSegment
-from cjm_transcript_correction_core.signals import (event_span_proposals,
-                                                    load_event_proposal_set)
+from cjm_transcript_correction_core.signals import event_span_proposals, load_event_proposal_set
 
 
 def _seg(i, start, end, text="words"):

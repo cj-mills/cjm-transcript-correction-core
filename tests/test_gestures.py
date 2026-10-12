@@ -2,7 +2,9 @@
 
 Hermetic: plan_boundary_shift is pure; the SpineView prune bookkeeping is
 exercised on a directly-constructed view (no graph stack)."""
-from cjm_transcript_correction_core.spine import parse_mark_input, resolve_mark_class_token, SpineView, plan_boundary_shift
+
+from cjm_transcript_correction_core.spine import (parse_mark_input, plan_boundary_shift,
+                                                  resolve_mark_class_token, SpineView)
 
 
 def test_plan_push_and_pull_stripped_corpus():

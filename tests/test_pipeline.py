@@ -1,6 +1,7 @@
 """Tests for cjm_transcript_correction_core.pipeline — pure-logic checks (no runtime).
 
 Projected from the pipeline notebook's smoke-check cell at the golden-reference flip."""
+
 from cjm_transcript_correction_core.models import SpineSegment
 from cjm_transcript_correction_core.pipeline import compute_worklist, resolve_graph_db_path
 

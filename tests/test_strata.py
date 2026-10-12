@@ -3,32 +3,27 @@ half (DECs 304fd984 + 9d4c0a38): pack build/render, proposer-row validation,
 proposal-set write/load round-trip, the stratum op, the pending worklist, the
 derived-verdict bench join, the per-consumer exclusion query, and the gate's
 lane fold. Pure — no runtime."""
+
 import json
 
 import pytest
-
-from cjm_transcript_correction_core.graph import (build_stratum_correction,
-                                                  build_extraction_gate_assertion,
-                                                  build_text_correction,
-                                                  corrections_to_edits,
-                                                  latest_extraction_gates)
+from cjm_transcript_correction_core.graph import (build_extraction_gate_assertion,
+                                                  build_stratum_correction, build_text_correction,
+                                                  corrections_to_edits, latest_extraction_gates)
 from cjm_transcript_correction_core.models import (RECOMMENDED_STRATUM_CLASSES, SpineSegment,
                                                    STRATUM_SLATES)
-from cjm_transcript_correction_core.strata import (FILTER_LANE, FILTER_MARK_GLOSSES,
-                                                   FILTER_PACK_FORMAT,
-                                                   FILTER_PACK_VERSION,
-                                                   FILTER_PACK_VERSION_LADDER,
+from cjm_transcript_correction_core.strata import (active_strata, bench_filter_proposals,
+                                                   build_filter_pack, exclude_strata, FILTER_LANE,
+                                                   FILTER_MARK_GLOSSES, FILTER_PACK_FORMAT,
+                                                   FILTER_PACK_VERSION, FILTER_PACK_VERSION_LADDER,
                                                    FILTER_PROPOSAL_SET_FORMAT,
-                                                   active_strata, bench_filter_proposals,
-                                                   build_filter_pack, exclude_strata,
                                                    load_filter_proposal_sets,
                                                    merge_filter_proposals, pack_digest,
                                                    pending_filter_proposals, plan_pack_windows,
                                                    proposals_from_rows, render_filter_pack,
                                                    render_filter_propset_markdown, resolve_slate,
-                                                   select_span_segments,
-                                                   STRATUM_GLOSSES, validate_proposal_rows,
-                                                   write_filter_propset)
+                                                   select_span_segments, STRATUM_GLOSSES,
+                                                   validate_proposal_rows, write_filter_propset)
 
 SEGS = [
     SpineSegment(id="s0", index=0, text="Opening credits, read by the author.", start_time=0.0, end_time=3.0),

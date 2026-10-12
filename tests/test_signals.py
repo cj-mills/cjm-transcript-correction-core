@@ -1,17 +1,12 @@
 """Tests for cjm_transcript_correction_core.signals — pure deterministic Tier-1 signals.
 
 Projected from the signals notebook's smoke-check cell at the golden-reference flip."""
+
 from cjm_transcript_correction_core.models import SpineSegment
-from cjm_transcript_correction_core.signals import (
-    boundary_punct_caps_flags,
-    cluster_variants,
-    compute_signal_flags,
-    detect_empty_segments,
-    fa_coverage_flags,
-    levenshtein,
-    phonetic_key,
-    variant_divergence,
-)
+from cjm_transcript_correction_core.signals import (boundary_punct_caps_flags, cluster_variants,
+                                                    compute_signal_flags, detect_empty_segments,
+                                                    fa_coverage_flags, levenshtein, phonetic_key,
+                                                    variant_divergence)
 
 SEGS = [
     SpineSegment(id="0", index=0, text="The art of war", start_time=0.0, end_time=1.0),

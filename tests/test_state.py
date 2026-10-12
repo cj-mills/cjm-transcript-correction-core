@@ -1,6 +1,6 @@
 """Tests for the last-focused-segment sidecar state (resume across restarts)."""
-from cjm_transcript_correction_core.state import load_tui_state
-from cjm_transcript_correction_core.state import save_tui_state
+
+from cjm_transcript_correction_core.state import load_tui_state, save_tui_state
 
 
 def test_state_round_trip(tmp_path):

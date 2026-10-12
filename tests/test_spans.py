@@ -4,21 +4,22 @@ digest, brief), quoted-word resolution (whole tokens, nth, refusals), the span
 proposal set (own format, loader gating both ways), the lexicon tier, the
 pending worklist, the derived-verdict bench, and snap-at-accept with
 re-anchoring. Pure — no runtime."""
-import pytest
 
+import pytest
 from cjm_transcript_correction_core.graph import build_speech_overlay_correction
 from cjm_transcript_correction_core.models import RECOMMENDED_OVERLAY_LABELS, SpineSegment
-from cjm_transcript_correction_core.spans import (FILTERABLE_OVERLAY_LABELS, HESITATION_LEXICON,
+from cjm_transcript_correction_core.spans import (bench_span_proposals, build_span_pack,
+                                                  FILTERABLE_OVERLAY_LABELS, find_token_span,
+                                                  HESITATION_LEXICON, is_span_pack,
                                                   KEEP_OVERLAY_LABELS, LEXICON_ACTOR,
-                                                  OVERLAY_GLOSSES, SPAN_LANE,
-                                                  SPAN_PROPOSAL_SET_FORMAT, bench_span_proposals,
-                                                  build_span_pack, find_token_span, is_span_pack,
                                                   lexicon_span_rows, load_span_proposal_sets,
-                                                  locate_span_tokens, overlay_label_slate,
-                                                  pending_span_proposals,
+                                                  locate_span_tokens, OVERLAY_GLOSSES,
+                                                  overlay_label_slate, pending_span_proposals,
                                                   render_span_pack, render_span_propset_markdown,
-                                                  snap_span_proposal, span_proposals_from_rows,
-                                                  validate_span_rows, write_span_propset)
+                                                  snap_span_proposal, SPAN_LANE,
+                                                  SPAN_PROPOSAL_SET_FORMAT,
+                                                  span_proposals_from_rows, validate_span_rows,
+                                                  write_span_propset)
 from cjm_transcript_correction_core.strata import (build_filter_pack, load_filter_proposal_sets,
                                                    validate_proposal_rows)
 

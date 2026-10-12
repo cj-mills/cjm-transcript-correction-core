@@ -3,9 +3,10 @@
 filterable overlay spans cut with a visible marker, KEEP labels never cut,
 word-repeat keeps its last unit, an emptied line drops, elisions are recorded
 and rendered in an L1 pack whose digest differs from L0. Pure — no runtime."""
-from cjm_transcript_correction_core.cleanread import (CLEAN_READ_FILTER_LABELS, ELISION_MARKER,
-                                                      clean_read, clean_read_pack_read,
-                                                      clean_read_segments, clean_read_summary,
+
+from cjm_transcript_correction_core.cleanread import (clean_read, CLEAN_READ_FILTER_LABELS,
+                                                      clean_read_pack_read, clean_read_segments,
+                                                      clean_read_summary, ELISION_MARKER,
                                                       repeat_survivor, subtract_spans)
 from cjm_transcript_correction_core.models import SpineSegment
 from cjm_transcript_correction_core.spans import FILTERABLE_OVERLAY_LABELS

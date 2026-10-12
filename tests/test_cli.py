@@ -3,8 +3,8 @@
 Fresh projection at the golden-reference flip: the notebook's eval:false check cell
 still exercised the stage-5-retired --secondary-manifest flag (stale-superseded);
 these tests cover the live run/review surface instead."""
-import pytest
 
+import pytest
 from cjm_transcript_correction_core.cli import build_parser
 
 
