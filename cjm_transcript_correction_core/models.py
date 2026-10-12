@@ -14,6 +14,7 @@ from cjm_substrate.core.workspace import relativize_recorded
 
 class CorrectionRelations:
     """Registry of edge types the correction overlay adds to the spine graph."""
+
     CORRECTS = "CORRECTS"          # Correction -> the layer-0 Segment(s) it corrects
     SUPERSEDES = "SUPERSEDES"      # Correction -> the prior Correction it replaces (undo/update chain)
     DERIVED_FROM = "DERIVED_FROM"  # grouping Correction -> the layer-0 Segments it regroups/prunes
@@ -38,6 +39,7 @@ class Correction:
     generic GraphNode. Corrections are DECISIONS (asserted events) — they keep
     GENERATED ids, the FLIP-TRIGGER-protected class.
     """
+
     correction_type: str                                   # "text_content" | "punctuation" | "grouping" | "review" | "mark" | "timing" | "insertion" | "speaker"
     status: str = "applied"                                # "proposed" | "applied" | "superseded"
     session_id: str = ""                                   # Owning CorrectionSession id
@@ -57,6 +59,7 @@ class Correction:
 @dataclass
 class CorrectionSession:
     """A resumable, reopen-able correction review over one or more sources."""
+
     status: str = "in_progress"                            # "in_progress" | "completed" | "reopened"
     purpose: Optional[str] = None                          # None = genuine pass; "feature-test" = structurally excludable from flywheel datasets (open vocabulary, DEC c86714a4)
     scope: List[str] = field(default_factory=list)         # Source node ids in scope
@@ -78,6 +81,7 @@ class SpineSegment:
     (the stable anchor) + per-transcriber `CharSlice` refs into Transcript
     nodes; `content_hash` is the AUTHORITATIVE text's hash (the `text_from`
     slice) — the cross-transcript cache key."""
+
     id: str                                   # Graph Segment node id
     index: int                                # 0-based position in the source spine
     text: str                                 # Layer-0 text (may be empty for silence VAD chunks)
@@ -97,6 +101,7 @@ class SpineSegment:
 @dataclass
 class WorklistItem:
     """One spine segment surfaced for review, with its deterministic Tier-1 flags."""
+
     segment: SpineSegment                            # The segment under review
     flags: List[str] = field(default_factory=list)   # Tier-1 signal flags (empty, boundary, divergence, ...)
 
@@ -109,6 +114,7 @@ class WorklistItem:
 @dataclass
 class CorrectionConfig:
     """Configuration for one correction run."""
+
     graph_capability: str = "cjm-capability-graph-sqlite"  # Graph-storage capability id
     graph_db_path: Optional[str] = None            # Graph DB the spine lives in (from the decomp manifest)
     actor: str = "human"                           # Actor recorded on corrections + review markers
@@ -129,6 +135,7 @@ class CorrectionManifest:
     Schema 0.2.0 (stage 5): `documents` became `sources` (Document dissolved
     into Source); the cross-transcriber diff is intra-graph now, so the
     secondary-manifest pointer is gone."""
+
     run_id: str             # Unique run identifier
     created_at: float       # Unix timestamp at run start
     config: Dict[str, Any]  # CorrectionConfig snapshot
@@ -373,6 +380,7 @@ class Entity:
     identifying later is a RENAME on this stable id, propagating corpus-wide.
     Minted-once identities with GENERATED ids, referenced by every assignment.
     """
+
     canonical_name: str                                    # Display name, or a descriptive handle when provisional
     kind: str = "person"                                   # Entity kind (speakers are persons; the lexicon adds more)
     provisional: bool = False                              # True = handle is a description, NOT an identification
@@ -405,6 +413,7 @@ class ExtractionGate:
     is latest-wins per (source_id, skeleton_hash) and the chain is the full history.
     The spine is named by (source_id, skeleton_hash) — None hash = the pre-split
     legacy spine, matching the f1024568 spine-identity vocabulary."""
+
     source_id: str                                         # Source whose spine is gated
     skeleton_hash: Optional[str] = None                    # Which SKELETON spine (None = legacy pre-split)
     extraction_status: str = "in_progress"                 # EXTRACTION_STATUSES member
@@ -441,6 +450,7 @@ class DatasetManifest:
     each consumed spine's extraction_status + annotated_through at extraction
     time (rescind detection). The chain: source -> decomp manifest ->
     correction journal -> THIS -> training-run manifest -> model (DEC e047beee)."""
+
     dataset_id: str          # Unique dataset identifier (sortable, run-id pattern)
     created_at: float        # Unix timestamp at extraction start
     config: Dict[str, Any]   # Extraction config snapshot (capability, selectors, purpose args)

@@ -36,6 +36,7 @@ class ChunkRef:
     so the span is expressed LOCAL to that AudioSegment's WAV — Segment times are
     source-coordinate on the graph; the join subtracts the owning AudioSegment's
     start."""
+
     wav_path: str   # The AudioSegment's model-input WAV (16 kHz mono)
     start_s: float  # Chunk start, seconds, local to `wav_path`
     end_s: float    # Chunk end, seconds, local to `wav_path`
@@ -764,6 +765,7 @@ class SeamRef:
     context tail of the left segment + the whole gap + context head of the
     right — valid whether the boundary is an FA cut inside one VAD chunk, a
     real inter-chunk gap, or a coarse-AudioSegment crossing."""
+
     left: int       # Left segment position in the walked spine (the boundary follows it)
     right: int      # Right segment position
     start_s: float  # Span start (source-coordinate seconds)
