@@ -24,6 +24,8 @@ def test_correction_session_node():
     assert sess.to_graph_node().properties["status"] == "in_progress"
     # purpose=None (genuine pass) stays OFF the node — absence is the genuine marker
     assert "purpose" not in sess.to_graph_node().properties
+    # last activity is the node's updated_at column, never a blob copy (ruling 0669404b (2))
+    assert "updated_at" not in sess.to_graph_node().properties
     tagged = CorrectionSession(scope=["src1"], purpose="feature-test")
     assert tagged.to_graph_node().properties["purpose"] == "feature-test"
 
