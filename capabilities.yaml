@@ -5,11 +5,11 @@ capabilities:
 - name: sqlite-graph
   env_name: test-sqlite-graph
   env_file: https://raw.githubusercontent.com/cj-mills/cjm-capability-graph-sqlite/main/environment.yml
-  package: cjm-capability-graph-sqlite>=0.0.33
+  package: cjm-capability-graph-sqlite>=0.0.34
   interface_libs:
-  - cjm-context-graph-primitives>=0.0.23
+  - cjm-context-graph-primitives>=0.0.24
   adapters:
-  - lib: cjm-graph-storage-adapter-interface>=0.0.10
+  - lib: cjm-graph-storage-adapter-interface>=0.0.11
     impl: cjm_graph_storage_adapter_interface.generic:GenericGraphStorageAdapter
 - name: sys-mon-nvidia
   env_name: test-sys-mon
