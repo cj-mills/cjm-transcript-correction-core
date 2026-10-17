@@ -6,13 +6,13 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from cjm_context_graph_layer.journal import sidecar_journal_path
 from cjm_substrate.core.journal_store import JournalEvent, SubstrateEventType
 from cjm_substrate.core.manager import CapabilityManager
 from cjm_substrate.core.queue import JobQueue
 from cjm_substrate.core.workspace import resolve_recorded_tree
-from cjm_transcript_correction_core.graph import (active_corrections, build_prune_correction,
-                                                  commit_nodes_edges, commit_text_correction,
-                                                  count_source_segments,
+from cjm_transcript_correction_core.graph import (active_corrections, commit_prune_correction,
+                                                  commit_text_correction, count_source_segments,
                                                   find_active_text_corrections_batch,
                                                   find_corrections_for_session,
                                                   find_prior_corrections_by_hash, get_session,
@@ -118,6 +118,7 @@ async def prune_empty_segments(
     source_id: str,         # Source being corrected
     total_count: int,       # Total segment count (for the summary)
     session_id: str,        # Owning session id
+    journal_path: str,      # The graph's sidecar journal (the run's writes are journaled)
 ) -> Dict[str, Any]:  # {"pruned": n, "correction_id": id|None}
     """First operation: prune empty (silence) segments as one grouping correction (D14).
 
@@ -138,12 +139,10 @@ async def prune_empty_segments(
                         [], assume_yes=cfg.assume_yes):
         logger.warning(f"[prune] {source_id}: declined by operator")
         return {"pruned": 0, "correction_id": None}
-    node, edges = build_prune_correction(source_id, empties, session_id, actor=cfg.actor)
-    await commit_nodes_edges(queue, graph_id, [node], edges)
-    await record_review_markers(queue, graph_id, session_id,
-                                [(s.id, "corrected") for s in empties])
-    logger.info(f"[prune] {source_id}: grouping correction {node['id']} pruned {len(empties)} segment(s)")
-    return {"pruned": len(empties), "correction_id": node["id"]}
+    cid = await commit_prune_correction(queue, graph_id, source_id, empties, session_id,
+                                        actor=cfg.actor, journal_path=journal_path)
+    logger.info(f"[prune] {source_id}: grouping correction {cid} pruned {len(empties)} segment(s)")
+    return {"pruned": len(empties), "correction_id": cid}
 
 
 def collect_capability_info(
@@ -203,6 +202,9 @@ async def run_correction(
     session's review markers drop decided segments.
     """
     run_id = run_id or new_run_id()
+    # The run's writes are journaled to the shared db's sidecar, then applied (ruling 6683f49e, E2:
+    # the run and review passes had been the correction writes that never reached the journal).
+    journal_path = sidecar_journal_path(graph_db_path)
     # CR-14 follow-up: queue-scoped run context — every job submitted in this
     # run carries run_id/actor into its journal rows + worker diagnostics
     # (run-manifest <-> journal linkage); the run itself is bracketed by
@@ -227,11 +229,12 @@ async def run_correction(
                 raise SystemExit(f"session {session_id} not found in graph")
             if reopen:
                 await set_session_status(queue, cfg.graph_capability, session_id, "reopened",
-                                         actor=cfg.actor)
+                                         actor=cfg.actor, journal_path=journal_path)
             sess_id = session_id
             logger.info(f"resumed session {sess_id}")
         else:
-            sess = await start_session(queue, cfg.graph_capability, source_ids, actor=cfg.actor)
+            sess = await start_session(queue, cfg.graph_capability, source_ids, actor=cfg.actor,
+                                       journal_path=journal_path)
             sess_id = sess.id
             logger.info(f"started session {sess_id} over {len(source_ids)} source(s)")
 
@@ -261,7 +264,8 @@ async def run_correction(
 
             prune = {"pruned": 0, "correction_id": None}
             if cfg.prune_empty:
-                prune = await prune_empty_segments(queue, cfg, cfg.graph_capability, sid, n, sess_id)
+                prune = await prune_empty_segments(queue, cfg, cfg.graph_capability, sid, n, sess_id,
+                                                   journal_path)
 
             corrections = await find_corrections_for_session(queue, cfg.graph_capability, sess_id)
             effective = project_effective_spine(segments, corrections)
@@ -277,7 +281,7 @@ async def run_correction(
             })
 
         await set_session_status(queue, cfg.graph_capability, sess_id, "completed",
-                                 actor=cfg.actor)
+                                 actor=cfg.actor, journal_path=journal_path)
     except BaseException as e:
         # The journal exists for exactly this row: a run that DIED records
         # that it was attempted (failures stop being the unattributed case).
@@ -320,6 +324,8 @@ async def review_worklist(
     session_id: str,                                    # Owning session id
     variant_by_segment: Optional[Dict[str, str]] = None,  # segment_id -> divergent variant text
     max_items: int = 0,                                 # Cap (0 = all)
+    journal_path: Optional[str] = None,                 # The graph's sidecar journal (None refuses unless `unjournaled`)
+    unjournaled: bool = False,                          # Explicitly review with no journal (scratch graphs, tests)
 ) -> Dict[str, int]:  # {"corrected": n, "skipped": n, "reviewed": n}
     """Interactive review loop -> text_content corrections (cheapest HITL seam).
 
@@ -355,7 +361,9 @@ async def review_worklist(
                 prior = (hits[0].get("payload") or {}).get("new_text")
         logger.info("review item:\n" + _format_worklist_item(item, effective_text, var, prior))
         if cfg.assume_yes:
-            await record_review_markers(queue, cfg.graph_capability, session_id, [(seg.id, "reviewed")])
+            await record_review_markers(queue, cfg.graph_capability, session_id, [(seg.id, "reviewed")],
+                                        actor=cfg.actor, journal_path=journal_path,
+                                        unjournaled=unjournaled)
             counts["reviewed"] += 1
             continue
         try:
@@ -372,21 +380,27 @@ async def review_worklist(
             if not new_text and var:
                 new_text = var
             if not new_text:
-                await record_review_markers(queue, cfg.graph_capability, session_id, [(seg.id, "skipped")])
+                await record_review_markers(queue, cfg.graph_capability, session_id,
+                                            [(seg.id, "skipped")], actor=cfg.actor,
+                                            journal_path=journal_path, unjournaled=unjournaled)
                 counts["skipped"] += 1
                 continue
             cid = await commit_text_correction(
                 queue, cfg.graph_capability, source_id, seg.id, new_text, session_id,
                 old_text=effective_text, supersedes_id=(active.get("id") if active else None),
-                actor=cfg.actor)
+                actor=cfg.actor, journal_path=journal_path, unjournaled=unjournaled)
             logger.info(f"  #{seg.index}: text correction {cid}"
                         + (f" supersedes {active['id']}" if active else ""))
             counts["corrected"] += 1
         elif decision in ("s", "skip"):
-            await record_review_markers(queue, cfg.graph_capability, session_id, [(seg.id, "skipped")])
+            await record_review_markers(queue, cfg.graph_capability, session_id, [(seg.id, "skipped")],
+                                        actor=cfg.actor, journal_path=journal_path,
+                                        unjournaled=unjournaled)
             counts["skipped"] += 1
         else:
-            await record_review_markers(queue, cfg.graph_capability, session_id, [(seg.id, "reviewed")])
+            await record_review_markers(queue, cfg.graph_capability, session_id, [(seg.id, "reviewed")],
+                                        actor=cfg.actor, journal_path=journal_path,
+                                        unjournaled=unjournaled)
             counts["reviewed"] += 1
     return counts
 
@@ -412,6 +426,9 @@ async def run_review(
     fine spine is scoped to the chosen AudioRendition (cfg.rendition_selector).
     """
     run_id = run_id or new_run_id()
+    # The run's writes are journaled to the shared db's sidecar, then applied (ruling 6683f49e, E2:
+    # the run and review passes had been the correction writes that never reached the journal).
+    journal_path = sidecar_journal_path(graph_db_path)
     # CR-14 follow-up: queue-scoped run context — every job submitted in this
     # run carries run_id/actor into its journal rows + worker diagnostics
     # (run-manifest <-> journal linkage); the run itself is bracketed by
@@ -435,11 +452,12 @@ async def run_review(
                 raise SystemExit(f"session {session_id} not found in graph")
             if reopen:
                 await set_session_status(queue, cfg.graph_capability, session_id, "reopened",
-                                         actor=cfg.actor)
+                                         actor=cfg.actor, journal_path=journal_path)
             sess_id = session_id
             logger.info(f"resumed session {sess_id}")
         else:
-            sess = await start_session(queue, cfg.graph_capability, source_ids, actor=cfg.actor)
+            sess = await start_session(queue, cfg.graph_capability, source_ids, actor=cfg.actor,
+                                       journal_path=journal_path)
             sess_id = sess.id
             logger.info(f"started review session {sess_id} over {len(source_ids)} source(s)")
 
@@ -469,7 +487,8 @@ async def run_review(
             logger.info(f"[src {sid[:8]}] {n} segment(s); review worklist {len(worklist)} "
                         f"(reviewing up to {max_items or len(worklist)})")
             counts = await review_worklist(queue, cfg, sid, worklist, sess_id,
-                                           variant_by_segment=variant_by_segment, max_items=max_items)
+                                           variant_by_segment=variant_by_segment, max_items=max_items,
+                                           journal_path=journal_path)
 
             corrections, superseded = await load_source_corrections(queue, cfg.graph_capability, sid)
             active = active_corrections(corrections, superseded)
@@ -485,7 +504,7 @@ async def run_review(
                         f"effective spine={len(effective)}")
 
         await set_session_status(queue, cfg.graph_capability, sess_id, "completed",
-                                 actor=cfg.actor)
+                                 actor=cfg.actor, journal_path=journal_path)
     except BaseException as e:
         # The journal exists for exactly this row: a run that DIED records
         # that it was attempted (failures stop being the unattributed case).

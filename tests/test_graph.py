@@ -264,43 +264,26 @@ def test_discharge_mark_supersedes_by_the_correction(tmp_path):
     names the correction (user ask 2026-09-14: edits clear the attention tier's marks)."""
     import asyncio
     import json
-    from types import SimpleNamespace
 
-    from cjm_substrate.core.queue import JobStatus
+    from cjm_context_graph_layer.testing import MemGraph
     from cjm_transcript_correction_core.graph import (build_boundary_shift_correction,
                                                       build_mark_correction, discharge_mark,
                                                       open_marks)
-
-    class FakeQueue:   # answers the layer's extend_graph sequence: query_edges (none exist) -> add_edges
-        def __init__(self):
-            self.submitted = []
-
-        async def submit(self, graph_id, **kw):
-            self.submitted.append((graph_id, kw))
-            return str(len(self.submitted))
-
-        async def wait_for_job(self, jid):
-            _, kw = self.submitted[int(jid) - 1]
-            if kw.get("method") == "query_edges":
-                result = SimpleNamespace(rows=[])
-            elif kw.get("method") == "add_edges":
-                result = [e["id"] for e in kw["edges"]]
-            else:
-                result = None
-            return SimpleNamespace(status=JobStatus.completed, result=result, error=None)
 
     mark, _ = build_mark_correction("src1", {"kind": "boundary", "boundary_after": "a",
                                              "right_segment_id": "b"},
                                     "fa-mid-word-boundary", session_id="s1",
                                     actor="capability:attention-tier")
     fix, _ = build_boundary_shift_correction("src1", "a", "b", "word", "push", session_id="s1")
-    q = FakeQueue()
+    q = MemGraph()
     journal = tmp_path / "context_graph.writes.jsonl"
     edge_id = asyncio.run(discharge_mark(q, "g", "src1", mark["id"], fix["id"], "s1",
                                          actor="human", note="discharged by boundary shift",
                                          journal_path=str(journal)))
     assert edge_id
-    assert [kw["method"] for _, kw in q.submitted] == ["query_edges", "add_edges"]   # no node ever written
+    # one edge planned by presence, then added -- no node ever written (the cursor reads aside)
+    assert [m for m in q.methods if "journal_cursor" not in m] == ["query_edges", "add_edges"]
+    assert q.nodes == {} and list(q.edges) == [edge_id]
     rows = []
     for n in (mark, fix):
         p = dict(n["properties"])

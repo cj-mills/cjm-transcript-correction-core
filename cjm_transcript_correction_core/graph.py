@@ -12,6 +12,7 @@ from uuid import uuid4
 from cjm_context_graph_layer.edits import (project_effective_spine as layer_project_effective_spine,
                                            resolve_active, SpineEdit, SpineUnit)
 from cjm_context_graph_layer.grammar import make_edge, OverlayRelations, SpineRelations
+from cjm_context_graph_layer.journal import write_window
 from cjm_context_graph_layer.ops import extend_graph, graph_task
 from cjm_context_graph_primitives.graph import GraphNode
 from cjm_context_graph_primitives.journal import op_clocked
@@ -20,7 +21,7 @@ from cjm_context_graph_primitives.query import (EdgeQuery, EdgeQueryResult, Node
                                                 NodeQueryResult, OrderBy, PropertyPredicate,
                                                 RelationPredicate, SourcePredicate)
 from cjm_substrate.core.queue import JobQueue, JobStatus
-from cjm_transcript_correction_core.journal import journal_correction_op, segment_anchor
+from cjm_transcript_correction_core.journal import journal_correction_op
 from cjm_transcript_correction_core.models import (Correction, CorrectionRelations,
                                                    CorrectionSession, Entity, EXTRACTION_STATUSES,
                                                    ExtractionGate, SpineSegment)
@@ -320,6 +321,36 @@ def build_prune_correction(
     return node.to_dict(), edges
 
 
+@op_clocked
+async def commit_prune_correction(
+    queue: JobQueue,             # Started job queue
+    graph_id: str,               # Graph-storage capability id
+    source_id: str,              # Source being corrected
+    pruned: List[SpineSegment],  # Empty layer-0 segments to prune
+    session_id: str,             # Owning session id
+    actor: str = "human",        # Actor
+    journal_path: Optional[str] = None,  # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,   # Explicitly commit with no journal (scratch graphs, tests)
+) -> str:  # The grouping Correction's id
+    """Commit the empty-segment prune (D14) + its REVIEWED markers -- one unit of work.
+
+    Journaled as `prune` (ruling 6683f49e, E2): the correction pipeline's prune had been the
+    one correction commit that never reached the journal, so a rebuild lost it."""
+    node, edges = build_prune_correction(source_id, pruned, session_id, actor=actor)
+    ids = [s.id for s in pruned]
+    async with write_window(queue, graph_id, journal_path, unjournaled=unjournaled,
+                            what="prune"):  # the correction + its markers: one unit of work
+        await journal_correction_op(queue, graph_id, "prune", actor=actor, session_id=session_id,
+                                    args={"source_id": source_id, "pruned_segment_ids": ids},
+                                    anchor_segments=ids, nodes=[node], edges=edges,
+                                    op_id=node["id"],
+                                    journal_path=journal_path, unjournaled=unjournaled)
+        await record_review_markers(queue, graph_id, session_id,
+                                    [(sid, "corrected") for sid in ids], actor=actor,
+                                    journal_path=journal_path, unjournaled=unjournaled)
+    return node["id"]
+
+
 async def commit_nodes_edges(
     queue: JobQueue,              # Started job queue
     graph_id: str,                # Graph-storage capability id
@@ -342,18 +373,18 @@ async def start_session(
     queue: JobQueue,   # Started job queue
     graph_id: str,     # Graph-storage capability id
     scope: List[str],  # Source node ids in scope
-    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,  # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
     purpose: Optional[str] = None,  # None = genuine pass; "feature-test" = excludable from flywheel datasets (DEC c86714a4)
     actor: str = "human",  # Actor stamped on the journal row (finding ac878d68: the shells pass theirs)
 ) -> CorrectionSession:  # The committed CorrectionSession
     """Create + commit a new CorrectionSession node."""
     sess = CorrectionSession(scope=scope, purpose=purpose)
     node = sess.to_graph_node().to_dict()
-    await commit_nodes_edges(queue, graph_id, [node], [])
-    if journal_path:
-        journal_correction_op(journal_path, "session-start", actor=actor,
-                              session_id=node["id"], args={"scope": scope},
-                              nodes=[node], edges=[], op_id=node["id"])
+    await journal_correction_op(queue, graph_id, "session-start", actor=actor,
+                                session_id=node["id"], args={"scope": scope},
+                                nodes=[node], edges=[], op_id=node["id"],
+                                journal_path=journal_path, unjournaled=unjournaled)
     return sess
 
 
@@ -375,7 +406,8 @@ async def set_session_status(
     graph_id: str,    # Graph-storage capability id
     session_id: str,  # CorrectionSession node id
     status: str,      # New status ("in_progress" | "completed" | "reopened")
-    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,  # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
     actor: str = "human",  # Actor stamped on the journal row (finding ac878d68)
 ) -> None:
     """Update a session's status + updated_at.
@@ -385,14 +417,12 @@ async def set_session_status(
     Its journal op replays via update_node (last-wins in append order), not wires.
     """
     ts = time.time()
-    await graph_task(queue, graph_id, "update_node", node_id=session_id,
-                     properties={"status": status, "updated_at": ts})
-    if journal_path:
-        journal_correction_op(journal_path, "session-status", actor=actor,
-                              session_id=session_id,
-                              args={"session_id": session_id, "status": status,
-                                    "updated_at": ts},
-                              nodes=[], edges=[])
+    await journal_correction_op(queue, graph_id, "session-status", actor=actor,
+                                session_id=session_id,
+                                args={"session_id": session_id, "status": status,
+                                      "updated_at": ts},
+                                nodes=[], edges=[],
+                                journal_path=journal_path, unjournaled=unjournaled)
 
 
 @op_clocked
@@ -401,23 +431,23 @@ async def record_review_markers(
     graph_id: str,                     # Graph-storage capability id
     session_id: str,                   # Owning session id
     decisions: List[Tuple[str, str]],  # (segment_id, decision) pairs
-    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,  # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
     actor: str = "human",  # Actor stamped on the journal row (finding ac878d68)
 ) -> int:  # Number of REVIEWED edges committed
     """Persist per-(session, segment) review markers as REVIEWED edges."""
     edges = [_edge(session_id, seg_id, CorrectionRelations.REVIEWED,
                    {"decision": dec, "ts": time.time()})
              for seg_id, dec in decisions]
-    n = (await commit_nodes_edges(queue, graph_id, [], edges))["edges"]
-    if journal_path:
-        # No anchor: markers are derivative session state — the CORRECTION op carries
-        # the anchor (DEC ccbab9f5 point 5 scopes anchors to correction ops), and the
-        # extra segment reads priced the TUI keystroke (journal-lag finding).
-        journal_correction_op(journal_path, "review-markers", actor=actor,
-                              session_id=session_id,
-                              args={"decisions": [list(d) for d in decisions]},
-                              nodes=[], edges=edges)
-    return n
+    # No anchor: markers are derivative session state — the CORRECTION op carries
+    # the anchor (DEC ccbab9f5 point 5 scopes anchors to correction ops), and the
+    # extra segment reads priced the TUI keystroke (journal-lag finding).
+    await journal_correction_op(queue, graph_id, "review-markers", actor=actor,
+                                session_id=session_id,
+                                args={"decisions": [list(d) for d in decisions]},
+                                nodes=[], edges=edges,
+                                journal_path=journal_path, unjournaled=unjournaled)
+    return len(edges)
 
 
 async def load_review_markers(
@@ -619,7 +649,8 @@ async def commit_text_correction(
     supersedes_id: Optional[str] = None,   # Prior Correction to supersede (re-edit)
     actor: str = "human",                  # Actor
     canonical_form: Optional[str] = None,  # Optional entity key
-    journal_path: Optional[str] = None,    # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,    # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
     rationale: Optional[str] = None,       # Optional note (an applied proposal's provenance line)
     proposal_id: Optional[str] = None,     # Applied proposal id (the fidelity-edit apply path)
     proposal_set_id: Optional[str] = None,  # Its proposal set
@@ -629,22 +660,23 @@ async def commit_text_correction(
         source_id, segment_id, new_text, session_id, old_text=old_text,
         supersedes_id=supersedes_id, actor=actor, canonical_form=canonical_form,
         rationale=rationale, proposal_id=proposal_id, proposal_set_id=proposal_set_id)
-    await commit_nodes_edges(queue, graph_id, [node], edges)
-    if journal_path:
-        journal_correction_op(journal_path, "text-correction", actor=actor,
-                              session_id=session_id,
-                              args={"source_id": source_id, "segment_id": segment_id,
-                                    "new_text": new_text, "old_text": old_text,
-                                    "supersedes_id": supersedes_id,
-                                    "canonical_form": canonical_form,
-                                    **({"rationale": rationale} if rationale else {}),
-                                    **({"proposal_id": proposal_id,
-                                        "proposal_set_id": proposal_set_id}
-                                       if proposal_id else {})},
-                              anchor=await segment_anchor(queue, graph_id, [segment_id]),
-                              nodes=[node], edges=edges, op_id=node["id"])
-    await record_review_markers(queue, graph_id, session_id, [(segment_id, "corrected")],
-                                journal_path=journal_path)
+    async with write_window(queue, graph_id, journal_path, unjournaled=unjournaled,
+                            what="text-correction"):  # the correction + its marker: one unit of work
+        await journal_correction_op(queue, graph_id, "text-correction", actor=actor,
+                                    session_id=session_id,
+                                    args={"source_id": source_id, "segment_id": segment_id,
+                                          "new_text": new_text, "old_text": old_text,
+                                          "supersedes_id": supersedes_id,
+                                          "canonical_form": canonical_form,
+                                          **({"rationale": rationale} if rationale else {}),
+                                          **({"proposal_id": proposal_id,
+                                              "proposal_set_id": proposal_set_id}
+                                             if proposal_id else {})},
+                                    anchor_segments=[segment_id],
+                                    nodes=[node], edges=edges, op_id=node["id"],
+                                    journal_path=journal_path, unjournaled=unjournaled)
+        await record_review_markers(queue, graph_id, session_id, [(segment_id, "corrected")],
+                                    journal_path=journal_path, unjournaled=unjournaled)
     return node["id"]
 
 
@@ -843,25 +875,26 @@ async def commit_boundary_shift_correction(
     session_id: str,                       # Owning session id
     supersedes_id: Optional[str] = None,   # Prior Correction to supersede (re-edit)
     actor: str = "human",                  # Actor
-    journal_path: Optional[str] = None,    # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,    # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
 ) -> str:  # The new Correction node id
     """Commit a boundary-shift correction (node + CORRECTS x2 [+ SUPERSEDES]) + REVIEWED markers on both segments."""
     node, edges = build_boundary_shift_correction(
         source_id, left_segment_id, right_segment_id, text, direction, session_id,
         supersedes_id=supersedes_id, actor=actor)
-    await commit_nodes_edges(queue, graph_id, [node], edges)
-    if journal_path:
-        journal_correction_op(journal_path, "boundary-shift", actor=actor,
-                              session_id=session_id,
-                              args={"source_id": source_id, "left_segment_id": left_segment_id,
-                                    "right_segment_id": right_segment_id, "text": text,
-                                    "direction": direction, "supersedes_id": supersedes_id},
-                              anchor=await segment_anchor(queue, graph_id,
-                                                          [left_segment_id, right_segment_id]),
-                              nodes=[node], edges=edges, op_id=node["id"])
-    await record_review_markers(queue, graph_id, session_id,
-                                [(left_segment_id, "corrected"), (right_segment_id, "corrected")],
-                                journal_path=journal_path)
+    async with write_window(queue, graph_id, journal_path, unjournaled=unjournaled,
+                            what="boundary-shift"):  # the correction + its marker: one unit of work
+        await journal_correction_op(queue, graph_id, "boundary-shift", actor=actor,
+                                    session_id=session_id,
+                                    args={"source_id": source_id, "left_segment_id": left_segment_id,
+                                          "right_segment_id": right_segment_id, "text": text,
+                                          "direction": direction, "supersedes_id": supersedes_id},
+                                    anchor_segments=[left_segment_id, right_segment_id],
+                                    nodes=[node], edges=edges, op_id=node["id"],
+                                    journal_path=journal_path, unjournaled=unjournaled)
+        await record_review_markers(queue, graph_id, session_id,
+                                    [(left_segment_id, "corrected"), (right_segment_id, "corrected")],
+                                    journal_path=journal_path, unjournaled=unjournaled)
     return node["id"]
 
 
@@ -900,17 +933,17 @@ async def commit_prune_amendment(
     unprune_ids: List[str],     # Segment ids rescued from the prune set
     session_id: str,            # Owning session id
     actor: str = "human",       # Actor
-    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,  # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
 ) -> Dict[str, Any]:  # The amended correction as a property dict + id (local-echo ready)
     """Commit an unprune amendment (node + DERIVED_FROM edges + SUPERSEDES)."""
     node, edges = build_prune_amendment(prior, unprune_ids, session_id, actor=actor)
-    await commit_nodes_edges(queue, graph_id, [node], edges)
-    if journal_path:
-        journal_correction_op(journal_path, "prune-amendment", actor=actor,
-                              session_id=session_id,
-                              args={"prior_id": prior.get("id"), "unprune_ids": unprune_ids},
-                              anchor=await segment_anchor(queue, graph_id, unprune_ids),
-                              nodes=[node], edges=edges, op_id=node["id"])
+    await journal_correction_op(queue, graph_id, "prune-amendment", actor=actor,
+                                session_id=session_id,
+                                args={"prior_id": prior.get("id"), "unprune_ids": unprune_ids},
+                                anchor_segments=unprune_ids,
+                                nodes=[node], edges=edges, op_id=node["id"],
+                                journal_path=journal_path, unjournaled=unjournaled)
     return _node_to_correction_dict(node)
 
 
@@ -997,7 +1030,8 @@ async def commit_mark_correction(
     supersedes_id: Optional[str] = None,  # Prior mark to supersede (re-mark)
     actor: str = "human",                 # Actor
     note: Optional[str] = None,           # Optional free-text note
-    journal_path: Optional[str] = None,   # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,   # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
     proposal_id: Optional[str] = None,    # Accepted proposal id (mark-family routing; None = hand-placed)
     proposal_set_id: Optional[str] = None,  # Its proposal set
 ) -> str:  # The new mark Correction node id
@@ -1010,18 +1044,16 @@ async def commit_mark_correction(
                                         supersedes_id=supersedes_id, actor=actor, note=note,
                                         proposal_id=proposal_id,
                                         proposal_set_id=proposal_set_id)
-    await commit_nodes_edges(queue, graph_id, [node], edges)
-    if journal_path:
-        journal_correction_op(journal_path, "mark", actor=actor, session_id=session_id,
-                              args={"source_id": source_id, "anchor": dict(anchor),
-                                    "mark_class": mark_class, "note": note,
-                                    "supersedes_id": supersedes_id,
-                                    **({"proposal_id": proposal_id,
-                                        "proposal_set_id": proposal_set_id}
-                                       if proposal_id else {})},
-                              anchor=await segment_anchor(queue, graph_id,
-                                                          mark_anchor_segments(anchor)),
-                              nodes=[node], edges=edges, op_id=node["id"])
+    await journal_correction_op(queue, graph_id, "mark", actor=actor, session_id=session_id,
+                                args={"source_id": source_id, "anchor": dict(anchor),
+                                      "mark_class": mark_class, "note": note,
+                                      "supersedes_id": supersedes_id,
+                                      **({"proposal_id": proposal_id,
+                                          "proposal_set_id": proposal_set_id}
+                                         if proposal_id else {})},
+                                anchor_segments=mark_anchor_segments(anchor),
+                                nodes=[node], edges=edges, op_id=node["id"],
+                                journal_path=journal_path, unjournaled=unjournaled)
     return node["id"]
 
 
@@ -1033,7 +1065,8 @@ async def commit_mark_dismissal(
     session_id: str,                     # Owning session id
     actor: str = "human",                # Actor (the dismisser)
     note: Optional[str] = None,          # Optional note (why dismissed)
-    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,  # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
 ) -> str:  # The review node id that superseded the mark
     """Dismiss an open mark WITHOUT a correction (reject-as-supersede).
 
@@ -1045,12 +1078,11 @@ async def commit_mark_dismissal(
     """
     node, edges = build_reject_review(source_id, mark_id, session_id,
                                       actor=actor, rationale=note)
-    await commit_nodes_edges(queue, graph_id, [node], edges)
-    if journal_path:
-        journal_correction_op(journal_path, "mark-dismiss", actor=actor,
-                              session_id=session_id,
-                              args={"source_id": source_id, "mark_id": mark_id, "note": note},
-                              nodes=[node], edges=edges, op_id=node["id"])
+    await journal_correction_op(queue, graph_id, "mark-dismiss", actor=actor,
+                                session_id=session_id,
+                                args={"source_id": source_id, "mark_id": mark_id, "note": note},
+                                nodes=[node], edges=edges, op_id=node["id"],
+                                journal_path=journal_path, unjournaled=unjournaled)
     return node["id"]
 
 
@@ -1063,7 +1095,8 @@ async def discharge_mark(
     session_id: str,                     # Owning session id
     actor: str = "human",                # Actor (whose edit discharged it)
     note: Optional[str] = None,          # Optional note (which gesture)
-    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,  # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
 ) -> str:  # The SUPERSEDES edge id
     """Discharge an open mark BY THE CORRECTION THAT ADDRESSED IT — the closure
     `build_mark_correction` names (the real correction supersedes the mark), applied
@@ -1074,12 +1107,11 @@ async def discharge_mark(
     the mark exactly as a dismissal would; the edge carries the provenance a dismissal
     review would (who, when, which correction)."""
     edge = make_edge(correction_id, mark_id, CorrectionRelations.SUPERSEDES)
-    await commit_nodes_edges(queue, graph_id, [], [edge])
-    if journal_path:
-        journal_correction_op(journal_path, "mark-discharge", actor=actor, session_id=session_id,
-                              args={"source_id": source_id, "mark_id": mark_id,
-                                    "correction_id": correction_id, "note": note},
-                              nodes=[], edges=[edge], op_id=edge["id"])
+    await journal_correction_op(queue, graph_id, "mark-discharge", actor=actor, session_id=session_id,
+                                args={"source_id": source_id, "mark_id": mark_id,
+                                      "correction_id": correction_id, "note": note},
+                                nodes=[], edges=[edge], op_id=edge["id"],
+                                journal_path=journal_path, unjournaled=unjournaled)
     return edge["id"]
 
 
@@ -1144,7 +1176,8 @@ async def commit_stratum_correction(
     supersedes_id: Optional[str] = None,   # Prior stratum to supersede
     actor: str = "human",                  # Actor
     note: Optional[str] = None,            # Optional note
-    journal_path: Optional[str] = None,    # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,    # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
 ) -> str:  # The new stratum Correction node id
     """Commit a stratum (node + CORRECTS per covered segment [+ SUPERSEDES]).
 
@@ -1155,17 +1188,16 @@ async def commit_stratum_correction(
         source_id, segment_ids, category, session_id, skeleton_hash=skeleton_hash,
         start_time=start_time, end_time=end_time, proposal_id=proposal_id,
         proposal_set_id=proposal_set_id, supersedes_id=supersedes_id, actor=actor, note=note)
-    await commit_nodes_edges(queue, graph_id, [node], edges)
-    if journal_path:
-        journal_correction_op(journal_path, "stratum", actor=actor, session_id=session_id,
-                              args={"source_id": source_id, "skeleton_hash": skeleton_hash,
-                                    "segment_ids": list(segment_ids), "category": category,
-                                    "start_time": start_time, "end_time": end_time,
-                                    "proposal_id": proposal_id,
-                                    "proposal_set_id": proposal_set_id,
-                                    "supersedes_id": supersedes_id, "note": note},
-                              anchor=await segment_anchor(queue, graph_id, list(segment_ids)),
-                              nodes=[node], edges=edges, op_id=node["id"])
+    await journal_correction_op(queue, graph_id, "stratum", actor=actor, session_id=session_id,
+                                args={"source_id": source_id, "skeleton_hash": skeleton_hash,
+                                      "segment_ids": list(segment_ids), "category": category,
+                                      "start_time": start_time, "end_time": end_time,
+                                      "proposal_id": proposal_id,
+                                      "proposal_set_id": proposal_set_id,
+                                      "supersedes_id": supersedes_id, "note": note},
+                                anchor_segments=list(segment_ids),
+                                nodes=[node], edges=edges, op_id=node["id"],
+                                journal_path=journal_path, unjournaled=unjournaled)
     return node["id"]
 
 
@@ -1177,7 +1209,8 @@ async def commit_stratum_retraction(
     session_id: str,                     # Owning session id
     actor: str = "human",                # Actor (the retractor)
     note: Optional[str] = None,          # Optional note (why)
-    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,  # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
 ) -> str:  # The review node id that superseded the stratum
     """Retract a live stratum WITHOUT replacing it (reject-as-supersede, the
     mark-dismissal shape): a SUPERSEDES edge from a small review node, append-
@@ -1185,12 +1218,11 @@ async def commit_stratum_retraction(
     No segment anchor: retraction is derivative lane state."""
     node, edges = build_reject_review(source_id, stratum_id, session_id,
                                       actor=actor, rationale=note)
-    await commit_nodes_edges(queue, graph_id, [node], edges)
-    if journal_path:
-        journal_correction_op(journal_path, "stratum-retract", actor=actor,
-                              session_id=session_id,
-                              args={"source_id": source_id, "stratum_id": stratum_id, "note": note},
-                              nodes=[node], edges=edges, op_id=node["id"])
+    await journal_correction_op(queue, graph_id, "stratum-retract", actor=actor,
+                                session_id=session_id,
+                                args={"source_id": source_id, "stratum_id": stratum_id, "note": note},
+                                nodes=[node], edges=edges, op_id=node["id"],
+                                journal_path=journal_path, unjournaled=unjournaled)
     return node["id"]
 
 
@@ -1458,7 +1490,8 @@ async def commit_time_nudge_correction(
     boundary_words: Optional[Dict[str, Any]] = None,  # Words at the boundary (flywheel context)
     step_s: Optional[float] = None,        # The press's signed step (seconds)
     actor: str = "human",                  # Actor
-    journal_path: Optional[str] = None,    # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,    # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
 ) -> str:  # The new Correction node id
     """Commit a time-nudge correction (node + CORRECTS per touched segment).
 
@@ -1469,17 +1502,14 @@ async def commit_time_nudge_correction(
     node, edges = build_time_nudge_correction(
         source_id, edits, session_id, boundary_words=boundary_words,
         step_s=step_s, actor=actor)
-    await commit_nodes_edges(queue, graph_id, [node], edges)
-    if journal_path:
-        journal_correction_op(journal_path, "time-nudge", actor=actor,
-                              session_id=session_id,
-                              args={"source_id": source_id, "edits": [dict(e) for e in edits],
-                                    "boundary_words": dict(boundary_words or {}),
-                                    "step_s": step_s},
-                              anchor=await segment_anchor(
-                                  queue, graph_id,
-                                  [str(e["segment_id"]) for e in edits]),
-                              nodes=[node], edges=edges, op_id=node["id"])
+    await journal_correction_op(queue, graph_id, "time-nudge", actor=actor,
+                                session_id=session_id,
+                                args={"source_id": source_id, "edits": [dict(e) for e in edits],
+                                      "boundary_words": dict(boundary_words or {}),
+                                      "step_s": step_s},
+                                anchor_segments=[str(e["segment_id"]) for e in edits],
+                                nodes=[node], edges=edges, op_id=node["id"],
+                                journal_path=journal_path, unjournaled=unjournaled)
     return node["id"]
 
 
@@ -1590,7 +1620,8 @@ async def commit_chunk_insert_correction(
     label: Optional[str] = None,          # Optional annotation class
     rank: float = 0.0,                    # Walked-order tie-break among same-start siblings (131ba57a)
     actor: str = "human",                 # Actor
-    journal_path: Optional[str] = None,   # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,   # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
 ) -> str:  # The new insertion Correction node id (= the synthetic segment id)
     """Commit a chunk insertion (node + CORRECTS per flank).
 
@@ -1603,20 +1634,18 @@ async def commit_chunk_insert_correction(
     node, edges = build_chunk_insert_correction(
         source_id, after_segment_id, start_time, end_time, session_id,
         before_segment_id=before_segment_id, label=label, rank=rank, actor=actor)
-    await commit_nodes_edges(queue, graph_id, [node], edges)
-    if journal_path:
-        journal_correction_op(journal_path, "chunk-insert", actor=actor,
-                              session_id=session_id,
-                              args={"source_id": source_id,
-                                    "after_segment_id": after_segment_id,
-                                    "before_segment_id": before_segment_id,
-                                    "start_time": float(start_time),
-                                    "end_time": float(end_time), "label": label,
-                                    "rank": float(rank)},
-                              anchor=await segment_anchor(
-                                  queue, graph_id,
-                                  [sid for sid in (after_segment_id, before_segment_id) if sid]),
-                              nodes=[node], edges=edges, op_id=node["id"])
+    await journal_correction_op(queue, graph_id, "chunk-insert", actor=actor,
+                                session_id=session_id,
+                                args={"source_id": source_id,
+                                      "after_segment_id": after_segment_id,
+                                      "before_segment_id": before_segment_id,
+                                      "start_time": float(start_time),
+                                      "end_time": float(end_time), "label": label,
+                                      "rank": float(rank)},
+                                anchor_segments=[sid for sid in (after_segment_id, before_segment_id)
+                                                 if sid],
+                                nodes=[node], edges=edges, op_id=node["id"],
+                                journal_path=journal_path, unjournaled=unjournaled)
     return node["id"]
 
 
@@ -1628,7 +1657,8 @@ async def commit_chunk_insert_removal(
     session_id: str,                     # Owning session id
     actor: str = "human",                # Actor
     note: Optional[str] = None,          # Optional note (why removed)
-    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,  # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
 ) -> str:  # The review node id that superseded the insertion
     """Remove an inserted chunk WITHOUT touching layer-0 (reject-as-supersede).
 
@@ -1642,13 +1672,12 @@ async def commit_chunk_insert_removal(
     """
     node, edges = build_reject_review(source_id, insert_id, session_id,
                                       actor=actor, rationale=note)
-    await commit_nodes_edges(queue, graph_id, [node], edges)
-    if journal_path:
-        journal_correction_op(journal_path, "chunk-insert-remove", actor=actor,
-                              session_id=session_id,
-                              args={"source_id": source_id, "insert_id": insert_id,
-                                    "note": note},
-                              nodes=[node], edges=edges, op_id=node["id"])
+    await journal_correction_op(queue, graph_id, "chunk-insert-remove", actor=actor,
+                                session_id=session_id,
+                                args={"source_id": source_id, "insert_id": insert_id,
+                                      "note": note},
+                                nodes=[node], edges=edges, op_id=node["id"],
+                                journal_path=journal_path, unjournaled=unjournaled)
     return node["id"]
 
 
@@ -1734,7 +1763,8 @@ async def set_session_purpose(
     graph_id: str,    # Graph-storage capability id
     session_id: str,  # CorrectionSession node id
     purpose: Optional[str],  # None = genuine pass; "feature-test" = excludable from flywheel datasets (open vocabulary)
-    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,  # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
     actor: str = "human",  # Actor stamped on the journal row (finding ac878d68)
 ) -> None:
     """Update a session's purpose + updated_at (the test-session hygiene tag, DEC c86714a4).
@@ -1744,14 +1774,12 @@ async def set_session_purpose(
     order), not wires. Doubles as the BACKFILL lane for sessions minted before
     the tag existed (the C.0/C.1 feature-test passes)."""
     ts = time.time()
-    await graph_task(queue, graph_id, "update_node", node_id=session_id,
-                     properties={"purpose": purpose, "updated_at": ts})
-    if journal_path:
-        journal_correction_op(journal_path, "session-purpose", actor=actor,
-                              session_id=session_id,
-                              args={"session_id": session_id, "purpose": purpose,
-                                    "updated_at": ts},
-                              nodes=[], edges=[])
+    await journal_correction_op(queue, graph_id, "session-purpose", actor=actor,
+                                session_id=session_id,
+                                args={"session_id": session_id, "purpose": purpose,
+                                      "updated_at": ts},
+                                nodes=[], edges=[],
+                                journal_path=journal_path, unjournaled=unjournaled)
 
 
 async def commit_speaker_entity(
@@ -1762,7 +1790,8 @@ async def commit_speaker_entity(
     provisional: bool = False,           # True = descriptive handle, not an identification (DEC 484e2d74)
     kind: str = "person",                # Entity kind
     actor: str = "human",                # Actor
-    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,  # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
 ) -> str:  # The new Entity node id
     """Mint a source-spanning Entity into the shared registry (DEC 4ec6a49c).
 
@@ -1775,13 +1804,12 @@ async def commit_speaker_entity(
         raise ValueError("canonical_name must be a non-empty string")
     node = Entity(canonical_name=name, kind=kind, provisional=provisional,
                   actor=actor).to_graph_node().to_dict()
-    await commit_nodes_edges(queue, graph_id, [node], [])
-    if journal_path:
-        journal_correction_op(journal_path, "speaker-entity", actor=actor,
-                              session_id=session_id,
-                              args={"canonical_name": name, "kind": kind,
-                                    "provisional": provisional},
-                              nodes=[node], edges=[], op_id=node["id"])
+    await journal_correction_op(queue, graph_id, "speaker-entity", actor=actor,
+                                session_id=session_id,
+                                args={"canonical_name": name, "kind": kind,
+                                      "provisional": provisional},
+                                nodes=[node], edges=[], op_id=node["id"],
+                                journal_path=journal_path, unjournaled=unjournaled)
     return node["id"]
 
 
@@ -1793,7 +1821,8 @@ async def rename_speaker_entity(
     session_id: str,                     # Session the rename happened in (journal set identity)
     provisional: Optional[bool] = None,  # New provisional flag; None = unchanged (identifying passes False)
     actor: str = "human",                # Actor
-    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,  # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
 ) -> None:
     """Rename an Entity on its STABLE id — identification IS a rename (DEC 484e2d74).
 
@@ -1808,13 +1837,12 @@ async def rename_speaker_entity(
     props: Dict[str, Any] = {"canonical_name": name, "updated_at": updated_at}
     if provisional is not None:
         props["provisional"] = provisional
-    await graph_task(queue, graph_id, "update_node", node_id=entity_id, properties=props)
-    if journal_path:
-        journal_correction_op(journal_path, "entity-rename", actor=actor,
-                              session_id=session_id,
-                              args={"entity_id": entity_id, "canonical_name": name,
-                                    "provisional": provisional, "updated_at": updated_at},
-                              nodes=[], edges=[])
+    await journal_correction_op(queue, graph_id, "entity-rename", actor=actor,
+                                session_id=session_id,
+                                args={"entity_id": entity_id, "canonical_name": name,
+                                      "provisional": provisional, "updated_at": updated_at},
+                                nodes=[], edges=[],
+                                journal_path=journal_path, unjournaled=unjournaled)
 
 
 async def list_speaker_entities(
@@ -1941,7 +1969,8 @@ async def commit_speaker_assign_correction(
     proposal: Optional[Dict[str, Any]] = None,  # Machine-proposal snapshot; None = unassisted
     supersedes_id: Optional[str] = None,  # Prior speaker Correction being replaced
     actor: str = "human",                 # Actor
-    journal_path: Optional[str] = None,   # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,   # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
 ) -> str:  # The new Correction node id
     """Commit a speaker assignment (node + CORRECTS per segment + ASSIGNS).
 
@@ -1952,17 +1981,16 @@ async def commit_speaker_assign_correction(
     node, edges = build_speaker_assign_correction(
         source_id, segment_ids, entity_id, session_id, verdict=verdict,
         proposal=proposal, supersedes_id=supersedes_id, actor=actor)
-    await commit_nodes_edges(queue, graph_id, [node], edges)
-    if journal_path:
-        ids = [str(s) for s in segment_ids if s]
-        journal_correction_op(journal_path, "speaker-assign", actor=actor,
-                              session_id=session_id,
-                              args={"source_id": source_id, "segment_ids": ids,
-                                    "entity_id": str(entity_id), "verdict": verdict,
-                                    "proposal": dict(proposal or {}),
-                                    "supersedes_id": supersedes_id},
-                              anchor=await segment_anchor(queue, graph_id, ids),
-                              nodes=[node], edges=edges, op_id=node["id"])
+    ids = [str(s) for s in segment_ids if s]
+    await journal_correction_op(queue, graph_id, "speaker-assign", actor=actor,
+                                session_id=session_id,
+                                args={"source_id": source_id, "segment_ids": ids,
+                                      "entity_id": str(entity_id), "verdict": verdict,
+                                      "proposal": dict(proposal or {}),
+                                      "supersedes_id": supersedes_id},
+                                anchor_segments=ids,
+                                nodes=[node], edges=edges, op_id=node["id"],
+                                journal_path=journal_path, unjournaled=unjournaled)
     return node["id"]
 
 
@@ -2098,7 +2126,8 @@ async def commit_chunk_split_correction(
     old_text: Optional[str] = None,        # Prior effective text (for the record)
     boundary_words: Optional[Dict[str, Any]] = None,  # Words either side of the new cut
     actor: str = "human",                  # Actor
-    journal_path: Optional[str] = None,    # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,    # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
 ) -> Dict[str, str]:  # {"insert_id","text_id","nudge_id"} (insert_id = the right half's segment id)
     """Commit a chunk split: three composed nodes in ONE atomic batch + ONE journal op.
 
@@ -2114,21 +2143,19 @@ async def commit_chunk_split_correction(
         source_id, segment_id, split_time, left_text, right_text, end_time,
         session_id, after_segment_id, before_segment_id=before_segment_id,
         old_text=old_text, boundary_words=boundary_words, actor=actor)
-    await commit_nodes_edges(queue, graph_id, nodes, edges)
-    if journal_path:
-        journal_correction_op(journal_path, "chunk-split", actor=actor,
-                              session_id=session_id,
-                              args={"source_id": source_id, "segment_id": segment_id,
-                                    "split_time": float(split_time),
-                                    "left_text": left_text, "right_text": right_text,
-                                    "end_time": float(end_time),
-                                    "after_segment_id": after_segment_id,
-                                    "before_segment_id": before_segment_id,
-                                    "boundary_words": dict(boundary_words or {})},
-                              anchor=await segment_anchor(
-                                  queue, graph_id,
-                                  [sid for sid in (after_segment_id, before_segment_id) if sid]),
-                              nodes=nodes, edges=edges, op_id=ids["insert_id"])
+    await journal_correction_op(queue, graph_id, "chunk-split", actor=actor,
+                                session_id=session_id,
+                                args={"source_id": source_id, "segment_id": segment_id,
+                                      "split_time": float(split_time),
+                                      "left_text": left_text, "right_text": right_text,
+                                      "end_time": float(end_time),
+                                      "after_segment_id": after_segment_id,
+                                      "before_segment_id": before_segment_id,
+                                      "boundary_words": dict(boundary_words or {})},
+                                anchor_segments=[sid for sid in (after_segment_id, before_segment_id)
+                                                 if sid],
+                                nodes=nodes, edges=edges, op_id=ids["insert_id"],
+                                journal_path=journal_path, unjournaled=unjournaled)
     return ids
 
 
@@ -2156,7 +2183,8 @@ async def commit_chunk_split_removal(
     session_id: str,                     # Owning session id
     actor: str = "human",                # Actor
     note: Optional[str] = None,          # Optional note (why unsplit)
-    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,  # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
 ) -> str:  # The review node id that superseded the group
     """UNSPLIT: remove a split's right half AND its whole group (one review
     node, SUPERSEDES per member).
@@ -2175,13 +2203,12 @@ async def commit_chunk_split_removal(
                                  rationale=note).to_graph_node().to_dict()
     edges = [make_edge(node["id"], rid, CorrectionRelations.SUPERSEDES)
              for rid in [insert_id, *group_ids]]
-    await commit_nodes_edges(queue, graph_id, [node], edges)
-    if journal_path:
-        journal_correction_op(journal_path, "chunk-split-remove", actor=actor,
-                              session_id=session_id,
-                              args={"source_id": source_id, "insert_id": insert_id,
-                                    "group_ids": list(group_ids), "note": note},
-                              nodes=[node], edges=edges, op_id=node["id"])
+    await journal_correction_op(queue, graph_id, "chunk-split-remove", actor=actor,
+                                session_id=session_id,
+                                args={"source_id": source_id, "insert_id": insert_id,
+                                      "group_ids": list(group_ids), "note": note},
+                                nodes=[node], edges=edges, op_id=node["id"],
+                                journal_path=journal_path, unjournaled=unjournaled)
     return node["id"]
 
 
@@ -2291,7 +2318,8 @@ async def commit_extraction_gate(
     annotated_through: Optional[float],  # Watermark (source seconds)
     session_id: Optional[str] = None,    # CorrectionSession context (None = CLI assert)
     actor: str = "human",                # Actor
-    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,  # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
     lane: Optional[str] = None,          # None = the correction gate; a lane tag = that lane's watermark chain
 ) -> str:  # The new ExtractionGate assertion node id
     """Commit one extraction-gate assertion (node + GATES edge) — the journaled
@@ -2304,16 +2332,15 @@ async def commit_extraction_gate(
     node, edges = build_extraction_gate_assertion(
         source_id, skeleton_hash, extraction_status, annotated_through,
         session_id=session_id, actor=actor, lane=lane)
-    await commit_nodes_edges(queue, graph_id, [node], edges)
-    if journal_path:
-        journal_correction_op(journal_path, "extraction-gate", actor=actor,
-                              session_id=session_id or "",
-                              args={"source_id": source_id,
-                                    "skeleton_hash": skeleton_hash,
-                                    "extraction_status": extraction_status,
-                                    "annotated_through": annotated_through,
-                                    **({"lane": lane} if lane else {})},
-                              nodes=[node], edges=edges, op_id=node["id"])
+    await journal_correction_op(queue, graph_id, "extraction-gate", actor=actor,
+                                session_id=session_id or "",
+                                args={"source_id": source_id,
+                                      "skeleton_hash": skeleton_hash,
+                                      "extraction_status": extraction_status,
+                                      "annotated_through": annotated_through,
+                                      **({"lane": lane} if lane else {})},
+                                nodes=[node], edges=edges, op_id=node["id"],
+                                journal_path=journal_path, unjournaled=unjournaled)
     return node["id"]
 
 
@@ -2732,7 +2759,8 @@ async def commit_speech_overlay_correction(
     supersedes_id: Optional[str] = None,  # Prior overlay to supersede
     actor: str = "human",                 # Actor
     note: Optional[str] = None,           # Optional note
-    journal_path: Optional[str] = None,   # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,   # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
     proposal_id: Optional[str] = None,    # The span proposal this overlay accepts (None = hand-annotated)
     proposal_set_id: Optional[str] = None,  # Its proposal set
 ) -> str:  # The new overlay Correction node id
@@ -2746,21 +2774,19 @@ async def commit_speech_overlay_correction(
         source_id, anchor, label, start_time, end_time, text, session_id,
         words=words, snap=snap, supersedes_id=supersedes_id, actor=actor, note=note,
         proposal_id=proposal_id, proposal_set_id=proposal_set_id)
-    await commit_nodes_edges(queue, graph_id, [node], edges)
-    if journal_path:
-        journal_correction_op(journal_path, "speech-overlay", actor=actor,
-                              session_id=session_id,
-                              args={"source_id": source_id, "anchor": dict(anchor),
-                                    "label": label, "start_time": float(start_time),
-                                    "end_time": float(end_time), "text": text,
-                                    "words": [dict(w) for w in (words or [])],
-                                    "snap": snap or "estimated", "note": note,
-                                    "supersedes_id": supersedes_id,
-                                    "proposal_id": proposal_id,
-                                    "proposal_set_id": proposal_set_id},
-                              anchor=await segment_anchor(queue, graph_id,
-                                                          mark_anchor_segments(anchor)),
-                              nodes=[node], edges=edges, op_id=node["id"])
+    await journal_correction_op(queue, graph_id, "speech-overlay", actor=actor,
+                                session_id=session_id,
+                                args={"source_id": source_id, "anchor": dict(anchor),
+                                      "label": label, "start_time": float(start_time),
+                                      "end_time": float(end_time), "text": text,
+                                      "words": [dict(w) for w in (words or [])],
+                                      "snap": snap or "estimated", "note": note,
+                                      "supersedes_id": supersedes_id,
+                                      "proposal_id": proposal_id,
+                                      "proposal_set_id": proposal_set_id},
+                                anchor_segments=mark_anchor_segments(anchor),
+                                nodes=[node], edges=edges, op_id=node["id"],
+                                journal_path=journal_path, unjournaled=unjournaled)
     return node["id"]
 
 
@@ -2772,7 +2798,8 @@ async def commit_speech_overlay_removal(
     session_id: str,                     # Owning session id
     actor: str = "human",                # Actor (the remover)
     note: Optional[str] = None,          # Optional note (why removed)
-    journal_path: Optional[str] = None,  # Sidecar journal — append the op on success (None = unjournaled)
+    journal_path: Optional[str] = None,  # Sidecar journal — the op is journaled, then applied (None refuses unless `unjournaled`)
+    unjournaled: bool = False,  # Explicitly commit with no journal (scratch graphs, tests)
 ) -> str:  # The review node id that superseded the overlay
     """Remove a speech overlay WITHOUT a replacement (reject-as-supersede).
 
@@ -2782,13 +2809,12 @@ async def commit_speech_overlay_removal(
     removal is derivative session state (the ccbab9f5 anchor scope)."""
     node, edges = build_reject_review(source_id, overlay_id, session_id,
                                       actor=actor, rationale=note)
-    await commit_nodes_edges(queue, graph_id, [node], edges)
-    if journal_path:
-        journal_correction_op(journal_path, "speech-overlay-remove", actor=actor,
-                              session_id=session_id,
-                              args={"source_id": source_id, "overlay_id": overlay_id,
-                                    "note": note},
-                              nodes=[node], edges=edges, op_id=node["id"])
+    await journal_correction_op(queue, graph_id, "speech-overlay-remove", actor=actor,
+                                session_id=session_id,
+                                args={"source_id": source_id, "overlay_id": overlay_id,
+                                      "note": note},
+                                nodes=[node], edges=edges, op_id=node["id"],
+                                journal_path=journal_path, unjournaled=unjournaled)
     return node["id"]
 
 

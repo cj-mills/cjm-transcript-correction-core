@@ -1,8 +1,8 @@
-"""Live append-through for the correction verbs — the workflow journal's domain half.
+"""The correction verbs on the write order — the workflow journal's domain half.
 
-Every correction commit appends its op to the sidecar journal (DEC ccbab9f5): the
-ENVELOPE (op id = minted Correction id, actor, set = session id, run-independent
-segment ANCHOR) keeps each op a legible dataset row; the exact WIRES committed make
+Every correction commit journals its op to the sidecar journal, then applies it (DEC
+ccbab9f5, ruling 6683f49e): the ENVELOPE (op id = minted Correction id, actor, set =
+session id, run-independent segment ANCHOR) keeps each op a legible dataset row; the exact WIRES committed make
 replay faithful to what WAS written (builder evolution can never drift a rebuild —
 store the effect, not the recipe). Replay handlers register onto
 `cjm_context_graph_layer.journal.replay_journal` (replay stays domain-owned); the
@@ -11,9 +11,8 @@ append discipline lives in `cjm_context_graph_primitives.journal`.
 
 from typing import Any, Dict, List, Optional
 
-from cjm_context_graph_layer.journal import wires_handlers
+from cjm_context_graph_layer.journal import journal_op, wires_handlers, write_window
 from cjm_context_graph_layer.ops import graph_task
-from cjm_context_graph_primitives.journal import append_op
 from cjm_context_graph_primitives.query import NodeQuery
 
 
@@ -50,33 +49,40 @@ async def segment_anchor(
     }
 
 
-def journal_correction_op(
-    journal_path: str,             # Sidecar journal path
+async def journal_correction_op(
+    queue: Any,                    # Started job queue
+    graph_id: str,                 # Graph-storage capability id
     verb: str,                     # Domain verb ("boundary-shift" | "text-correction" | ...)
     actor: str,                    # Who decided ("human" | "agent:*" | "import:*")
     session_id: str,               # The op's SET identity (per-run CorrectionSession)
     args: Dict[str, Any],          # The semantic call args (the dataset row)
-    nodes: List[Dict[str, Any]],   # The exact node wires committed
-    edges: List[Dict[str, Any]],   # The exact edge wires committed
-    anchor: Optional[Dict[str, Any]] = None,  # Run-independent segment anchor
+    nodes: List[Dict[str, Any]],   # The exact node wires to commit
+    edges: List[Dict[str, Any]],   # The exact edge wires to commit
+    anchor_segments: Optional[List[str]] = None,  # Segment ids the run-independent anchor is read from (None = no anchor)
     op_id: Optional[str] = None,   # Minted Correction node id (exact-once dedup lane)
-) -> bool:  # True if appended
-    """Append one correction op — envelope + semantic args + the EXACT wires committed.
+    journal_path: Optional[str] = None,  # Sidecar journal (None refuses unless `unjournaled`)
+    unjournaled: bool = False,     # Explicitly commit with no journal (scratch graphs, tests)
+) -> Dict[str, Any]:  # The op as journaled (as applied, when unjournaled)
+    """Journal one correction op, then apply it — envelope + semantic args + the EXACT wires.
 
     Wires make replay faithful to what WAS written (a builder change can never drift a
     rebuild); args + anchor keep the op a legible dataset row (the north-star pullable-
-    datasets requirement). Appended AFTER the commit succeeds, mirroring the dev-graph
-    append-on-success discipline. dedup=False: the append must stay UI-cheap (a dedup
-    rescan over a genesis-scale journal cost 111ms/op — the TUI keystroke lag finding);
-    id-carrying ops mint a fresh Correction uuid per commit so duplicates are
-    structurally impossible live, and replay converges on collisions regardless."""
-    op: Dict[str, Any] = {"verb": verb, "actor": actor, "set": session_id,
-                          "args": args, "wires": {"nodes": nodes, "edges": edges}}
-    if op_id:
-        op["id"] = op_id
-    if anchor:
-        op["anchor"] = anchor
-    return append_op(journal_path, op, dedup=False)
+    datasets requirement). THE WRITE ORDER (ruling 6683f49e (1)): the op is APPENDED, then
+    APPLIED through its verb's own replay handler (`apply_wires`, or the session / entity
+    property merges) — the commit IS the apply, so live and rebuild run one code path — under
+    the family's writer, which the verb's `write_window` (an app's gesture window, in turn) is
+    joined by. The anchor is read inside that writer, on the healed db, and only when the op is
+    journaled (it is the journal row's coordinate). No content dedup: id-carrying ops mint a
+    fresh Correction uuid per commit, so duplicates are structurally impossible live, and the
+    apply converges on collisions regardless."""
+    async with write_window(queue, graph_id, journal_path, unjournaled=unjournaled, what=verb):
+        op: Dict[str, Any] = {"verb": verb, "actor": actor, "set": session_id,
+                              "args": args, "wires": {"nodes": nodes, "edges": edges}}
+        if op_id:
+            op["id"] = op_id
+        if journal_path and anchor_segments is not None:
+            op["anchor"] = await segment_anchor(queue, graph_id, list(anchor_segments))
+        return await journal_op(queue, graph_id, op, journal_path, unjournaled=unjournaled)
 
 
 def correction_replay_handlers() -> Dict[str, Any]:  # verb -> async handler(queue, graph_id, op)
@@ -108,7 +114,7 @@ def correction_replay_handlers() -> Dict[str, Any]:  # verb -> async handler(que
                          properties=props)
 
     handlers = wires_handlers("session-start", "boundary-shift", "text-correction",
-                              "prune-amendment", "mark", "mark-dismiss", "mark-discharge",
+                              "prune", "prune-amendment", "mark", "mark-dismiss", "mark-discharge",
                               "review-markers",
                               "time-nudge", "chunk-insert", "chunk-insert-remove",
                               "chunk-split", "chunk-split-remove",

@@ -10,7 +10,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - **`cjm_transcript_correction_core.cleanread`** — The clean read — L1 of the reading ladder (design 6752db0a; the subtraction
 - **`cjm_transcript_correction_core.cli`** — The CLI driver — the correction core's first (and currently only) frontend. run <decomp-manifest> corrects the committed spine in the decomp graph DB, pointing the graph worker at that shared DB via load-time config, with optional session resume/reopen; review runs the interactive text-correction loop (the cross-transcriber diff is intra-graph since stage 5).
 - **`cjm_transcript_correction_core.graph`** — The correction overlay's graph I/O: targeted (scale-shaped) reads of a committed spine via the graph-storage query action, construction of Correction / CorrectionSession nodes + CORRECTS / SUPERSEDES / DERIVED_FROM / REVIEWED edges, the in-core effective-spine projection (layer-0 + applied corrections), and commit through the job queue. Hand-rolled (revolution-1) = direct CR-18 spec material; append-only on layer-0 (never update/delete a Segment).
-- **`cjm_transcript_correction_core.journal`** — Live append-through for the correction verbs — the workflow journal's domain half.
+- **`cjm_transcript_correction_core.journal`** — The correction verbs on the write order — the workflow journal's domain half.
 - **`cjm_transcript_correction_core.launch`** — The shared launch surface every correction shell drives through: the
 - **`cjm_transcript_correction_core.models`** — Overlay data shapes for the transcript-correction workflow: the Correction / CorrectionSession graph nodes + their relation registry, the read view of a committed spine segment, the worklist item, run configuration, and the correction run manifest (proto-bundle that chains decomp -> correction).
 - **`cjm_transcript_correction_core.pipeline`** — The headless correction workflow: load a decomp run manifest, resolve the shared graph DB, start/resume/reopen a CorrectionSession, recompute the worklist from deterministic signals + persisted review state, run the D14 empty-segment prune (first operation), and record a chainable correction run manifest — with a cheapest-form HITL approval seam.
@@ -100,6 +100,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 - `commit_mark_dismissal` _function_ — Dismiss an open mark WITHOUT a correction (reject-as-supersede).
 - `commit_nodes_edges` _function_ — Commit overlay nodes/edges through the layer's idempotent extend_graph.
 - `commit_prune_amendment` _function_ — Commit an unprune amendment (node + DERIVED_FROM edges + SUPERSEDES).
+- `commit_prune_correction` _function_ — Commit the empty-segment prune (D14) + its REVIEWED markers -- one unit of work.
 - `commit_speaker_assign_correction` _function_ — Commit a speaker assignment (node + CORRECTS per segment + ASSIGNS).
 - `commit_speaker_entity` _function_ — Mint a source-spanning Entity into the shared registry (DEC 4ec6a49c).
 - `commit_speech_overlay_correction` _function_ — Commit a speech overlay (node + CORRECTS [+ SUPERSEDES]).
@@ -154,7 +155,7 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 ### `cjm_transcript_correction_core.journal`
 
 - `correction_replay_handlers` _function_ — The correction core's registered replay vocabulary (replay stays DOMAIN-OWNED).
-- `journal_correction_op` _function_ — Append one correction op — envelope + semantic args + the EXACT wires committed.
+- `journal_correction_op` _function_ — Journal one correction op, then apply it — envelope + semantic args + the EXACT wires.
 - `segment_anchor` _function_ — The run-independent anchor stamped on every correction op (DEC ccbab9f5 point 5).
 
 ### `cjm_transcript_correction_core.launch`
@@ -296,4 +297,4 @@ A frontend-agnostic core for the transcript correction workflow — the first do
 ## Dependencies
 
 **Depends on:** `cjm-capability-primitives`, `cjm-context-graph-layer`, `cjm-context-graph-primitives`, `cjm-substrate`, `cjm-transcript-graph-schema`, `numpy`
-**Used by:** `cjm-context-graph-projection`, `cjm-transcript-correction-qt`, `cjm-transcription-core`, `cjm-workflow-hub-qt`
+**Used by:** `cjm-context-graph-projection`, `cjm-transcript-correction-qt`, `cjm-transcript-decomp-core`, `cjm-transcription-core`, `cjm-workflow-hub-qt`
