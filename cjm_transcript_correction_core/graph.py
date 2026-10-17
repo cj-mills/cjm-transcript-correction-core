@@ -339,7 +339,7 @@ async def commit_prune_correction(
     node, edges = build_prune_correction(source_id, pruned, session_id, actor=actor)
     ids = [s.id for s in pruned]
     async with write_window(queue, graph_id, journal_path, unjournaled=unjournaled,
-                            what="prune"):  # the correction + its markers: one unit of work
+                            what="prune", unit=True):  # the correction + its markers: one atomic unit (3de795e4)
         await journal_correction_op(queue, graph_id, "prune", actor=actor, session_id=session_id,
                                     args={"source_id": source_id, "pruned_segment_ids": ids},
                                     anchor_segments=ids, nodes=[node], edges=edges,
@@ -661,7 +661,7 @@ async def commit_text_correction(
         supersedes_id=supersedes_id, actor=actor, canonical_form=canonical_form,
         rationale=rationale, proposal_id=proposal_id, proposal_set_id=proposal_set_id)
     async with write_window(queue, graph_id, journal_path, unjournaled=unjournaled,
-                            what="text-correction"):  # the correction + its marker: one unit of work
+                            what="text-correction", unit=True):  # the correction + its marker: one atomic unit (3de795e4)
         await journal_correction_op(queue, graph_id, "text-correction", actor=actor,
                                     session_id=session_id,
                                     args={"source_id": source_id, "segment_id": segment_id,
@@ -883,7 +883,7 @@ async def commit_boundary_shift_correction(
         source_id, left_segment_id, right_segment_id, text, direction, session_id,
         supersedes_id=supersedes_id, actor=actor)
     async with write_window(queue, graph_id, journal_path, unjournaled=unjournaled,
-                            what="boundary-shift"):  # the correction + its marker: one unit of work
+                            what="boundary-shift", unit=True):  # the correction + its marker: one atomic unit (3de795e4)
         await journal_correction_op(queue, graph_id, "boundary-shift", actor=actor,
                                     session_id=session_id,
                                     args={"source_id": source_id, "left_segment_id": left_segment_id,

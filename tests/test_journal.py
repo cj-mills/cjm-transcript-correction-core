@@ -105,3 +105,49 @@ def test_a_commit_with_no_journal_refuses_unless_explicitly_unjournaled(tmp_path
     assert store.methods == [] and store.nodes == {}
     sess = asyncio.run(g.start_session(store, "gid", ["src"], unjournaled=True))
     assert sess.id in store.nodes
+
+
+class _Crash(BaseException):
+    """A simulated crash: nothing on the write path catches it."""
+
+
+@pytest.mark.parametrize("point", ["torn_append", "after_append"])
+def test_a_crashed_text_correction_lands_with_its_marker_or_not_at_all(tmp_path, point):
+    """Ruling 3de795e4: the correction and its REVIEWED marker are ONE atomic unit -- a crash
+    leaves both journaled (the next writer's heal applies them) or neither, never a correction
+    without its marker."""
+    from cjm_context_graph_layer.journal import replay_journal
+    from cjm_context_graph_primitives.writer import FAULT_HOOK
+    from cjm_transcript_correction_core import graph as g
+
+    j = str(tmp_path / "w.jsonl")
+    store = MemGraph()
+    seg = {"id": "seg-1", "label": "Segment", "sources": [],
+           "properties": {"index": 0, "source_id": "src", "start_time": 1.0, "end_time": 2.0,
+                          "text": "t"}}
+    store.nodes["seg-1"] = seg  # layer 0, as the pipeline left it
+    sess = asyncio.run(g.start_session(store, "gid", ["src"], journal_path=j))
+
+    def hook(p):
+        if p == point:
+            raise _Crash(p)
+
+    token = FAULT_HOOK.set(hook)
+    try:
+        with pytest.raises(_Crash):
+            asyncio.run(g.commit_text_correction(store, "gid", "src", "seg-1", "fixed", sess.id,
+                                                 old_text="t", journal_path=j))
+    finally:
+        FAULT_HOOK.reset(token)
+    asyncio.run(g.set_session_status(store, "gid", sess.id, "completed", journal_path=j))  # heals
+    verbs = [r["verb"] for r in read_journal(j)]
+    whole = point == "after_append"
+    assert verbs == ["session-start"] + (
+        ["text-correction", "review-markers"] if whole else []) + ["session-status"]
+    corrections = [n for n in store.nodes.values() if n["label"] == "Correction"]
+    reviewed = [e for e in store.edges.values() if e["relation_type"] == "REVIEWED"]
+    assert (len(corrections), len(reviewed)) == ((1, 1) if whole else (0, 0))
+    rebuilt = MemGraph()
+    rebuilt.nodes["seg-1"] = dict(seg)
+    asyncio.run(replay_journal(rebuilt, "gid", j, handlers=correction_replay_handlers()))
+    assert set(rebuilt.nodes) == set(store.nodes) and set(rebuilt.edges) == set(store.edges)
