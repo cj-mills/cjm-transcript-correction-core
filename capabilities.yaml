@@ -7,7 +7,7 @@ capabilities:
   env_file: https://raw.githubusercontent.com/cj-mills/cjm-capability-graph-sqlite/main/environment.yml
   package: cjm-capability-graph-sqlite>=0.0.34
   interface_libs:
-  - cjm-context-graph-primitives>=0.0.26
+  - cjm-context-graph-primitives>=0.0.27
   adapters:
   - lib: cjm-graph-storage-adapter-interface>=0.0.11
     impl: cjm_graph_storage_adapter_interface.generic:GenericGraphStorageAdapter
