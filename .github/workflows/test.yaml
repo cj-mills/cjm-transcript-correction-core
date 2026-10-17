@@ -9,5 +9,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e .[test]
+      # The workflow lane's suite runs in the lane's env: a writer on the shared workflow journal
+      # needs every core's replay registry (ruling 6683f49e (2)), so the sibling cores install too.
+      - run: pip install -e .[test] cjm-transcript-decomp-core cjm-transcription-core
       - run: pytest tests/
